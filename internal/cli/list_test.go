@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"fu/internal/skill"
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/skill"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 func TestListMatrixAndShow(t *testing.T) {

@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"fu/internal/agent"
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 // TestWriteOperationsNeverSilentlyTouchForeignContent is the mechanical,

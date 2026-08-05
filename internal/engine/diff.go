@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 
-	"fu/internal/skill"
+	"github.com/cosensexyz/fu/internal/skill"
 )
 
 type ActionType int

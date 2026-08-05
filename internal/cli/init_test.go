@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 func runCmd(t *testing.T, args ...string) (string, error) {

@@ -5,8 +5,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"fu/internal/engine"
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/engine"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 // NewRootCmd builds the fu command tree. Tests construct a fresh tree

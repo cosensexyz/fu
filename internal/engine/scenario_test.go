@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/agent"
 )
 
 // Walks SPEC scenarios covered by plan 1: create (7), toggle (2), and

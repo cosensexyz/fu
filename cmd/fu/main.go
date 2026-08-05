@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"fu/internal/cli"
+	"github.com/cosensexyz/fu/internal/cli"
 )
 
 func main() {

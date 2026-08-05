@@ -18,7 +18,7 @@ import (
 	"strings"
 	"sync"
 
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 // TxnRecord is the command-level write-ahead record (DESIGN §2). Every stage

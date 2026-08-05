@@ -14,7 +14,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage"
 
-	"fu/internal/skill"
+	"github.com/cosensexyz/fu/internal/skill"
 )
 
 // Critical finding 3: AddWithOptions{All: true} goes through go-git's

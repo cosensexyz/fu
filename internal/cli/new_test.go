@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"fu/internal/engine"
+	"github.com/cosensexyz/fu/internal/engine"
 )
 
 func TestNewCommand(t *testing.T) {

@@ -12,8 +12,8 @@ import (
 	git "github.com/go-git/go-git/v5"
 	"github.com/gofrs/flock"
 
-	"fu/internal/agent"
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 func TestRunPipelineOrderAndSweep(t *testing.T) {

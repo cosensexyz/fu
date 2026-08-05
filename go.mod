@@ -1,4 +1,4 @@
-module fu
+module github.com/cosensexyz/fu
 
 go 1.25
 

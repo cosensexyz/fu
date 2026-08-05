@@ -16,9 +16,9 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"golang.org/x/sys/unix"
 
-	"fu/internal/agent"
-	"fu/internal/skill"
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/skill"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 func TestNewSkillScaffoldsAndLinks(t *testing.T) {

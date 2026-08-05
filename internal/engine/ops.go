@@ -7,9 +7,9 @@ import (
 	"io/fs"
 	"path/filepath"
 
-	"fu/internal/agent"
-	"fu/internal/skill"
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/skill"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 const skillTemplate = `---

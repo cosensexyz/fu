@@ -12,8 +12,8 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 
-	"fu/internal/skill"
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/skill"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 // ErrTxnConflict means recovery found state that is neither the transaction's

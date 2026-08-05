@@ -7,8 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"fu/internal/agent"
-	"fu/internal/engine"
+	"github.com/cosensexyz/fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/engine"
 )
 
 func newNewCmd() *cobra.Command {

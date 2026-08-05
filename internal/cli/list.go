@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/agent"
 )
 
 func onOff(b bool) string {

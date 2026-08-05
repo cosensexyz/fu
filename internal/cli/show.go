@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"fu/internal/agent"
-	"fu/internal/skill"
+	"github.com/cosensexyz/fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/skill"
 )
 
 // singleLine keeps untrusted frontmatter inside one output line so it cannot

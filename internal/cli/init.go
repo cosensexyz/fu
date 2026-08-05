@@ -5,7 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 func newInitCmd() *cobra.Command {

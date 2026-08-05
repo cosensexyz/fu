@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 func txnRevisionPaths(t *testing.T, s *store.Store) []string {

@@ -13,7 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 
-	"fu/internal/skill"
+	"github.com/cosensexyz/fu/internal/skill"
 )
 
 // SupportedVersion is the highest fu.yaml version this build understands.

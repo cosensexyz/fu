@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/agent"
 )
 
 // EntryKind classifies one entry in an agent skills directory.

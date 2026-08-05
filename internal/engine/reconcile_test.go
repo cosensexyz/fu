@@ -9,8 +9,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"fu/internal/agent"
-	"fu/internal/store"
+	"github.com/cosensexyz/fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 func setupStore(t *testing.T, skills ...string) (*store.Store, *store.Config) {
