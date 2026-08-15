@@ -162,6 +162,21 @@ func TestDigestExcludesGit(t *testing.T) {
 	}
 }
 
+func TestDigestFSRefusesFileLargerThanCopyLimit(t *testing.T) {
+	root := t.TempDir()
+	oversized := filepath.Join(root, "oversized.bin")
+	if err := os.WriteFile(oversized, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(oversized, (64<<20)+1); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := DigestFS(os.DirFS(root), "."); err == nil || !strings.Contains(err.Error(), "64 MiB") {
+		t.Fatalf("DigestFS oversized error = %v, want shared 64 MiB limit", err)
+	}
+}
+
 // TestDigestExcludesGitWorktreeFile covers the .git-as-file form used by
 // git worktrees and submodules (a regular file containing a "gitdir:"
 // pointer, instead of a real .git directory). It must be excluded from

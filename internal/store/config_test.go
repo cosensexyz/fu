@@ -151,9 +151,9 @@ func TestSameValueNormalization(t *testing.T) {
 	// Round 3 finding 4: a global flip must NOT drop an override that
 	// becomes equal to it, reversing this test's own prior assertion here
 	// (it used to require the opposite: "global flip must normalize
-	// now-equal overrides"). SPEC §4.1 contains two rules that contradict
-	// each other for exactly this case; this build resolves it in favor of
-	// "overrides are not cleared by a global toggle" -- see SetEnabled's
+	// now-equal overrides"). SPEC §4.1 gives the agent-level setter the
+	// normalization rule and separately says a global toggle preserves
+	// overrides; this build follows that scope distinction -- see SetEnabled's
 	// doc comment for the full reasoning. The normalizing helper now runs
 	// only from SetAgent.
 	c.SetAgent("alpha", "codex", false)
@@ -273,7 +273,7 @@ func TestAgentSwitchNormalizationClearsOwnOverrideEvenAlongsideOthers(t *testing
 // erasing it from fu.yaml" -- which round 5 found unguarded: dropping such
 // an entry from skills.Content inside validateConfigTree left the whole
 // suite green. That mutation is unrecoverable data loss today, since this
-// plan ships no `fu rm` and hand-editing fu.yaml is the only way back; the
+// `fu rm` refuses a name LoadConfig isolated, so hand-editing fu.yaml is the only way back; the
 // entry would vanish as a side effect of any unrelated write.
 func TestSaveRoundTripsInvalidEntryUnchanged(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "fu.yaml")
@@ -314,7 +314,7 @@ skills:
 	for _, want := range []string{"../evil", "sha256:bad", "codex"} {
 		if !strings.Contains(string(after), want) {
 			t.Fatalf("an unrelated write erased %q from fu.yaml -- unrecoverable, this plan "+
-				"ships no `fu rm`:\n%s", want, after)
+				"cannot be recovered with `fu rm`:\n%s", want, after)
 		}
 	}
 
@@ -612,6 +612,52 @@ skills:
 	}
 }
 
+func TestConfigSaveWritesThroughPinnedParentAfterPathReplacement(t *testing.T) {
+	parent := t.TempDir()
+	configDir := filepath.Join(parent, "config")
+	if err := os.Mkdir(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDir, "fu.yaml")
+	initial := []byte("version: 1\nskills:\n  alpha:\n    enabled: true\n")
+	if err := os.WriteFile(configPath, initial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.SetEnabled("alpha", false)
+	movedDir := filepath.Join(parent, "config-moved")
+	replacement := []byte("replacement parent\n")
+	err = cfg.saveWithHooks(configSaveHooks{afterOpenRoot: func() error {
+		if err := os.Rename(configDir, movedDir); err != nil {
+			return err
+		}
+		if err := os.Mkdir(configDir, 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(configPath, replacement, 0o644)
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, err := os.ReadFile(filepath.Join(movedDir, "fu.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(moved), "enabled: false") {
+		t.Fatalf("pinned original config was not updated: %q", moved)
+	}
+	gotReplacement, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotReplacement, replacement) {
+		t.Fatalf("replacement parent was modified: %q", gotReplacement)
+	}
+}
+
 // TestLoadConfigValidatesStructure verifies LoadConfig rejects a
 // parsed-but-malformed fu.yaml -- one that does not have the shape
 // every mutator assumes -- instead of silently accepting it and later
@@ -845,6 +891,54 @@ skills:
 	}
 	if got := c2.InvalidNames(); len(got) != 0 {
 		t.Fatalf("a config with no invalid names must report none, got %+v", got)
+	}
+}
+
+func TestInvalidNameIsolationAppliesToEverySkillAccessor(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "fu.yaml")
+	raw := `version: 1
+skills:
+  ../evil:
+    digest: sha256:bad
+    enabled: true
+    source:
+      type: local
+      path: /tmp/evil
+    overrides:
+      codex: false
+`
+	if err := os.WriteFile(p, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Digest("../evil") != "" || c.Enabled("../evil") || c.Effective("../evil", "codex") {
+		t.Fatal("read accessors must not expose an isolated invalid entry")
+	}
+	if fields := c.SourceFields("../evil"); len(fields) != 0 {
+		t.Fatalf("SourceFields exposed isolated data: %v", fields)
+	}
+	if _, ok := c.Override("../evil", "codex"); ok {
+		t.Fatal("Override exposed isolated data")
+	}
+	c.SetDigest("../evil", "sha256:changed")
+	c.SetEnabled("../evil", false)
+	c.SetSourceFields("../evil", map[string]string{"type": "git"})
+	c.SetAgent("../evil", "codex", true)
+	c.RemoveSkill("../evil")
+	if err := c.Save(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"../evil", "sha256:bad", "/tmp/evil", "codex: false"} {
+		if !strings.Contains(string(after), want) {
+			t.Fatalf("invalid entry mutation erased or changed %q:\n%s", want, after)
+		}
 	}
 }
 

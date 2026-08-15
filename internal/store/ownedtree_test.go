@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,35 @@ func TestHashFileAtRefusesFIFOReplacementWithoutBlocking(t *testing.T) {
 		case <-time.After(3 * time.Second):
 		}
 		t.Fatal("owned-tree hashing blocked after a regular file was replaced by a FIFO")
+	}
+}
+
+func TestReadSourceFileRefusesFIFOWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	if err := unix.Mkfifo(filepath.Join(dir, "entry"), 0o600); err != nil {
+		t.Skipf("mkfifo unsupported: %v", err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	result := make(chan error, 1)
+	go func() {
+		_, err := readSourceFile(root, "entry")
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("FIFO source must be refused by type, got %v", err)
+		}
+	case <-time.After(time.Second):
+		fd, openErr := unix.Open(filepath.Join(dir, "entry"), unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if openErr == nil {
+			_ = unix.Close(fd)
+		}
+		t.Fatal("readSourceFile blocked while opening a FIFO")
 	}
 }
 

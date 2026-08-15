@@ -68,6 +68,29 @@ func TestNewCommandReportsPerAgentReconcileFailure(t *testing.T) {
 	}
 }
 
+func TestNewCommandSuppressesCreatedForRollbackPendingInstall(t *testing.T) {
+	interrupted := errors.New("WAL completion failed")
+	cmd := newNewCmd(fakeNewApplication{
+		outcome: engine.OperationOutcome{
+			Name:               "alpha",
+			Committed:          true,
+			PostCommitComplete: true,
+			RecoveryPending:    true,
+		},
+		err: interrupted,
+	})
+	output, err := executeCommandForOutcomeTest(cmd, "alpha")
+	if !errors.Is(err, interrupted) {
+		t.Fatalf("new error = %v, want %v", err, interrupted)
+	}
+	if strings.Contains(output, "created alpha") {
+		t.Fatalf("rollback-pending scaffold must not be reported as created: %q", output)
+	}
+	if !strings.Contains(output, "will roll back") {
+		t.Fatalf("rollback-pending scaffold must explain recovery: %q", output)
+	}
+}
+
 // Finding I6, end to end: with HOME unset, fu must never write into the
 // process's current working directory. Reproduced against the compiled
 // binary pre-fix: running `env -u HOME FU_HOME=... fu new alpha` from

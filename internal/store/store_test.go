@@ -105,6 +105,29 @@ func TestInitOpenCommit(t *testing.T) {
 	}
 }
 
+func TestStagingIdentityUsesTheValidatedDirectory(t *testing.T) {
+	home := t.TempDir()
+	s, err := Init(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := s.StagingIdentity()
+	if err != nil || identity.Inode == 0 {
+		t.Fatalf("staging identity = %+v, %v; want validated inode", identity, err)
+	}
+
+	original := s.StagingDir() + "-original"
+	if err := os.Rename(s.StagingDir(), original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(s.StagingDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StagingIdentity(); err == nil || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("replacement staging identity error = %v", err)
+	}
+}
+
 func TestBeginWriteRefusesReplacedLogicalRoots(t *testing.T) {
 	tests := []struct {
 		name    string

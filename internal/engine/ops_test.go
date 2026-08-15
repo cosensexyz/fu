@@ -517,10 +517,9 @@ func TestSetAgentSwitchSameAsGlobalIsNotStored(t *testing.T) {
 // Flipping the global switch must move only the agents that follow it; an
 // agent holding an override stays exactly where it is -- indefinitely, not
 // just across the one flip that happens to make it equal to the new
-// global value (round 3 finding 4). SPEC §4.1 contains two rules that
-// contradict each other for exactly this case ("normalize after any
-// switch write" vs. "a global toggle does not clear overrides"); this
-// build resolves it in favor of the latter, so a global toggle never
+// global value (round 3 finding 4). SPEC §4.1 scopes normalization to an
+// agent-level switch write and separately says a global toggle does not
+// clear overrides. Therefore a global toggle never
 // touches overrides at all -- an override recorded once survives any
 // number of later global flips until an agent-level write explicitly
 // changes or clears it.
@@ -789,27 +788,25 @@ func TestNewSkillDoesNotAdoptForeignStagingRootsOrDescendants(t *testing.T) {
 	}
 }
 
-// A process that dies between creating the private staging root and renaming
-// it into place leaves an empty directory no WAL mentions: the record is still
-// at "started" with no payload, and recovery only ever looks at skills/<name>
-// and staging/<name>. Nothing would ever report or reclaim it.
-//
-// Reclaiming rather than journaling the name: recording it would put it in the
-// recovery directory for anyone to read, and a racer who knows the name can
-// swap the root between the mkdirat and the snapshot -- which is the gap the
-// private name exists to close.
-func TestNewSkillReclaimsAbandonedPrivateStagingRoots(t *testing.T) {
+// An unrecorded private name has no ownership proof. Even emptiness does not
+// identify its inode, so later operations preserve it.
+func TestNewSkillPreservesUnrecordedPrivateStagingRoots(t *testing.T) {
 	s, _ := setupStore(t)
 	abandoned := filepath.Join(s.StagingDir(), ".fu-new-0123456789abcdef0123456789abcdef")
 	if err := os.Mkdir(abandoned, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(abandoned)
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := NewSkill(s, nil, "alpha"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Lstat(abandoned); !os.IsNotExist(err) {
-		t.Fatalf("an abandoned private staging root must be reclaimed, got err %v", err)
+	after, err := os.Lstat(abandoned)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("unrecorded private staging root must be preserved: %v, %v", after, err)
 	}
 }
 
@@ -2005,7 +2002,7 @@ func TestNewSkillRecoversAfterProcessInterruption(t *testing.T) {
 	}
 }
 
-func TestUncommittedNewRecoveryRevalidatesTerminalArchiveAfterProcessInterruption(t *testing.T) {
+func TestUncommittedInstallRecoveryRevalidatesTerminalArchiveAfterProcessInterruption(t *testing.T) {
 	if mode := os.Getenv("FU_TEST_CRASH_UNCOMMITTED_ARCHIVE_HELPER"); mode != "" {
 		home := os.Getenv("FU_TEST_CRASH_UNCOMMITTED_ARCHIVE_HOME")
 		s, err := store.Open(home)
@@ -2033,7 +2030,7 @@ func TestUncommittedNewRecoveryRevalidatesTerminalArchiveAfterProcessInterruptio
 				panic(fmt.Sprintf("expected one manifested pending transaction, got %+v", records))
 			}
 			record := records[0]
-			payload := newUncommittedPayloadName(record)
+			payload := installUncommittedPayloadName(record)
 			if err := session.Store.QuarantineSkillOwned(record.Name, payload, *record.Payload); err != nil {
 				panic(err)
 			}
@@ -2053,7 +2050,7 @@ func TestUncommittedNewRecoveryRevalidatesTerminalArchiveAfterProcessInterruptio
 	}
 	runInterrupted := func(mode string) {
 		t.Helper()
-		cmd := exec.Command(os.Args[0], "-test.run=^TestUncommittedNewRecoveryRevalidatesTerminalArchiveAfterProcessInterruption$")
+		cmd := exec.Command(os.Args[0], "-test.run=^TestUncommittedInstallRecoveryRevalidatesTerminalArchiveAfterProcessInterruption$")
 		cmd.Env = append(os.Environ(),
 			"FU_TEST_CRASH_UNCOMMITTED_ARCHIVE_HELPER="+mode,
 			"FU_TEST_CRASH_UNCOMMITTED_ARCHIVE_HOME="+home,
@@ -2121,7 +2118,7 @@ func TestStartedNewRecoveryPreservesManifestlessStagingReplacement(t *testing.T)
 			panic(err)
 		}
 		_, _ = newSkill(s, nil, "alpha", hooks{
-			afterStagingCreate: func() error {
+			afterTxnStart: func() error {
 				os.Exit(86)
 				return nil
 			},
@@ -2145,15 +2142,11 @@ func TestStartedNewRecoveryPreservesManifestlessStagingReplacement(t *testing.T)
 	}
 
 	staged := filepath.Join(home, "staging", "alpha")
-	if err := os.Remove(staged); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.Mkdir(staged, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	sentinel := filepath.Join(staged, "foreign.txt")
-	want := []byte("replacement staging content")
-	if err := os.WriteFile(sentinel, want, 0o644); err != nil {
+	replacement, err := os.Lstat(staged)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -2164,12 +2157,9 @@ func TestStartedNewRecoveryPreservesManifestlessStagingReplacement(t *testing.T)
 	if _, err := NewSkill(s, nil, "beta"); !errors.Is(err, ErrTxnConflict) {
 		t.Fatalf("manifest-less staging replacement must stop recovery with ErrTxnConflict, got %v", err)
 	}
-	got, err := os.ReadFile(sentinel)
-	if err != nil {
-		t.Fatalf("manifest-less replacement must survive: %v", err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("manifest-less replacement changed: got %q want %q", got, want)
+	current, err := os.Lstat(staged)
+	if err != nil || !os.SameFile(current, replacement) {
+		t.Fatalf("manifest-less empty replacement must survive: %v, %v", current, err)
 	}
 	if pending, err := PendingTxns(s); err != nil {
 		t.Fatal(err)
@@ -2190,7 +2180,7 @@ func TestCommittedNewRecoverySurvivesProcessInterruption(t *testing.T) {
 			os.Exit(86)
 			return nil
 		}
-		var h newRecoveryHooks
+		var h installRecoveryHooks
 		switch stage {
 		case "after-compensation-started":
 			h.afterCompensationStarted = crash
@@ -2213,7 +2203,7 @@ func TestCommittedNewRecoverySurvivesProcessInterruption(t *testing.T) {
 			panic("unknown recovery crash stage " + stage)
 		}
 		RegisterRecoverHandler("new", func(st *store.Store, record TxnRecord) error {
-			return recoverNewSkillWithHooks(st, record, h)
+			return recoverInstallSkillWithHooks(st, record, h)
 		})
 		_, _ = NewSkill(s, nil, "beta")
 		panic("recovery crash hook did not run")
@@ -2366,7 +2356,7 @@ func TestCommittedNewRecoveryPreservesChangedQuarantineContent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			home := filepath.Join(t.TempDir(), "home")
 			record := stopCommittedNewRecoveryBeforeCleanup(t, home, "alpha")
-			payload := filepath.Join(home, "recovery", newCompensationPayloadName(record))
+			payload := filepath.Join(home, "recovery", installCompensationPayloadName(record))
 			sentinel := tt.mutate(t, payload)
 
 			s, err := store.Open(home)
@@ -2590,7 +2580,7 @@ func stopCommittedNewRecoveryBeforeCleanup(t *testing.T, home, name string) TxnR
 		t.Fatalf("setup must leave one pending transaction, got %+v", pending)
 	}
 	stop := errors.New("stop before quarantine cleanup")
-	err = recoverNewSkillWithHooks(checked, pending[0], newRecoveryHooks{
+	err = recoverInstallSkillWithHooks(checked, pending[0], installRecoveryHooks{
 		beforeQuarantineCleanup: func(*store.Store, TxnRecord) error { return stop },
 	})
 	closeErr := session.Close()
@@ -2604,7 +2594,7 @@ func stopCommittedNewRecoveryBeforeCleanup(t *testing.T, home, name string) TxnR
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 1 || pending[0].Stage != newTxnCompensationCommitted {
+	if len(pending) != 1 || pending[0].Stage != installTxnCompensationCommitted {
 		t.Fatalf("setup must persist committed compensation state, got %+v", pending)
 	}
 	return pending[0]
@@ -2725,5 +2715,111 @@ func TestNewSkillConvergesAfterACrashInEitherOwnershipWindow(t *testing.T) {
 				t.Fatalf("converged recovery must leave no pending transaction, got %+v", pending)
 			}
 		})
+	}
+}
+
+// TestReconcileCompleteDistinguishesAgentFailureFromHardError pins round 18
+// finding I3. ReconcileComplete was set before the reconcile error was
+// examined, so the phase vector DESIGN §6 documents as faithful reported a
+// phase it had not necessarily reached. The two reconcile outcomes must be
+// told apart: ErrOperationFailed means the pass ran to completion and found
+// per-agent failures, so the phase is complete; a hard error means it never
+// ran, so the phase is not.
+//
+// Only the ErrOperationFailed half is reachable through run() today --
+// reconcile's single hard-error path is st.SkillsRoot(), and the checked
+// session pins that root at BeginWrite, so nothing during the operation can
+// make it fail. The flag is still computed from the error rather than set
+// unconditionally, so a future hard-error path cannot silently inherit the lie.
+func TestReconcileCompleteDistinguishesAgentFailureFromHardError(t *testing.T) {
+	s, _ := setupStore(t)
+	claudeDir := t.TempDir()
+	agents := []agent.Agent{fakeAgent{"claude", claudeDir}}
+	NewSkill(s, agents, "alpha")
+
+	var outcome OperationOutcome
+	// The store link's target becomes unreadable, so the agent-side apply
+	// fails while the reconcile pass itself completes.
+	h := hooks{afterCommit: func() error {
+		return os.Chmod(s.SkillsDir(), 0o000)
+	}}
+	t.Cleanup(func() { _ = os.Chmod(s.SkillsDir(), 0o755) })
+	_, err := setGlobalTracked(s, agents, "alpha", false, h, &outcome)
+	if !errors.Is(err, ErrOperationFailed) {
+		t.Fatalf("err = %v; want ErrOperationFailed", err)
+	}
+	if !outcome.ReconcileComplete {
+		t.Fatalf("a reconcile that ran and reported per-agent failures did complete: %+v", outcome)
+	}
+	if len(outcome.Reconcile.Failed) == 0 {
+		t.Fatalf("the per-agent failure must be reported: %+v", outcome.Reconcile)
+	}
+}
+
+// TestPendingTxnsToleratesDamagedCompletedRevision pins round 18 finding I5.
+// PendingTxns re-read and SHA-256'd every revision of every transaction on
+// every write command, including long-completed ones that nothing prunes. Two
+// consequences: command latency grew with the store's whole lifetime history,
+// and a single damaged historical byte -- on a transaction that already
+// finished years earlier -- permanently bricked every write command.
+//
+// A completed transaction is now recognised from its terminal marker plus the
+// revision filenames, which already commit to their own digests, so no
+// historical revision is read at all. store/config_exchange.go made exactly
+// this trade for the config-exchange journal and documents the reasoning.
+func TestPendingTxnsToleratesDamagedCompletedRevision(t *testing.T) {
+	s, _ := setupStore(t)
+	agents := []agent.Agent{fakeAgent{"claude", t.TempDir()}}
+	NewSkill(s, agents, "alpha")
+
+	entries, err := os.ReadDir(s.RecoveryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	damaged := ""
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "txn-new-") && strings.HasSuffix(e.Name(), ".json") {
+			if damaged == "" || e.Name() < damaged {
+				damaged = e.Name()
+			}
+		}
+	}
+	if damaged == "" {
+		t.Fatal("the completed transaction left no revision to damage")
+	}
+	if err := os.WriteFile(filepath.Join(s.RecoveryDir(), damaged), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := PendingTxns(s)
+	if err != nil {
+		t.Fatalf("a damaged revision of an already-completed transaction must not brick every write command: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("the completed transaction must stay completed: %+v", pending)
+	}
+	// The store must still be writable end to end.
+	if _, err := SetGlobal(s, agents, "alpha", false); err != nil {
+		t.Fatalf("write commands must still run: %v", err)
+	}
+}
+
+func TestInstallCompensationPayloadNameUsesOperation(t *testing.T) {
+	for _, op := range []string{"new", "add", "adopt"} {
+		record := TxnRecord{Op: op, Name: "alpha", StartHead: "0123456789abcdef"}
+		name := installCompensationPayloadName(record)
+		if !strings.HasPrefix(name, "rollback-"+op+"-alpha-") {
+			t.Fatalf("operation %q produced compensation name %q", op, name)
+		}
+	}
+}
+
+func TestInstallCompensationPayloadNameUsesFullStartHead(t *testing.T) {
+	startHead := strings.Repeat("a", 40)
+	record := TxnRecord{Op: "add", Name: "alpha", StartHead: startHead}
+
+	name := installCompensationPayloadName(record)
+	if !strings.HasSuffix(name, "-"+startHead) {
+		t.Fatalf("compensation payload name %q does not contain full start HEAD %q", name, startHead)
 	}
 }

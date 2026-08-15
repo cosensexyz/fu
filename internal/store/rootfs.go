@@ -141,6 +141,7 @@ func openRootDirNoFollow(root *checkedRoot, dir string, create bool) (*os.File, 
 }
 
 func openRootDirNoFollowPerm(root *checkedRoot, dir string, create bool, perm os.FileMode) (*os.File, error) {
+	defer keepDescriptorOwnersAlive(root)
 	if root == nil || root.dir == nil {
 		return nil, fmt.Errorf("open directory %s: checked root is unavailable", dir)
 	}
@@ -281,6 +282,7 @@ func statEntryNoFollow(parentFD int, name, display string) (os.FileInfo, error) 
 }
 
 func lstatCheckedPath(root *checkedRoot, path string) (os.FileInfo, error) {
+	defer keepDescriptorOwnersAlive(root)
 	dir, base, err := openCheckedParent(root, path, false)
 	if err != nil {
 		return nil, err
@@ -322,6 +324,7 @@ func readOnlyRootOpen(flag int) bool {
 // the open itself safe, and O_TRUNC is withheld until the descriptor is proven
 // regular so a special file is never emptied on the way to being rejected.
 func openWritableRootFile(root *checkedRoot, path, display string, flag int, perm os.FileMode) (billy.File, error) {
+	defer keepDescriptorOwnersAlive(root)
 	base := filepath.Base(path)
 	if base == "." || base == ".." || base == string(filepath.Separator) {
 		return nil, fmt.Errorf("open %s for writing: %q does not name a file", display, path)
@@ -379,6 +382,7 @@ func openWritableRootFile(root *checkedRoot, path, display string, flag int, per
 // then does what it always claimed to, catching a replacement between the stat
 // and the open. O_NONBLOCK is what keeps a FIFO at this name from blocking.
 func openReadOnlyRootFile(root *checkedRoot, path, display string, flag int, perm os.FileMode) (billy.File, error) {
+	defer keepDescriptorOwnersAlive(root)
 	dir, base, err := openCheckedParent(root, path, false)
 	if err != nil {
 		return nil, err
@@ -461,6 +465,7 @@ func (f *rootFilesystem) Stat(name string) (os.FileInfo, error) {
 }
 
 func (f *rootFilesystem) Rename(oldName, newName string) error {
+	defer keepDescriptorOwnersAlive(f)
 	oldRoot, oldPath, _, err := f.resolve(oldName)
 	if err != nil {
 		return err
@@ -490,6 +495,7 @@ func (f *rootFilesystem) Rename(oldName, newName string) error {
 }
 
 func (f *rootFilesystem) Remove(name string) error {
+	defer keepDescriptorOwnersAlive(f)
 	root, p, _, err := f.resolve(name)
 	if err != nil {
 		return err
@@ -543,6 +549,7 @@ func (f *rootFilesystem) TempFile(dir, prefix string) (billy.File, error) {
 }
 
 func createTempAt(parent *os.File, prefix string) (*os.File, string, error) {
+	defer keepDescriptorOwnersAlive(parent)
 	for range 100 {
 		var random [8]byte
 		if _, err := rand.Read(random[:]); err != nil {
@@ -586,6 +593,7 @@ func createTempRoot(root *os.Root, dir, prefix string) (*os.File, string, error)
 }
 
 func openDirFresh(root *checkedRoot, name string) (*os.File, error) {
+	defer keepDescriptorOwnersAlive(root)
 	if root == nil || root.dir == nil {
 		return nil, fmt.Errorf("open directory %s: checked root is unavailable", name)
 	}
@@ -603,6 +611,7 @@ func openDirFresh(root *checkedRoot, name string) (*os.File, error) {
 }
 
 func readDirInfosFresh(root *checkedRoot, name string) ([]os.FileInfo, error) {
+	defer keepDescriptorOwnersAlive(root)
 	dir, err := openRootDirNoFollow(root, name, false)
 	if err != nil {
 		return nil, err
@@ -727,6 +736,7 @@ func (f *rootFilesystem) Lstat(name string) (os.FileInfo, error) {
 }
 
 func (f *rootFilesystem) Symlink(target, link string) error {
+	defer keepDescriptorOwnersAlive(f)
 	root, p, _, err := f.resolve(link)
 	if err != nil {
 		return err
@@ -744,6 +754,7 @@ func (f *rootFilesystem) Symlink(target, link string) error {
 }
 
 func (f *rootFilesystem) Readlink(link string) (string, error) {
+	defer keepDescriptorOwnersAlive(f)
 	root, p, _, err := f.resolve(link)
 	if err != nil {
 		return "", err
@@ -839,6 +850,7 @@ type rootFile struct {
 func (f *rootFile) Name() string { return f.name }
 
 func (f *rootFile) validateReadStamp() error {
+	defer keepDescriptorOwnersAlive(f)
 	if f.readStamp == nil {
 		return nil
 	}
@@ -885,9 +897,11 @@ func stableReadError(readErr, validationErr error) error {
 }
 
 func (f *rootFile) Lock() error {
+	defer keepDescriptorOwnersAlive(f)
 	return unix.Flock(int(f.Fd()), unix.LOCK_EX)
 }
 
 func (f *rootFile) Unlock() error {
+	defer keepDescriptorOwnersAlive(f)
 	return unix.Flock(int(f.Fd()), unix.LOCK_UN)
 }

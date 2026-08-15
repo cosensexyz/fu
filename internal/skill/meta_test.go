@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeSkill(t *testing.T, dir, frontmatter string) string {
@@ -34,6 +36,12 @@ func TestParseMeta(t *testing.T) {
 func TestParseMetaMissingFile(t *testing.T) {
 	if _, err := ParseMeta(t.TempDir()); err != ErrNoSkillFile {
 		t.Fatalf("want ErrNoSkillFile, got %v", err)
+	}
+}
+
+func TestDescribeEntryNamesDirectory(t *testing.T) {
+	if got := describeEntry(os.ModeDir); got != "a directory" {
+		t.Fatalf("describeEntry(directory) = %q, want %q", got, "a directory")
 	}
 }
 
@@ -80,5 +88,100 @@ func TestValidateRejectsBlankDescription(t *testing.T) {
 	// whitespace and all.
 	if err := Validate(Meta{Name: "alpha", Description: "  does a thing  "}, "alpha"); err != nil {
 		t.Errorf("a description with actual content must pass: %v", err)
+	}
+}
+
+// TestParseMetaRejectsOversizedSkillFile pins round 18 finding I8. SKILL.md
+// was the only uncapped external read in the codebase: MaxConfigBytes bounds
+// the config at 8 MiB, MaxSourceFileBytes bounds projected files at 64 MiB, and
+// readlinkAt bounds a link target at 1 MiB, but ParseMeta/ParseMetaFS/
+// ValidateSkillDir read SKILL.md whole. ScanFS calls ParseMetaFS for every
+// directory in a source tree, and `fu add <git-url>` is precisely the command
+// whose input is third-party, so an oversized SKILL.md exhausted memory during
+// the scan -- before the copy cap could ever refuse it.
+func TestParseMetaRejectsOversizedSkillFile(t *testing.T) {
+	dir := t.TempDir()
+	oversized := make([]byte, maxSkillFileBytes+1)
+	for i := range oversized {
+		oversized[i] = 'a'
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), oversized, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ParseMeta(dir); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("ParseMeta must refuse an oversized SKILL.md, got %v", err)
+	}
+	if _, err := ParseMetaFS(os.DirFS(dir), "."); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("ParseMetaFS must refuse an oversized SKILL.md, got %v", err)
+	}
+	if err := ValidateSkillDir(os.DirFS(dir), "."); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("ValidateSkillDir must refuse an oversized SKILL.md, got %v", err)
+	}
+}
+
+// TestFrontmatterIgnoresFenceInsideBlockScalar pins round 18 finding M3. The
+// closing fence was matched after TrimSpace, so a "---" line indented inside a
+// YAML block scalar ended the frontmatter early: the description was silently
+// truncated, and in the reverse field order the name came back empty and the
+// skill was rejected with the misleading "name length 0 out of range 1-64".
+// A fence is a document marker and only counts at column 0.
+func TestFrontmatterIgnoresFenceInsideBlockScalar(t *testing.T) {
+	raw := "---\ndescription: |\n  first line\n  ---\n  after the inner fence\nname: alpha\n---\n\nbody\n"
+	fm, err := frontmatter(raw)
+	if err != nil {
+		t.Fatalf("frontmatter: %v", err)
+	}
+	m := Meta{}
+	if err := yamlUnmarshalForTest(fm, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m.Name != "alpha" {
+		t.Fatalf("name = %q; the block scalar's inner fence must not end the frontmatter", m.Name)
+	}
+	if !strings.Contains(m.Description, "after the inner fence") {
+		t.Fatalf("description was truncated at the inner fence: %q", m.Description)
+	}
+}
+
+// TestFrontmatterAcceptsByteOrderMark: a UTF-8 BOM is invisible in every
+// editor, and rejecting the file with "missing frontmatter opening fence"
+// gives the user nothing to look at (round 18 finding M3).
+func TestFrontmatterAcceptsByteOrderMark(t *testing.T) {
+	raw := "\ufeff---\nname: alpha\ndescription: d\n---\n"
+	if _, err := frontmatter(raw); err != nil {
+		t.Fatalf("a leading UTF-8 BOM must not hide the opening fence: %v", err)
+	}
+}
+
+func yamlUnmarshalForTest(fm string, m *Meta) error {
+	return yaml.Unmarshal([]byte(fm), m)
+}
+
+// TestFrontmatterFenceToleratesTrailingWhitespace pins the marker rule against
+// YAML's own. `---` followed by spaces or tabs is a valid document-start
+// marker, and gopkg.in/yaml.v3 parses such a document; fu refused it and
+// reported a missing opening fence for a file whose first line is visibly
+// `---`. A trailing double space is a Markdown hard-line-break idiom, so this
+// is ordinary input, not a contrived one.
+func TestFrontmatterFenceToleratesTrailingWhitespace(t *testing.T) {
+	for _, raw := range []string{
+		"---  \nname: a\ndescription: d\n---\n",
+		"---\t\nname: a\ndescription: d\n---\n",
+		"---\nname: a\ndescription: d\n---  \n",
+		"---  \r\nname: a\ndescription: d\n---  \r\n",
+	} {
+		fm, err := frontmatter(raw)
+		if err != nil {
+			t.Fatalf("frontmatter(%q) = %v; a fence with trailing whitespace is still a fence", raw, err)
+		}
+		if !strings.Contains(fm, "name: a") {
+			t.Fatalf("frontmatter(%q) = %q; want the block between the fences", raw, fm)
+		}
+	}
+	// Leading whitespace is still content, not a marker: the column-0 rule is
+	// what keeps a `---` inside a block scalar from ending the block.
+	if _, err := frontmatter("  ---\nname: a\n---\n"); err == nil {
+		t.Fatal("an indented fence must still be content, not a marker")
 	}
 }

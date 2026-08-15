@@ -20,7 +20,7 @@ func TestToggleConfirmationDoesNotContradictConflictDiagnostic(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 	if _, err := runCmd(t, "disable", "alpha", "--agent", "claude"); err != nil {
@@ -60,7 +60,7 @@ func TestToggleConfirmationUnaffectedByAnotherSkillsConflict(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 	runCmd(t, "new", "beta")
@@ -91,7 +91,7 @@ func TestToggleConfirmationUnaffectedByAnotherSkillsConflict(t *testing.T) {
 // The confirmation must not contradict the disabled-foreign diagnostic
 // either -- the same class of bug finding 5 fixed for Conflicts/Failed,
 // now reachable through Result.DisabledForeign once printResult started
-// surfacing it. Without skillBlocked also checking DisabledForeign, this
+// surfacing it. Without toggleDeliveryBlocked also checking DisabledForeign, this
 // exact command would print "disabled alpha globally; takes effect in new
 // agent sessions" directly beneath a diagnostic saying the skill may still
 // be loaded -- reintroducing finding 5's bug for this one report the
@@ -100,7 +100,7 @@ func TestToggleConfirmationDoesNotContradictDisabledForeignDiagnostic(t *testing
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 	if _, err := runCmd(t, "disable", "alpha"); err != nil {
@@ -132,7 +132,7 @@ func TestToggleConfirmationDoesNotContradictDisabledForeignDiagnostic(t *testing
 	}
 }
 
-// Round 3 finding 1: skillBlocked only compared Conflicts/DisabledForeign/
+// Round 3 finding 1: toggleDeliveryBlocked only compared Conflicts/DisabledForeign/
 // Failed's Action.Skill against name directly, but Reconcile records an
 // agent-level failure (a broken ScanAgent, discovered before Diff ever
 // runs for that agent) as a placeholder Action whose Skill is empty --
@@ -147,8 +147,8 @@ func TestToggleGlobalConfirmationQualifiedByAgentLevelFailure(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
+	mustMkdirAll(t, filepath.Join(home, ".codex"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -179,7 +179,36 @@ func TestToggleGlobalConfirmationQualifiedByAgentLevelFailure(t *testing.T) {
 	}
 }
 
-// Round 3 finding 1: Missing was not consulted by skillBlocked at all, so
+func TestToggleNoOpStillPrintsReconcileFailure(t *testing.T) {
+	fuHome, home := t.TempDir(), t.TempDir()
+	t.Setenv("FU_HOME", fuHome)
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "init")
+	runCmd(t, "new", "alpha")
+	codexSkills := filepath.Join(home, ".codex", "skills")
+	if err := os.RemoveAll(codexSkills); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(codexSkills, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runCmd(t, "enable", "alpha")
+	if err == nil {
+		t.Fatal("a no-op toggle with a reconcile failure must exit non-zero")
+	}
+	if !strings.Contains(out, "failed: codex:") {
+		t.Fatalf("no-op toggle lost its reconcile diagnostic: %q", out)
+	}
+	if !strings.Contains(out, "enabled alpha globally") {
+		t.Fatalf("no-op toggle lost its durable-state confirmation: %q", out)
+	}
+}
+
+// Round 3 finding 1: Missing was not consulted by toggleDeliveryBlocked at all, so
 // a skill enabled but whose store content is gone still got an
 // unqualified "takes effect" confirmation, directly contradicting the
 // "missing:" diagnostic printed right above it. Reproduced against the
@@ -191,7 +220,7 @@ func TestToggleConfirmationQualifiedByMissingStoreContent(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 	runCmd(t, "disable", "alpha")
@@ -221,8 +250,8 @@ func TestToggleConfirmationQualifiedBySkippedAgent(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
+	mustMkdirAll(t, filepath.Join(home, ".codex"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -249,7 +278,7 @@ func TestToggleConfirmationQualifiedBySkippedAgent(t *testing.T) {
 }
 
 // Round 3 finding 1's own false-positive direction, the reverse of the
-// three tests above: skillBlocked used to ignore agent scope entirely, so
+// three tests above: toggleDeliveryBlocked used to ignore agent scope entirely, so
 // an --agent-scoped toggle picked up a diagnostic recorded against a
 // completely different agent it never touched. Reproduced against the
 // compiled binary pre-fix: with claude's alpha link disturbed by foreign
@@ -259,8 +288,8 @@ func TestToggleAgentScopedConfirmationUnaffectedByAnotherAgentsConflict(t *testi
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
+	mustMkdirAll(t, filepath.Join(home, ".codex"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -289,7 +318,7 @@ func TestToggleCommands(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 	link := filepath.Join(home, ".claude", "skills", "alpha")
@@ -318,7 +347,7 @@ func TestToggleUnknownSkillAndAgentFail(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -390,7 +419,7 @@ func TestToggleAgentEmptyStringRejectedNotGlobal(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -421,7 +450,7 @@ func TestToggleCommandsConfirmChangeAndTiming(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -455,8 +484,8 @@ func TestToggleAgentWriteDoesNotDestroyAnotherAgentsOverride(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
+	mustMkdirAll(t, filepath.Join(home, ".codex"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -517,7 +546,7 @@ func TestOrdinaryWriteReclaimsStrayLinkUnderInvalidNameLoadedFromDisk(t *testing
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -559,13 +588,13 @@ func TestOrdinaryWriteReclaimsStrayLinkUnderInvalidNameLoadedFromDisk(t *testing
 }
 
 // Round 4 process rule: a narrowing fix must have a test for the side it
-// excludes, written before the fix. skillBlocked's five report kinds
+// excludes, written before the fix. toggleDeliveryBlocked's five report kinds
 // (Conflicts, DisabledForeign, Missing, Failed, Skipped) each already had a
 // "must soften" test above; only Conflicts
 // (TestToggleAgentScopedConfirmationUnaffectedByAnotherAgentsConflict) also
 // had the reverse -- "must NOT soften" -- direction. The other four kinds'
 // own agent-scoping guard (the `targeted[...]` check in each of
-// skillBlocked's loops) was therefore unpinned: correct today, but exactly
+// toggleDeliveryBlocked's loops) was therefore unpinned: correct today, but exactly
 // the kind of adjacent coordinate three straight review rounds have found
 // unguarded and regressed. The four tests below close that gap, one per
 // remaining report kind, each mirroring
@@ -575,10 +604,10 @@ func TestOrdinaryWriteReclaimsStrayLinkUnderInvalidNameLoadedFromDisk(t *testing
 // ordinary, unqualified wording.
 //
 // Each was verified to discriminate by temporarily relaxing its
-// corresponding skillBlocked branch (dropping the `targeted[...]` guard so
+// corresponding toggleDeliveryBlocked branch (dropping the `targeted[...]` guard so
 // the report blocks regardless of agent scope) and confirming the test
 // fails, then restoring the guard and confirming it passes again; see the
-// round4-tests-docs.md report for the exact before/after `go test` output.
+// the saved code-review record for the exact before/after `go test` output.
 
 // TestToggleAgentScopedConfirmationUnaffectedByAnotherAgentsDisabledForeignDiagnostic
 // is DisabledForeign's reverse direction, the counterpart to
@@ -591,8 +620,8 @@ func TestToggleAgentScopedConfirmationUnaffectedByAnotherAgentsDisabledForeignDi
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
+	mustMkdirAll(t, filepath.Join(home, ".codex"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -629,14 +658,14 @@ func TestToggleAgentScopedConfirmationUnaffectedByAnotherAgentsDisabledForeignDi
 // idempotent, but still runs the full pipeline and reconcile) must not be
 // softened by codex's unrelated report against the very same skill name;
 // the same-name-different-agent shape mirrors the Conflicts test above so
-// the assertion exercises skillBlocked's agent match, not its skill-name
+// the assertion exercises toggleDeliveryBlocked's agent match, not its skill-name
 // match (a *different* skill name would already discriminate on its own).
 func TestToggleAgentScopedConfirmationUnaffectedByAnotherAgentsMissingStoreContent(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
+	mustMkdirAll(t, filepath.Join(home, ".codex"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -665,7 +694,7 @@ func TestToggleAgentScopedConfirmationUnaffectedByAnotherAgentsMissingStoreConte
 // case above -- and the shape the task brief calls out as mattering most:
 // Failed's agent-level form (a broken ScanAgent recorded as a placeholder
 // Action with AgentName set and Skill == "") blocks *every* skill on that
-// agent by construction, so if skillBlocked's `targeted[f.Action.AgentName]`
+// agent by construction, so if toggleDeliveryBlocked's `targeted[f.Action.AgentName]`
 // guard were ever dropped, this is the branch that would silently start
 // softening every other agent's confirmation too. codex's skills dir is a
 // plain file (ScanAgent fails for codex specifically); claude has nothing
@@ -677,8 +706,8 @@ func TestToggleAgentScopedConfirmationUnaffectedByAnotherAgentsFailure(t *testin
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
+	mustMkdirAll(t, filepath.Join(home, ".codex"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 
@@ -716,8 +745,8 @@ func TestToggleAgentScopedConfirmationUnaffectedByAnotherAgentsSkippedStatus(t *
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
+	mustMkdirAll(t, filepath.Join(home, ".codex"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 

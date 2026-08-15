@@ -26,12 +26,16 @@ move, and every change is a commit.
 
 ## Status
 
-**Six commands ship today:** `init`, `new`, `list`, `show`, `enable`, `disable`.
+**Ten commands ship today:** `init`, `new`, `list`, `show`, `enable`, `disable`,
+`add`, `adopt`, `rm`, `gc`.
 
-That is enough to write your own skills and manage which agents see them. It is
-not enough to install skills from anywhere else — `add`, `adopt`, `update`,
-`clone`, `push`, `pull`, `log`, `revert` and the rest are designed but not
-built. See [Roadmap](#roadmap).
+`add` installs a skill from a git URL or a local directory and records the
+locked source; `adopt` takes skills that already live in an agent's directory
+into the store, switching them to fu links; `rm` unregisters a skill and
+removes it from every agent; `gc` safely prunes completed transaction journals.
+Still designed but not built: `update`, `outdated`,
+`clone`, `push`, `pull`, `log`, `revert`, `restore`, `commit`, `status`,
+`remote`, `agent`. See [Roadmap](#roadmap).
 
 **macOS and Linux.** fu relies on POSIX directory-relative syscalls and does not
 build on Windows.
@@ -152,6 +156,10 @@ so a skill is never out of date in one agent and current in another.
 |---|---|
 | `fu init` | Create the store at `$FU_HOME` (default `~/.fu`). |
 | `fu new <name>` | Scaffold a skill in the store, enabled everywhere. |
+| `fu add [--all] [--ref <ref>] <source>` | Install from a git URL (including SCP forms) or local directory; `--ref` explicitly selects a git branch or tag. A source holding several skills prompts for a comma-separated selection (or `all`); `--all` installs every valid skill without prompting. Submitting an empty selection is an intentional successful cancellation (nothing is installed); input ending before any choice is an error. |
+| `fu adopt [--agent <a>]` | Take existing skill entries into the store, switching them to fu links; an explicitly empty agent value is rejected. |
+| `fu rm <name>` | Unregister a skill and remove it from every agent. |
+| `fu gc` | Safely prune completed transaction journal revisions and markers; recovery payload archives are never deleted. |
 | `fu list` | Show every skill and the full switch matrix. |
 | `fu show <name>` | Show one skill's frontmatter, digest and per-agent state. |
 | `fu enable <name> [--agent <a>]` | Turn a skill on, globally or for one agent. |
@@ -170,12 +178,42 @@ wrongly (unknown command, missing argument, bad flag).
 │   ├── fu.yaml              the skill registry and switch matrix
 │   └── skills/<name>/       the skills themselves
 ├── staging/                 machine-local: work in progress
-├── recovery/                machine-local: the write-ahead journal
+├── recovery/                machine-local: the journal, and archived originals
 └── fu.lock                  machine-local: write mutex
 ```
 
 Only `store/` is a git repository, and only `store/` is meant to be synced. The
 other three are per-machine bookkeeping.
+
+`recovery/` holds more than the write-ahead journal. `fu gc` removes only
+completed transaction revision families, using a crash-resumable prune record
+before it deletes the first journal file. Every original `adopt` replaced and
+every skill `rm` removed is archived there first, and kept — `fu gc` never
+deletes those payloads. POSIX offers no portable way to unlink a file
+conditional on its identity, and deleting an archive by name could remove
+something that arrived later. So if an adopt took in a directory you wanted
+back, or an `rm` removed more than you meant, the content is still on disk
+under `recovery/`. Reclaiming archived-payload space is manual today; a `fu
+status` that reports those payloads and a separate collector for provably owned
+orphans are designed but not built.
+
+The same directory also contains content-addressed `adopt-link-*.json` records.
+They preserve the exact identity, mode, path, and raw target of symlinks removed
+during adopt, and recovery validates them before it may unlink a retired link.
+A crash before the corresponding journal revision can leave an orphan record;
+`fu gc` intentionally retains it because current code cannot prove it is safe
+to collect. Do not delete these records by hand. They contain enough authority
+for a future restore operation, but this release does not ship a command that
+automatically restores an archived directory or symlink.
+
+Agent-link retirement has one smaller crash residue outside `recovery/`.
+Reconcile first renames an approved fu-owned link to an unpredictable
+`.fu-retired-*` sibling, validates that moved inode and raw target, and then
+unlinks it. A process crash between the rename and unlink can leave that link
+behind after the live name is recreated. It does not contain user data and
+does not block later commands, but this release deliberately does not collect
+an unjournalled name automatically. The planned `fu status` will report these
+orphan links alongside retained recovery payloads.
 
 ## Behaviour worth knowing
 
@@ -191,19 +229,25 @@ per agent, and you would not get it back by toggling the global switch again.
 The override disappears when you write it to match the global value yourself.
 
 **Hand-editing the store is expected.** Edit `~/.fu/store/skills/<name>/`
-directly whenever you like. The next fu command notices and commits it as an
-`external: manual modifications` commit before doing its own work, so nothing
-you wrote is silently swallowed into an unrelated change.
+directly whenever you like. The next fu *write* command notices and commits it
+as an `external: manual modifications` commit before doing its own work, so
+nothing you wrote is silently swallowed into an unrelated change. Read-only
+commands (`list`, `show`) take no lock and do not sweep, so an edit stays
+uncommitted until you next run a write command.
 
 **fu will not touch what it did not create.** If something already occupies the
 path where a symlink would go — a real directory, or a link you made yourself —
 fu reports it and leaves it alone rather than replacing it. The same applies in
 reverse: it only removes links whose target it can prove it wrote.
 
-**Interruptions recover on their own.** Every write is journaled before it
-happens. If a command is killed part-way, the next one finishes it, rolls it
-back, or reports a genuine conflict — you do not need to know where it stopped
-or repair anything by hand.
+**Durable mutations recover on their own.** Write commands enter recovery before
+ordinary work. If a command is killed part-way, the next write command finishes
+the recorded mutation, rolls it back, or reports a genuine conflict. Unknown or
+replaced files are preserved rather than guessed at or deleted.
+
+An error after the Git commit is durable is still a non-zero exit, but it is not
+reported as though nothing happened: fu prints the committed mutation and names
+whether post-commit work or WAL recovery remains pending.
 
 **`store/` is an ordinary git repository.** If you prefer, use `git` in it
 directly. fu is built to tolerate that rather than to own the repository
@@ -215,11 +259,11 @@ Designed in [DESIGN.md](DESIGN.md), not yet built:
 
 | | |
 |---|---|
-| `add`, `adopt` | Install a skill from a git URL; take existing scattered skills into the store. |
 | `update`, `outdated` | Track upstream versions and upgrade against a recorded commit. |
 | `clone`, `push`, `pull` | Move the store between machines. |
 | `log`, `revert`, `restore` | Browse history, undo a committed change, repair an uncommitted one. |
-| `commit`, `rm`, `status` | Record edits deliberately, remove a skill, inspect pending state. |
+| `commit`, `status` | Record edits deliberately, inspect pending state. |
+| `remote`, `agent` | Configure the store's remote, and inspect or configure agent adapters. |
 
 [SPEC.md](SPEC.md) states the product in full; [DESIGN.md](DESIGN.md) is the
 implementation design, including the known gaps. Both are written in Chinese.

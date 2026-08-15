@@ -5,5 +5,5 @@ package store
 import "golang.org/x/sys/unix"
 
 func renameExchange(oldDirFD int, oldName string, newDirFD int, newName string) error {
-	return unix.RenameatxNp(oldDirFD, oldName, newDirFD, newName, unix.RENAME_SWAP)
+	return mapAtomicRenameError("exchange", unix.RenameatxNp(oldDirFD, oldName, newDirFD, newName, unix.RENAME_SWAP))
 }

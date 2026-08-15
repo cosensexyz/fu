@@ -6,7 +6,35 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cosensexyz/fu/internal/engine"
 )
+
+type fakeShowApplication struct {
+	outcome engine.ShowOutcome
+	err     error
+}
+
+func (f fakeShowApplication) ShowSkill(string) (engine.ShowOutcome, error) {
+	return f.outcome, f.err
+}
+
+func TestShowSourceFieldsStayOnOneLine(t *testing.T) {
+	cmd := newShowCmd(fakeShowApplication{outcome: engine.ShowOutcome{
+		Description: "d",
+		Source:      map[string]string{"subdir": "tools/alpha\nglobal: off"},
+	}})
+	stdout, err := executeCommandForOutcomeTest(cmd, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(stdout, "global:") != 2 {
+		t.Fatalf("a source value must not forge an additional global field:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "\nglobal: off\n") {
+		t.Fatalf("source field newline was not flattened:\n%s", stdout)
+	}
+}
 
 // Round 3 finding 2: `fu show` joined an unvalidated fu.yaml key straight
 // onto st.SkillsDir() (internal/cli/show.go), the other place a name
@@ -34,7 +62,7 @@ func TestShowRejectsPathTraversalNamePlantedViaFuYaml(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 
 	// Real content one level above $FU_HOME/store (i.e. outside the store's
@@ -86,7 +114,7 @@ func TestShowStillWorksWhenNoInvalidNamesPresent(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
 

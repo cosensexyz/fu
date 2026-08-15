@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 
 	"golang.org/x/sys/unix"
@@ -61,8 +62,47 @@ type Config struct {
 // InvalidName pairs a fu.yaml skill name that fails skill.ValidateName with
 // why, so a caller can report it (round 4 finding 2).
 type InvalidName struct {
-	Name   string
-	Reason string
+	Name      string
+	Reason    string
+	enabled   bool
+	overrides map[string]bool
+}
+
+// Effective reports the isolated entry's switch state for diagnostics only.
+// Normal Config accessors deliberately reveal nothing about invalid names;
+// this snapshot lets the engine decide whether a reserved collision has any
+// user-visible consequence without reopening that accessor boundary.
+func (i InvalidName) Effective(agent string) bool {
+	if on, ok := i.overrides[agent]; ok {
+		return on
+	}
+	return i.enabled
+}
+
+func newInvalidName(name, reason string, entry *yaml.Node) InvalidName {
+	invalid := InvalidName{Name: name, Reason: reason, enabled: true}
+	if entry == nil || entry.Kind != yaml.MappingNode {
+		return invalid
+	}
+	if enabled := mapGet(entry, "enabled"); enabled != nil &&
+		enabled.Kind == yaml.ScalarNode && enabled.Tag == "!!bool" {
+		invalid.enabled = boolValue(enabled)
+	}
+	overrides := mapGet(entry, "overrides")
+	if overrides == nil || overrides.Kind != yaml.MappingNode {
+		return invalid
+	}
+	for n := 0; n+1 < len(overrides.Content); n += 2 {
+		name, value := overrides.Content[n], overrides.Content[n+1]
+		if name.Kind != yaml.ScalarNode || value.Kind != yaml.ScalarNode || value.Tag != "!!bool" {
+			continue
+		}
+		if invalid.overrides == nil {
+			invalid.overrides = map[string]bool{}
+		}
+		invalid.overrides[name.Value] = boolValue(value)
+	}
+	return invalid
 }
 
 func defaultDoc() *yaml.Node {
@@ -141,8 +181,10 @@ func missingConfigErr(path, what string) error {
 // entry is filtered at the accessor boundary, not deleted from c.doc), so
 // Save round-trips it unchanged rather than silently erasing it from
 // fu.yaml as a side effect of an unrelated write -- only a human
-// hand-editing fu.yaml removes it (this plan ships no `fu rm`). See
-// InvalidNames for how a caller reports these.
+// hand-editing fu.yaml removes it. `fu rm` refuses a name LoadConfig has
+// isolated without using it as a path component, but reports the validation
+// reason and config path so the user can edit the entry. See InvalidNames for
+// how a caller reports these.
 func LoadConfig(path string) (*Config, error) {
 	return loadConfigWithHooks(path, regularFileReadHooks{})
 }
@@ -292,6 +334,14 @@ func (c *Config) VersionTooNew() bool {
 // already-open flow collection. Left unfixed, real stores degrade to a
 // single unreadable, unmergeable line the moment a second skill is added.
 func (c *Config) Save() error {
+	return c.saveWithHooks(configSaveHooks{})
+}
+
+type configSaveHooks struct {
+	afterOpenRoot func() error
+}
+
+func (c *Config) saveWithHooks(hooks configSaveHooks) (retErr error) {
 	if err := c.CheckWritable(); err != nil {
 		return err
 	}
@@ -300,9 +350,26 @@ func (c *Config) Save() error {
 		return err
 	}
 	if c.fsRoot != nil {
+		if hooks.afterOpenRoot != nil {
+			if err := hooks.afterOpenRoot(); err != nil {
+				return err
+			}
+		}
 		return WriteFileAtomicRoot(c.fsRoot, c.rootPath, out, 0o644)
 	}
-	return WriteFileAtomic(c.path, out, 0o644)
+	root, err := os.OpenRoot(filepath.Dir(c.path))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, root.Close())
+	}()
+	if hooks.afterOpenRoot != nil {
+		if err := hooks.afterOpenRoot(); err != nil {
+			return err
+		}
+	}
+	return WriteFileAtomicRoot(root, filepath.Base(c.path), out, 0o644)
 }
 
 // ErrConfigChangedExternally means fu.yaml no longer held the bytes the
@@ -384,13 +451,12 @@ func (s *Store) RecoverConfigExchanges() error {
 	return recoverPendingConfigExchanges(s.writeRoots.store, s.writeRoots.staging, s.writeRoots.recovery)
 }
 
-// configExchangeHooks is a test-only seam at the two boundaries a concurrent
-// writer can be observed: with fu's bytes staged but not yet published, and
-// with the displaced object parked but not yet judged.
+// configExchangeHooks is a test-only seam at durable exchange boundaries.
 type configExchangeHooks struct {
 	afterRecord    func()
 	beforeExchange func()
 	afterExchange  func()
+	afterRestore   func()
 }
 
 func (s *Store) installConfigExpecting(expect, data []byte, hooks configExchangeHooks) error {
@@ -439,6 +505,7 @@ func configArchiveName(identity FileIdentity) string {
 // never mutates or deletes the object resolved by the terminal namespace
 // operation; if a writer wins a race, that object remains preserved.
 func archiveNamedConfigEntry(source *checkedRoot, sourceName string, archive *checkedRoot, expected FileIdentity) error {
+	defer keepDescriptorOwnersAlive(source, archive)
 	if !validLogicalEntry(sourceName) {
 		return fmt.Errorf("archive config entry: invalid source name %q", sourceName)
 	}
@@ -466,6 +533,7 @@ func archiveNamedConfigEntry(source *checkedRoot, sourceName string, archive *ch
 }
 
 func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *checkedRoot, expect, data []byte, perm os.FileMode, hooks configExchangeHooks) error {
+	defer keepDescriptorOwnersAlive(target, scratch, archive)
 	targetFD := int(target.dir.Fd())
 	scratchFD := int(scratch.dir.Fd())
 	targetPath := filepath.Join(target.display, name)
@@ -595,6 +663,9 @@ func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *che
 	if swapErr := renameExchange(scratchFD, configSwapName, targetFD, name); swapErr != nil {
 		return fmt.Errorf("%w (the displaced %s is parked at %s because restoring it failed: %v)",
 			ErrConfigChangedExternally, targetPath, scratchPath, swapErr)
+	}
+	if hooks.afterRestore != nil {
+		hooks.afterRestore()
 	}
 	// fu's generated inode is back under the scratch name. Retain it by the same
 	// no-replace protocol: a same-user process may have linked to the visible
@@ -870,7 +941,7 @@ func validateConfigTree(root *yaml.Node) ([]InvalidName, error) {
 		// routing an untrusted name through skill.ValidateName first, the
 		// way NewSkill already disciplines itself to do.
 		if err := skill.ValidateName(skillName); err != nil {
-			invalid = append(invalid, InvalidName{Name: skillName, Reason: err.Error()})
+			invalid = append(invalid, newInvalidName(skillName, err.Error(), skills.Content[i+1]))
 			continue
 		}
 		entry := skills.Content[i+1]
@@ -882,6 +953,19 @@ func validateConfigTree(root *yaml.Node) ([]InvalidName, error) {
 		}
 		if enabled := mapGet(entry, "enabled"); enabled != nil && !isBoolScalar(enabled) {
 			return nil, malformedErr(base+".enabled", "must be a boolean")
+		}
+		if source := mapGet(entry, "source"); source != nil {
+			if source.Kind != yaml.MappingNode {
+				return nil, malformedErr(base+".source", "must be a mapping of scalar strings")
+			}
+			if err := checkUnambiguousKeys(source, base+".source"); err != nil {
+				return nil, err
+			}
+			for j := 0; j+1 < len(source.Content); j += 2 {
+				if source.Content[j+1].Kind != yaml.ScalarNode || source.Content[j+1].Tag != "!!str" {
+					return nil, malformedErr(base+".source."+source.Content[j].Value, "must be a scalar string")
+				}
+			}
 		}
 		overrides := mapGet(entry, "overrides")
 		if overrides == nil {
@@ -974,8 +1058,12 @@ func mapSet(m *yaml.Node, key string, val *yaml.Node) {
 			return
 		}
 	}
+	// The key node needs the same explicit !!str tag scalar() carries (round
+	// 15 finding I1): a legal skill name like "true" or "123" would
+	// otherwise serialize bare and reload as !!bool/!!float, and
+	// checkUnambiguousKeys would reject the whole store.
 	m.Content = append(m.Content,
-		&yaml.Node{Kind: yaml.ScalarNode, Value: key}, val)
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"}, val)
 }
 
 func mapDel(m *yaml.Node, key string) {
@@ -990,7 +1078,16 @@ func mapDel(m *yaml.Node, key string) {
 	}
 }
 
-func scalar(v string) *yaml.Node { return &yaml.Node{Kind: yaml.ScalarNode, Value: v} }
+// scalar builds a string-typed YAML scalar. The explicit !!str tag matters
+// (round 14 finding I1): without it, a value YAML would parse as something
+// else -- "true", "123", "1.0", a date -- serializes unquoted, reloads as
+// !!bool/!!float, and validateConfigTree then rejects the whole store.
+// boolNode overrides the tag with !!bool for the one genuine boolean field.
+func scalar(v string) *yaml.Node {
+	n := &yaml.Node{Kind: yaml.ScalarNode, Value: v}
+	n.Tag = "!!str"
+	return n
+}
 
 func boolNode(b bool) *yaml.Node {
 	n := scalar(fmt.Sprintf("%v", b))
@@ -1079,11 +1176,19 @@ func (c *Config) AddSkill(name, digest string) error {
 }
 
 // RemoveSkill deletes a skill's entire entry, including any overrides.
-func (c *Config) RemoveSkill(name string) { mapDel(c.skills(), name) }
+func (c *Config) RemoveSkill(name string) {
+	if c.isInvalidName(name) {
+		return
+	}
+	mapDel(c.skills(), name)
+}
 
 // Digest returns the recorded content digest for name, or "" if the
 // skill or its digest field is absent.
 func (c *Config) Digest(name string) string {
+	if c.isInvalidName(name) {
+		return ""
+	}
 	if d := mapGet(mapGet(c.skills(), name), "digest"); d != nil {
 		return d.Value
 	}
@@ -1093,6 +1198,9 @@ func (c *Config) Digest(name string) string {
 // SetDigest updates the recorded content digest of an existing skill.
 // It is a no-op if the skill is not registered.
 func (c *Config) SetDigest(name, digest string) {
+	if c.isInvalidName(name) {
+		return
+	}
 	if entry := mapGet(c.skills(), name); entry != nil {
 		mapSet(entry, "digest", scalar(digest))
 	}
@@ -1100,6 +1208,9 @@ func (c *Config) SetDigest(name, digest string) {
 
 // Enabled returns the global switch (absent means true).
 func (c *Config) Enabled(name string) bool {
+	if c.isInvalidName(name) {
+		return false
+	}
 	e := mapGet(mapGet(c.skills(), name), "enabled")
 	return e == nil || boolValue(e)
 }
@@ -1110,10 +1221,7 @@ func (c *Config) Enabled(name string) bool {
 // Existing overrides are left completely untouched, even one that becomes
 // equal to the new global value as a result (round 3 finding 4, reversing
 // this build's own prior behavior -- normalize used to be called from
-// here too). SPEC §4.1 contains two rules that contradict each other for
-// exactly this case: same-value normalization applies after "any" switch
-// write, but a global toggle is also said to leave overrides alone. This
-// build resolves the contradiction in favor of the second rule: an
+// here too). SPEC §4.1 now states this rule directly: an
 // override is a user's explicit, one-agent decision, and a global toggle
 // is a completely unrelated write -- letting it silently delete that
 // decision just because the two values happened to end up equal is a
@@ -1128,6 +1236,9 @@ func (c *Config) Enabled(name string) bool {
 // either way. See normalize's own doc comment for where normalization
 // still happens.
 func (c *Config) SetEnabled(name string, on bool) {
+	if c.isInvalidName(name) {
+		return
+	}
 	entry := mapGet(c.skills(), name)
 	if entry == nil {
 		return
@@ -1137,6 +1248,9 @@ func (c *Config) SetEnabled(name string, on bool) {
 
 // Override returns (value, present) for an agent-level override.
 func (c *Config) Override(name, agent string) (bool, bool) {
+	if c.isInvalidName(name) {
+		return false, false
+	}
 	v := mapGet(mapGet(mapGet(c.skills(), name), "overrides"), agent)
 	if v == nil {
 		return false, false
@@ -1173,6 +1287,9 @@ func (c *Config) Override(name, agent string) (bool, bool) {
 // an agent the user had explicitly, and by this point only apparently,
 // disabled.
 func (c *Config) SetAgent(name, agent string, on bool) {
+	if c.isInvalidName(name) {
+		return
+	}
 	entry := mapGet(c.skills(), name)
 	if entry == nil {
 		return
@@ -1203,4 +1320,95 @@ func (c *Config) Effective(name, agent string) bool {
 		return v
 	}
 	return c.Enabled(name)
+}
+
+// ---- source record ----
+
+// SourceFields returns the `source` record of a skill as a map of scalar
+// field values, or an empty map when the skill or its source record is
+// absent. The field names and their semantics belong to internal/source;
+// Config treats the record as an opaque scalar mapping (DESIGN §3), which
+// is what keeps the dependency direction store -> source nonexistent.
+//
+// validateConfigTree guarantees at load time that every source mapping
+// holds only scalar strings, so SourceFields can read through this single
+// helper without re-checking shapes.
+func (c *Config) SourceFields(name string) map[string]string {
+	if c.isInvalidName(name) {
+		return map[string]string{}
+	}
+	src := mapGet(mapGet(c.skills(), name), "source")
+	if src == nil || src.Kind != yaml.MappingNode {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(src.Content)/2)
+	for i := 0; i+1 < len(src.Content); i += 2 {
+		key := src.Content[i].Value
+		if _, seen := out[key]; seen {
+			continue
+		}
+		out[key] = src.Content[i+1].Value
+	}
+	return out
+}
+
+// SetSourceFields replaces a skill's entire source record with fields. An
+// empty or nil fields map deletes the record (the mapping's absence is the
+// canonical form, the same way SetAgent erases an override that matches the
+// global). The operation is a no-op for an unregistered skill.
+//
+// The replacement is a true replacement (round 13 finding I3): keys present
+// in the existing record but absent from fields are dropped, so a partial
+// update (e.g. update rewriting the lock fields) cannot leave stale keys
+// (an old ref_kind, a superseded commit) behind.
+//
+// New keys are appended in sorted order so the serialized record is
+// canonical: recovery reconstructs the expected config from the same fields
+// JSON-round-tripped through the transaction record, and the two sides must
+// produce identical bytes for the committed-state comparison to hold (the
+// operation and the reconstruction otherwise iterate the same Go map in
+// unrelated random orders).
+func (c *Config) SetSourceFields(name string, fields map[string]string) {
+	if c.isInvalidName(name) {
+		return
+	}
+	entry := mapGet(c.skills(), name)
+	if entry == nil {
+		return
+	}
+	if len(fields) == 0 {
+		mapDel(entry, "source")
+		return
+	}
+	src := mapGet(entry, "source")
+	if src == nil || src.Kind != yaml.MappingNode {
+		src = emptyMap()
+		mapSet(entry, "source", src)
+	}
+	seen := make(map[string]bool, len(fields))
+	filtered := src.Content[:0]
+	for i := 0; i+1 < len(src.Content); i += 2 {
+		key := src.Content[i].Value
+		value, ok := fields[key]
+		if !ok {
+			continue // stale key: dropped by the replacement
+		}
+		seen[key] = true
+		filtered = append(filtered, src.Content[i], scalar(value))
+	}
+	src.Content = filtered
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		if !seen[key] {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		src.Content = append(src.Content,
+			// The key node carries the explicit !!str tag like mapSet's (round
+			// 15 finding I1): source field names are fixed and safe, but the
+			// same construction must not reintroduce the un-Tagged shape.
+			&yaml.Node{Kind: yaml.ScalarNode, Value: key, Tag: "!!str"}, scalar(fields[key]))
+	}
 }

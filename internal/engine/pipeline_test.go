@@ -16,6 +16,25 @@ import (
 	"github.com/cosensexyz/fu/internal/store"
 )
 
+func TestOperationOutcomeDurablyStartedAtEitherBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		outcome OperationOutcome
+		want    bool
+	}{
+		{name: "neither", outcome: OperationOutcome{}, want: false},
+		{name: "commit", outcome: OperationOutcome{Committed: true}, want: true},
+		{name: "post commit", outcome: OperationOutcome{PostCommitComplete: true}, want: true},
+		{name: "both", outcome: OperationOutcome{Committed: true, PostCommitComplete: true}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.outcome.DurablyStarted(); got != tc.want {
+				t.Fatalf("DurablyStarted() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunPipelineOrderAndSweep(t *testing.T) {
 	s, _ := setupStore(t)
 	// external edit exists before the operation
@@ -38,6 +57,21 @@ func TestRunPipelineOrderAndSweep(t *testing.T) {
 	}
 	if entries[1].Message != "external: manual modifications" {
 		t.Fatalf("external edit must be swept into its own commit, got %q", entries[1].Message)
+	}
+}
+
+func TestRunOutcomeDoesNotClaimNoOpCommitWasWritten(t *testing.T) {
+	s, _ := setupStore(t)
+	outcome := OperationOutcome{Name: "noop"}
+	_, err := run(s, nil, Op{Message: "noop", outcome: &outcome, Mutate: func(*store.Store, *store.Config) error { return nil }}, hooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Committed {
+		t.Fatalf("no-op commit must not be reported as written: %+v", outcome)
+	}
+	if !outcome.PostCommitComplete || !outcome.WALComplete || !outcome.CanonicalChecked || !outcome.ReconcileComplete || outcome.RecoveryPending {
+		t.Fatalf("a successful no-op must still report every later phase complete: %+v", outcome)
 	}
 }
 
@@ -90,6 +124,58 @@ func TestRunReconcilesAtEnd(t *testing.T) {
 	}
 	if _, err := os.Readlink(filepath.Join(dir, "alpha")); err != nil {
 		t.Fatal("pipeline must reconcile links after the commit")
+	}
+}
+
+func TestWriteCommandPrologueReconcilesWithoutPendingTransactions(t *testing.T) {
+	s, _ := setupStore(t)
+	agentDir := t.TempDir()
+	agents := []agent.Agent{fakeAgent{"claude", agentDir}}
+	if _, err := NewSkill(s, agents, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(agentDir, "alpha")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Dir(), "manual.txt"), []byte("dirty"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := writeCommandPrologue(s, agents); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Readlink(filepath.Join(agentDir, "alpha")); err != nil {
+		t.Fatalf("prologue must reconcile even with no pending WAL: %v", err)
+	}
+}
+
+func TestWriteCommandPrologueChecksWritableBeforeSweep(t *testing.T) {
+	s, _ := setupStore(t)
+	before, err := s.Log(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.ConfigPath(), []byte("version: 99\nskills: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = writeCommandPrologue(s, nil)
+	if !errors.Is(err, store.ErrVersionTooNew) {
+		t.Fatalf("prologue error = %v, want ErrVersionTooNew", err)
+	}
+	after, err := s.Log(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("writability refusal must precede sweep: before=%d after=%d", len(before), len(after))
+	}
+	dirty, err := s.IsDirty()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dirty {
+		t.Fatal("the refused config edit must remain uncommitted")
 	}
 }
 

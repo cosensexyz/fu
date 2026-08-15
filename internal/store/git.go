@@ -291,6 +291,7 @@ func (s *Store) indexMatchesHEAD(index *indexformat.Index) bool {
 // Private candidate staging never needs the lock. A lock left by an interrupted
 // process stops Fu the same way it stops Git, and is cleared the same way.
 func (s *Store) withIndexLock(fn func() error) (err error) {
+	defer keepDescriptorOwnersAlive(s)
 	if s.writeRoots == nil || s.writeRoots.git == nil || s.writeRoots.git.dir == nil {
 		// Outside a checked write session (Init's bootstrap commit) there is no
 		// pinned Git root to anchor the lock to, and no concurrent writer to
@@ -498,6 +499,7 @@ func (s *Store) syncPreparedPublicIndex(prepared PreparedCommit) error {
 // index.lock itself, because the lock is already held here for mutual exclusion
 // and reusing it as the staging file would release it by rename.
 func (s *Store) writePublicIndexAtomically(idx *indexformat.Index) error {
+	defer keepDescriptorOwnersAlive(s)
 	if s.writeRoots == nil || s.writeRoots.git == nil || s.writeRoots.git.dir == nil {
 		// No pinned Git root (Init's bootstrap commit): nothing else can be
 		// reading this repository yet.
@@ -928,13 +930,25 @@ func (s *Store) stageAll(repo *git.Repository, wt *git.Worktree) error {
 // but a bare errno naming a store-relative path is: it says nothing about
 // which store, or what to do.
 func (s *Store) explainStagingFailure(err error) error {
-	if !errors.Is(err, fs.ErrPermission) {
-		return err
-	}
 	var pathErr *fs.PathError
 	target := ""
 	if errors.As(err, &pathErr) {
-		target = filepath.Join(s.Dir(), filepath.FromSlash(pathErr.Path))
+		target = s.absoluteStagingFailurePath(pathErr.Path)
+	}
+	if errors.Is(err, unix.ENOTDIR) {
+		if target == "" {
+			return fmt.Errorf("%w; a tracked store path is not a directory; move or remove the conflicting entry, then retry the command", err)
+		}
+		return fmt.Errorf("%w; store entry %s is not a directory; move or remove it, then retry the command", err, target)
+	}
+	if errors.Is(err, fs.ErrInvalid) {
+		if target == "" {
+			return fmt.Errorf("%w; unable to stage the store under %s; inspect its entries and retry the command", err, s.Dir())
+		}
+		return fmt.Errorf("%w; unable to stage store entry %s; inspect or move it, then retry the command", err, target)
+	}
+	if !errors.Is(err, fs.ErrPermission) {
+		return err
 	}
 	if target == "" {
 		return fmt.Errorf("%w; every write command records the whole store, so it must be able to read every file under %s",
@@ -942,6 +956,29 @@ func (s *Store) explainStagingFailure(err error) error {
 	}
 	return fmt.Errorf("%w; fu records the whole store on every write command, so make %s readable or move it out of the store",
 		err, target)
+}
+
+// absoluteStagingFailurePath restores the logical store prefix that a mounted
+// checked root may omit from an fs.PathError. Prefer the candidate that exists
+// on disk so diagnostics name the entry the user can actually repair.
+func (s *Store) absoluteStagingFailurePath(name string) string {
+	if name == "" {
+		return ""
+	}
+	name = filepath.FromSlash(name)
+	if filepath.IsAbs(name) {
+		return filepath.Clean(name)
+	}
+	candidates := []string{
+		filepath.Join(s.Dir(), name),
+		filepath.Join(s.SkillsDir(), name),
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Lstat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return candidates[0]
 }
 
 // ChangedPathsIncludingIgnored reports the side-effect-free worktree

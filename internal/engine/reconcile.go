@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/cosensexyz/fu/internal/agent"
 	"github.com/cosensexyz/fu/internal/skill"
 	"github.com/cosensexyz/fu/internal/store"
@@ -35,7 +37,7 @@ import (
 // different again: it is not printed at all (reserved for a future `fu
 // status`), so it cannot contradict anything a write command tells the
 // user, and does not belong in the "reported prominently" list above.
-var ErrOperationFailed = errors.New("reconcile: one or more agent operations failed")
+var ErrOperationFailed = errors.New("one or more agent operations failed")
 
 // Desired computes the desired link set for one agent from config
 // (override wins, else global — SPEC §4.1).
@@ -154,7 +156,7 @@ func Desired(cfg *store.Config, a agent.Agent) (desired map[string]bool, reserve
 	// fu.yaml rather than of any agent, and is folded in once per pass by
 	// configInvalidNames below.
 	for _, inv := range cfg.InvalidNames() {
-		if !reservedNames[inv.Name] || !cfg.Effective(inv.Name, a.Name()) {
+		if !reservedNames[inv.Name] || !inv.Effective(a.Name()) {
 			continue
 		}
 		reserved = append(reserved, Action{
@@ -211,18 +213,18 @@ func Desired(cfg *store.Config, a agent.Agent) (desired map[string]bool, reserve
 // the name overridden off, while a non-reserving agent still wants it. No
 // ReportReserved fires, the skill is silently never delivered, and only the
 // config-level Invalid report is left to say so.
-func alreadyReportedAsReserved(cfg *store.Config, agents []agent.Agent, name string) bool {
+func alreadyReportedAsReserved(agents []agent.Agent, invalid store.InvalidName) bool {
 	reservedBySomeone, effectiveAnywhere := false, false
 	for _, a := range agents {
 		reserves := false
 		for _, r := range a.Reserved() {
-			if r == name {
+			if r == invalid.Name {
 				reserves = true
 				break
 			}
 		}
 		reservedBySomeone = reservedBySomeone || reserves
-		if !cfg.Effective(name, a.Name()) {
+		if !invalid.Effective(a.Name()) {
 			continue
 		}
 		effectiveAnywhere = true
@@ -236,7 +238,7 @@ func alreadyReportedAsReserved(cfg *store.Config, agents []agent.Agent, name str
 func configInvalidNames(cfg *store.Config, agents []agent.Agent) []Action {
 	var out []Action
 	for _, inv := range cfg.InvalidNames() {
-		if alreadyReportedAsReserved(cfg, agents, inv.Name) {
+		if alreadyReportedAsReserved(agents, inv) {
 			continue
 		}
 		out = append(out, Action{Type: ReportInvalid, Skill: inv.Name})
@@ -246,6 +248,7 @@ func configInvalidNames(cfg *store.Config, agents []agent.Agent) []Action {
 
 // Result carries the non-mutating findings of one reconcile pass.
 type Result struct {
+	Warnings        []string // durable recovery/isolation notices that do not fit reconcile action categories
 	Conflicts       []Action
 	Foreign         []Action       // name fu.yaml has no opinion on at all; informational inventory reserved for a future `fu status`, never printed by printResult
 	DisabledForeign []Action       // fu.yaml-known skill, disabled, blocked by unmanaged content at its own path; actionable, printed by printResult
@@ -256,6 +259,85 @@ type Result struct {
 	Failed          []FailedAction // per-entry or per-agent failures isolated from the rest (finding I3)
 }
 
+// Empty reports that a reconcile pass produced no finding a caller could act
+// on or display. Foreign is excluded on the same grounds as UserReports: it is
+// inventory for a future `fu status`, not a finding about this run.
+func (r Result) Empty() bool {
+	return len(r.Warnings) == 0 && len(r.Conflicts) == 0 && len(r.DisabledForeign) == 0 && len(r.Missing) == 0 &&
+		len(r.Reserved) == 0 && len(r.Invalid) == 0 && len(r.Skipped) == 0 && len(r.Failed) == 0
+}
+
+// UserReport is one finding ordinary write commands should present. Foreign
+// inventory is intentionally absent; it belongs to the future status command,
+// while every report returned here is actionable in the current command.
+type UserReport struct {
+	Kind   ActionType
+	Action Action
+	Err    error
+}
+
+// UserReports applies the engine's visibility and ordering policy to a
+// reconcile result. UI layers only format these structured reports.
+//
+// Identical findings are collapsed here, and only here. A batch command runs
+// one transaction per constituent operation and each ends with its own
+// reconcile, so mergeResult accumulates the same standing finding once per
+// item: `fu add --all` over three skills with one pre-existing foreign
+// directory printed the same `conflict: claude/alpha occupied by unmanaged
+// content` three times, and three identical lines read as three separate
+// conflicts. Output was O(candidates × findings) -- a 30-skill repo with five
+// conflicts printed 150 lines.
+//
+// This is the visibility and ordering boundary, which is why the collapse
+// belongs here rather than in mergeResult: the accumulated Result is also the
+// structured value a second front end would consume, and one operation really
+// did produce each of those findings.
+func (r Result) UserReports() []UserReport {
+	reports := make([]UserReport, 0, len(r.Conflicts)+len(r.DisabledForeign)+len(r.Missing)+len(r.Reserved)+len(r.Invalid)+len(r.Skipped)+len(r.Failed))
+	// Target is part of the key, not just agent/skill: a conflict carries the
+	// retired path only when fu moved its own link aside and could not put it
+	// back, and collapsing that into an earlier bare conflict for the same
+	// name would drop the user's only pointer to where their content went.
+	type reportKey struct {
+		kind                      ActionType
+		agent, skill, target, err string
+	}
+	seen := make(map[reportKey]bool, cap(reports))
+	add := func(report UserReport) {
+		key := reportKey{
+			kind:   report.Kind,
+			agent:  report.Action.AgentName,
+			skill:  report.Action.Skill,
+			target: report.Action.Target,
+		}
+		if report.Err != nil {
+			key.err = report.Err.Error()
+		}
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		reports = append(reports, report)
+	}
+	appendActions := func(kind ActionType, actions []Action) {
+		for _, action := range actions {
+			add(UserReport{Kind: kind, Action: action})
+		}
+	}
+	appendActions(ReportConflict, r.Conflicts)
+	appendActions(ReportDisabledForeign, r.DisabledForeign)
+	appendActions(ReportMissing, r.Missing)
+	appendActions(ReportReserved, r.Reserved)
+	appendActions(ReportInvalid, r.Invalid)
+	for _, agentName := range r.Skipped {
+		add(UserReport{Kind: ReportSkipped, Action: Action{AgentName: agentName}})
+	}
+	for _, failed := range r.Failed {
+		add(UserReport{Kind: ReportFailed, Action: failed.Action, Err: failed.Err})
+	}
+	return reports
+}
+
 // FailedAction pairs an Action -- or, for a failure discovered before
 // Diff ever ran for that agent (e.g. ScanAgent itself erroring), a
 // placeholder Action carrying only AgentName -- with the unexpected
@@ -263,6 +345,22 @@ type Result struct {
 type FailedAction struct {
 	Action Action
 	Err    error
+}
+
+// mergeResult accumulates the reconcile findings of one operation into dst,
+// so a multi-operation command (adopt's per-skill transactions, add's
+// batch) can surface every constituent pass, not just the last one (round 6
+// finding I1).
+func mergeResult(dst *Result, src Result) {
+	dst.Warnings = append(dst.Warnings, src.Warnings...)
+	dst.Conflicts = append(dst.Conflicts, src.Conflicts...)
+	dst.Foreign = append(dst.Foreign, src.Foreign...)
+	dst.DisabledForeign = append(dst.DisabledForeign, src.DisabledForeign...)
+	dst.Missing = append(dst.Missing, src.Missing...)
+	dst.Reserved = append(dst.Reserved, src.Reserved...)
+	dst.Invalid = append(dst.Invalid, src.Invalid...)
+	dst.Skipped = append(dst.Skipped, src.Skipped...)
+	dst.Failed = append(dst.Failed, src.Failed...)
 }
 
 // Reconcile loads the durable config and applies Diff for every given agent.
@@ -317,7 +415,9 @@ func Reconcile(st *store.Store, agents []agent.Agent) (res Result, retErr error)
 		return res, fmt.Errorf("use checked store root for reconcile: %w", err)
 	}
 	retErr = withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
-		if err := RecoverPending(checked); err != nil {
+		recoveryResult, err := RecoverPendingReporting(checked)
+		mergeResult(&res, recoveryResult)
+		if err != nil {
 			return fmt.Errorf("recover pending transactions before reconcile: %w", err)
 		}
 		cfg, err := store.LoadConfigRoot(storeRoot, "fu.yaml", st.ConfigPath())
@@ -330,7 +430,8 @@ func Reconcile(st *store.Store, agents []agent.Agent) (res Result, retErr error)
 		if err := session.CheckCanonicalPath(); err != nil {
 			return err
 		}
-		res, err = reconcileChecked(checked, cfg, agents, nil)
+		reconcileResult, err := reconcileChecked(checked, cfg, agents, nil)
+		mergeResult(&res, reconcileResult)
 		return err
 	})
 	return res, retErr
@@ -344,11 +445,28 @@ func Reconcile(st *store.Store, agents []agent.Agent) (res Result, retErr error)
 // unexported so it never widens Reconcile's public signature.
 type beforeApply func(a agent.Agent, acts []Action)
 
+type reconcileHooks struct {
+	beforeApply      beforeApply
+	beforeLinkRetire func(agent.Agent, Action)
+	// afterLinkRetire runs in the window between the approved link's rename to
+	// its retired name and the post-move validation, so a test can reoccupy the
+	// original name and reach the one path where fu moved its own link aside
+	// and could not put it back. That path is the only producer of a conflict
+	// carrying Action.Target, and no test could reach it otherwise: after the
+	// rename the original name is free, and nothing single-threaded reoccupies
+	// it. Production always passes nil.
+	afterLinkRetire func(agent.Agent, Action, string)
+}
+
 // reconcile is the package-local harness for tests that need an in-memory
 // Config or a boundary hook. Exported callers use Reconcile, which owns the
 // lock, pending recovery, and durable config reload; the write pipeline calls
 // reconcileChecked only while it already holds that same boundary.
 func reconcile(st *store.Store, cfg *store.Config, agents []agent.Agent, hook beforeApply) (res Result, retErr error) {
+	return reconcileWithHooks(st, cfg, agents, reconcileHooks{beforeApply: hook})
+}
+
+func reconcileWithHooks(st *store.Store, cfg *store.Config, agents []agent.Agent, hooks reconcileHooks) (res Result, retErr error) {
 	session, err := st.BeginWrite()
 	if err != nil {
 		return res, fmt.Errorf("open checked reconcile session: %w", err)
@@ -359,10 +477,14 @@ func reconcile(st *store.Store, cfg *store.Config, agents []agent.Agent, hook be
 	if err := session.CheckCanonicalPath(); err != nil {
 		return res, err
 	}
-	return reconcileChecked(session.Store, cfg, agents, hook)
+	return reconcileCheckedWithHooks(session.Store, cfg, agents, hooks)
 }
 
 func reconcileChecked(st *store.Store, cfg *store.Config, agents []agent.Agent, hook beforeApply) (Result, error) {
+	return reconcileCheckedWithHooks(st, cfg, agents, reconcileHooks{beforeApply: hook})
+}
+
+func reconcileCheckedWithHooks(st *store.Store, cfg *store.Config, agents []agent.Agent, hooks reconcileHooks) (Result, error) {
 	var res Result
 	skillsRoot, err := st.SkillsRoot()
 	if err != nil {
@@ -402,7 +524,7 @@ func reconcileChecked(st *store.Store, cfg *store.Config, agents []agent.Agent, 
 		// lifetime -- it is a real file handle, and a long-running caller
 		// reconciling repeatedly would otherwise accumulate one per pass
 		// (round 8 finding).
-		applyToAgent(st, skillsRoot, cfg, a, state, hook, &res)
+		applyToAgent(st, skillsRoot, cfg, a, state, hooks, &res)
 	}
 	if len(res.Failed) > 0 {
 		return res, ErrOperationFailed
@@ -440,7 +562,7 @@ func createAndScanAgentDir(a agent.Agent, storeSkillsDir string, afterCreate fun
 // directory's descriptor for exactly as long as that takes. Findings are
 // appended to res; failures are isolated here rather than propagated, so one
 // agent cannot starve the rest of the pass (finding I3).
-func applyToAgent(st *store.Store, skillsRoot *os.Root, cfg *store.Config, a agent.Agent, state AgentState, hook beforeApply, res *Result) {
+func applyToAgent(st *store.Store, skillsRoot *os.Root, cfg *store.Config, a agent.Agent, state AgentState, hooks reconcileHooks, res *Result) {
 	root, err := state.OpenCheckedDir()
 	if err != nil {
 		res.Failed = append(res.Failed, FailedAction{Action{AgentName: a.Name()}, err})
@@ -452,8 +574,8 @@ func applyToAgent(st *store.Store, skillsRoot *os.Root, cfg *store.Config, a age
 	res.Reserved = append(res.Reserved, reserved...)
 	res.Invalid = append(res.Invalid, invalid...)
 	acts := Diff(desired, state, st.SkillsDir())
-	if hook != nil {
-		hook(a, acts)
+	if hooks.beforeApply != nil {
+		hooks.beforeApply(a, acts)
 	}
 	for _, act := range acts {
 		switch act.Type {
@@ -506,16 +628,18 @@ func applyToAgent(st *store.Store, skillsRoot *os.Root, cfg *store.Config, a age
 			// CreateLink for one skill) that reported the skill as a
 			// conflict while its link was, in the same pass,
 			// successfully created.
-			// Checked and removed through the same descriptor, so the entry
-			// whose ownership is verified is necessarily the entry that
-			// gets deleted (round 7 finding).
-			owned, err := verifyFuLink(root, act.Skill, st.SkillsDir())
+			outcome, retiredName, err := retireFuLink(root, act.Skill, st.SkillsDir(),
+				func() {
+					if hooks.beforeLinkRetire != nil {
+						hooks.beforeLinkRetire(a, act)
+					}
+				},
+				func(retired string) {
+					if hooks.afterLinkRetire != nil {
+						hooks.afterLinkRetire(a, act, retired)
+					}
+				})
 			if err != nil {
-				if os.IsNotExist(err) {
-					// Vanished since Diff looked: nothing to remove, and
-					// nothing to report.
-					continue
-				}
 				// A permission or I/O failure is not a statement about
 				// ownership and must not be reported as one (round 8
 				// finding). Collapsing it into "not owned" produced a
@@ -525,12 +649,16 @@ func applyToAgent(st *store.Store, skillsRoot *os.Root, cfg *store.Config, a age
 				res.Failed = append(res.Failed, FailedAction{act, err})
 				continue
 			}
-			if !owned {
-				res.Conflicts = append(res.Conflicts, act)
-				continue
-			}
-			if err := root.Remove(act.Skill); err != nil && !os.IsNotExist(err) {
-				res.Failed = append(res.Failed, FailedAction{act, err})
+			if outcome == linkRetireConflict {
+				conflict := act
+				if retiredName != "" {
+					// fu moved the link aside and could not put it back
+					// because the original name was reoccupied. Naming the
+					// retired path is the difference between a user who can
+					// find their content and one who cannot (round 18 M10).
+					conflict.Target = filepath.Join(a.SkillsDir(), retiredName)
+				}
+				res.Conflicts = append(res.Conflicts, conflict)
 				continue
 			}
 		case ReportConflict:
@@ -550,52 +678,103 @@ func applyToAgent(st *store.Store, skillsRoot *os.Root, cfg *store.Config, a age
 	}
 }
 
-// verifyFuLink re-checks at execution time that name, inside the agent
-// directory root was opened for, is still a symlink owned by fu; anything
-// else was swapped in since Diff ran and must be left alone.
-//
-// Both the check and the removal that follows it go through root (round 7
-// finding), so the entry whose ownership is approved here is necessarily
-// the entry that gets deleted. Addressed by pathname, they could be
-// different entries in different directories: replacing the agent's skills
-// directory with a symlink between Diff and apply used to make this
-// function approve a link the *attacker* had placed at the same name --
-// pointing at the real store, so it passed -- and os.Remove then deleted
-// it. The window between this check and the removal is narrower still than
-// that, but it is the one DESIGN §2 documents as irreducible: nothing
-// stands between an fstatat and an unlinkat on the same descriptor except
-// time.
-// It returns three distinguishable outcomes, because they call for
-// different handling and collapsing them lost a real failure (round 8
-// finding): (true, nil) the entry is fu's and may be removed; (false, nil)
-// it is genuinely something else, which is a conflict; and (_, err) fu
-// could not tell -- the entry is gone (os.IsNotExist, a no-op) or
-// inspection failed outright (a permission or I/O error, a failed action).
-// Returning a bare bool turned every one of those errors into "not owned",
-// so a directory fu could not read was reported as unmanaged content
-// occupying the path, the command exited 0, and the link stayed where it
-// was.
 type agentDirReader interface {
 	Lstat(string) (os.FileInfo, error)
 	Readlink(string) (string, error)
 }
 
-func verifyFuLink(root agentDirReader, name, storeSkillsDir string) (bool, error) {
+func inspectFuLink(root agentDirReader, name, storeSkillsDir string) (os.FileInfo, string, bool, error) {
 	fi, err := root.Lstat(name)
 	if err != nil {
-		return false, err
+		return nil, "", false, err
 	}
 	if fi.Mode()&os.ModeSymlink == 0 {
 		// A real file or directory: not fu's, and nothing went wrong in
 		// establishing that.
-		return false, nil
+		return fi, "", false, nil
 	}
 	target, err := root.Readlink(name)
 	if err != nil {
-		return false, err
+		return nil, "", false, err
 	}
 	// name is the entry's own name -- the same name ScanAgent read from the
 	// directory listing when it classified this entry, so this re-check asks
 	// ownsLink exactly the question the scan asked.
-	return ownsLink(storeSkillsDir, name, target), nil
+	return fi, target, ownsLink(storeSkillsDir, name, target), nil
+}
+
+type linkRetireOutcome uint8
+
+const (
+	linkRetireRemoved linkRetireOutcome = iota
+	linkRetireAbsent
+	linkRetireConflict
+)
+
+// retireFuLink moves the approved link away from its live name before it
+// removes anything. The unpredictable retired name turns replacement of the
+// original name into a harmless new occupant, while the post-move identity
+// and target checks ensure the object removed is the one that was approved.
+// The retired name is returned alongside the outcome so a conflict can name
+// it. Without that, an object parked at .fu-retired-<hex> because the restore
+// found the original name reoccupied was reported only as "occupied by
+// unmanaged content" -- naming a path the user could look at, while the thing
+// fu had actually moved sat under a dot-name nothing mentioned (round 18
+// finding M10).
+func retireFuLink(root *checkedAgentDir, name, storeSkillsDir string, beforeRetire func(), afterRetire func(string)) (linkRetireOutcome, string, error) {
+	approved, approvedTarget, owned, err := inspectFuLink(root, name, storeSkillsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return linkRetireAbsent, "", nil
+		}
+		return linkRetireConflict, "", err
+	}
+	if !owned {
+		return linkRetireConflict, "", nil
+	}
+	if beforeRetire != nil {
+		beforeRetire()
+	}
+
+	retired, err := store.RetireNameAt(root.file, name, ".fu-retired-")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return linkRetireAbsent, "", nil
+		}
+		return linkRetireConflict, "", err
+	}
+	if afterRetire != nil {
+		afterRetire(retired)
+	}
+
+	moved, inspectErr := root.Lstat(retired)
+	movedTarget := ""
+	if inspectErr == nil && moved.Mode()&os.ModeSymlink != 0 {
+		movedTarget, inspectErr = root.Readlink(retired)
+	}
+	if inspectErr != nil || moved.Mode()&os.ModeSymlink == 0 || !sameCheckedEntry(approved, moved) || movedTarget != approvedTarget {
+		restoreErr := store.RestoreRetiredAt(root.file, retired, name)
+		if restoreErr != nil && !os.IsExist(restoreErr) {
+			if inspectErr != nil {
+				return linkRetireConflict, retired, errors.Join(inspectErr, fmt.Errorf("restore mismatched retired link: %w", restoreErr))
+			}
+			return linkRetireConflict, retired, fmt.Errorf("restore mismatched retired link: %w", restoreErr)
+		}
+		// A restore that hit EEXIST leaves the object parked under the retired
+		// name: the caller must be able to say where it went.
+		if restoreErr != nil {
+			return linkRetireConflict, retired, nil
+		}
+		return linkRetireConflict, "", nil
+	}
+	if err := root.Remove(retired); err != nil && !os.IsNotExist(err) {
+		return linkRetireConflict, retired, err
+	}
+	return linkRetireRemoved, "", nil
+}
+
+func sameCheckedEntry(left, right os.FileInfo) bool {
+	leftStat, leftOK := left.Sys().(*unix.Stat_t)
+	rightStat, rightOK := right.Sys().(*unix.Stat_t)
+	return leftOK && rightOK && leftStat.Dev == rightStat.Dev && leftStat.Ino == rightStat.Ino
 }

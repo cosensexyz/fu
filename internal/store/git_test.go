@@ -3,6 +3,7 @@ package store
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -780,6 +781,19 @@ func TestLogMoreEntriesThanExist(t *testing.T) {
 	}
 }
 
+func TestExplainStagingFailureDoesNotMislabelGenericInvalidError(t *testing.T) {
+	s := &Store{Home: t.TempDir()}
+	err := s.explainStagingFailure(fs.ErrInvalid)
+	if strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("generic invalid staging error was mislabelled: %v", err)
+	}
+	for _, want := range []string{"stage", s.Dir(), "retry"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("staging error %q does not contain %q", err, want)
+		}
+	}
+}
+
 func TestLogSingleCommit(t *testing.T) {
 	s, err := Init(t.TempDir())
 	if err != nil {
@@ -906,10 +920,9 @@ func TestAbsoluteSymlinkInStoreIsNotSilentlyCorrupted(t *testing.T) {
 //   - the projection recorded a "D" record per directory, but Git cannot
 //     store an empty directory at all, so a skill holding one digested
 //     differently after a clone, forever;
-//   - .git was excluded from the digest only when it was a directory or a
-//     regular file, so a *symlink* named .git reached the symlink arm and
-//     entered the digest, while staging excludes .git by name regardless of
-//     type -- again a permanent disagreement.
+//
+// The separate ProjectDir/DigestFS consistency tests cover .git entries,
+// including the required refusal of a .git symlink.
 //
 // Either one makes digest(store) differ from the recorded baseline on any
 // machine that obtained the store by cloning, which is the comparison
@@ -933,11 +946,6 @@ func TestDigestSurvivesCommitAndClone(t *testing.T) {
 	// A directory holding only another empty directory -- Git drops the
 	// whole branch, so a projection counting directories disagrees twice.
 	if err := os.MkdirAll(filepath.Join(dir, "outer", "inner"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// A .git symlink: excluded by staging on name alone, so it must be
-	// excluded by the digest on name alone too.
-	if err := os.Symlink("SKILL.md", filepath.Join(dir, ".git")); err != nil {
 		t.Fatal(err)
 	}
 	// A relative symlink Git *does* persist, so this one must stay in the

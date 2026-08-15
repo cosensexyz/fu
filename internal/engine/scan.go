@@ -106,6 +106,7 @@ func (d *checkedAgentDir) checkedName(op, name string) error {
 }
 
 func (d *checkedAgentDir) Lstat(name string) (os.FileInfo, error) {
+	defer keepDescriptorOwnersAlive(d)
 	if err := d.checkedName("lstat", name); err != nil {
 		return nil, err
 	}
@@ -117,6 +118,7 @@ func (d *checkedAgentDir) Lstat(name string) (os.FileInfo, error) {
 }
 
 func (d *checkedAgentDir) Readlink(name string) (string, error) {
+	defer keepDescriptorOwnersAlive(d)
 	if err := d.checkedName("readlink", name); err != nil {
 		return "", err
 	}
@@ -134,6 +136,7 @@ func (d *checkedAgentDir) Readlink(name string) (string, error) {
 }
 
 func (d *checkedAgentDir) Symlink(target, name string) error {
+	defer keepDescriptorOwnersAlive(d)
 	if err := d.checkedName("symlink", name); err != nil {
 		return err
 	}
@@ -144,6 +147,7 @@ func (d *checkedAgentDir) Symlink(target, name string) error {
 }
 
 func (d *checkedAgentDir) Remove(name string) error {
+	defer keepDescriptorOwnersAlive(d)
 	if err := d.checkedName("remove", name); err != nil {
 		return err
 	}

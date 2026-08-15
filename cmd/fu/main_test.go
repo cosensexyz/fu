@@ -97,6 +97,17 @@ func TestBinarySmoke(t *testing.T) {
 	if out, code := run("show"); code != 2 {
 		t.Fatalf("fu show (missing argument) must exit 2: exit=%d out=%q", code, out)
 	}
+	if out, code := run("list", "-test.not-a-fu-flag"); code != 2 {
+		t.Fatalf("fu list -test.* must exit 2: exit=%d out=%q", code, out)
+	}
+	if out, code := run("show", "--", "-test.name"); code != 1 ||
+		!strings.Contains(out, `unknown skill "-test.name"`) || strings.Contains(out, `unknown skill "--test.name"`) {
+		t.Fatalf("fu show must preserve a -test.* positional after --: exit=%d out=%q", code, out)
+	}
+	if out, code := run("add", "--ref", "-test.x", "https://example.invalid/repo.git"); code != 2 ||
+		!strings.Contains(out, `invalid ref "-test.x"`) || strings.Contains(out, `invalid ref "--test.x"`) {
+		t.Fatalf("fu add must preserve a -test.* flag value: exit=%d out=%q", code, out)
+	}
 
 	// Round 2 finding 1 (test blind spot: round 2 finding 2), confirmed here
 	// against the real compiled binary exactly as the reviewer reproduced
@@ -114,6 +125,10 @@ func TestBinarySmoke(t *testing.T) {
 	}
 	if out, code := run("completion", "bash"); code != 0 || !strings.Contains(out, "bash completion") {
 		t.Fatalf("fu completion bash must exit 0 and emit a completion script: exit=%d out=%q", code, out)
+	}
+	if out, code := run("completion", "bash", "zsh"); code != 2 ||
+		!strings.Contains(out, "fu completion bash") || !strings.Contains(out, "Usage:") {
+		t.Fatalf("fu completion bash zsh must be a usage error: exit=%d out=%q", code, out)
 	}
 	if out, code := run("__complete", "new", ""); code != 0 {
 		t.Fatalf("fu __complete must exit 0: exit=%d out=%q", code, out)

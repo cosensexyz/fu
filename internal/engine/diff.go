@@ -18,6 +18,9 @@ const (
 	ReportDisabledForeign // name fu.yaml tracks and wants off, but its path is occupied by foreign content — actionable, unlike ReportForeign
 	ReportReserved        // desired skill name collides with an agent's reserved entry — never linked (SPEC rule 11)
 	ReportInvalid         // desired skill name fails validation — never turned into a path component (round 2 finding 3)
+	ReportMissing         // desired link could not be created because store content is absent
+	ReportSkipped         // an agent was skipped before entry-level reconciliation
+	ReportFailed          // an unexpected entry-level or agent-level operation failed
 )
 
 type Action struct {
@@ -94,9 +97,9 @@ func Diff(desired map[string]bool, state AgentState, storeSkillsDir string) []Ac
 			acts = append(acts, Action{ReportConflict, name, skillName, link, ""})
 		case !on && present && e.Kind == KindFuLink:
 			acts = append(acts, Action{RemoveLink, name, skillName, link, ""})
-		// DESIGN §2's state matrix row six ("不应有链接 | 未纳管条目 |
-		// ReportForeign") does not distinguish "no entry in desired" from
-		// "present but explicitly off" -- both are "不应有链接". The
+		// DESIGN §2's state matrix row six ("link undesired | unmanaged
+		// entry | ReportForeign") does not distinguish "no entry in desired"
+		// from "present but explicitly off" -- both mean no link is desired. The
 		// trailing loop below only ever sees the former (it skips every
 		// name known to desired, value notwithstanding), so this arm is
 		// the only place the latter is ever reported (round 2 finding 2).

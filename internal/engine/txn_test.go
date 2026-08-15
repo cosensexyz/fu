@@ -4,6 +4,8 @@ package engine
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,6 +14,388 @@ import (
 
 	"github.com/cosensexyz/fu/internal/store"
 )
+
+func TestRecoverPendingAddsRemedyToBareConflict(t *testing.T) {
+	s, _ := setupStore(t)
+	record := TxnRecord{Op: "remedy-probe", Name: "alpha"}
+	if err := WriteTxn(s, &record); err != nil {
+		t.Fatal(err)
+	}
+	RegisterRecoverHandler(record.Op, func(*store.Store, TxnRecord) error {
+		return fmt.Errorf("changed recovery state: %w", ErrTxnConflict)
+	})
+	t.Cleanup(func() { deleteRecoverHandler(record.Op) })
+	session, err := s.BeginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	err = RecoverPending(session.Store)
+	if !errors.Is(err, ErrTxnConflict) {
+		t.Fatalf("recovery error = %v, want ErrTxnConflict", err)
+	}
+	journalPattern := filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s-*.json", record.Op, record.TxnID))
+	completionPath := filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s.done", record.Op, record.TxnID))
+	prunePattern := filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s-*.pruned", record.Op, record.TxnID))
+	for _, want := range []string{
+		s.RecoveryDir(), journalPattern, completionPath, prunePattern,
+		filepath.Join(s.SkillsDir(), "alpha"), filepath.Join(s.StagingDir(), "alpha"),
+		"preserve the complete transaction family", "move every transaction family file", "retry",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("recovery conflict %q lacks actionable detail %q", err, want)
+		}
+	}
+}
+
+func TestPruneCompletedTransactionsRemovesValidatedJournalFamily(t *testing.T) {
+	s, _ := setupStore(t)
+	if _, err := NewSkill(s, nil, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadDir(s.RecoveryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var transactionFiles int
+	for _, entry := range before {
+		if strings.HasPrefix(entry.Name(), "txn-") {
+			transactionFiles++
+		}
+	}
+	if transactionFiles < 2 {
+		t.Fatalf("completed transaction family = %d files, want revisions plus marker", transactionFiles)
+	}
+
+	outcome, err := PruneCompletedTransactions(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Transactions != 1 || outcome.Files != transactionFiles {
+		t.Fatalf("prune outcome = %+v, want one transaction and %d files", outcome, transactionFiles)
+	}
+	after, err := os.ReadDir(s.RecoveryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range after {
+		if strings.HasPrefix(entry.Name(), "txn-") {
+			t.Fatalf("successful prune left transaction artifact %s", entry.Name())
+		}
+	}
+	if _, err := NewSkill(s, nil, "beta"); err != nil {
+		t.Fatalf("pruned journal must not block later writes: %v", err)
+	}
+}
+
+func TestPruneCompletedTransactionsResumesAfterInterruption(t *testing.T) {
+	for _, stage := range []string{"after marker", "after first removal"} {
+		t.Run(stage, func(t *testing.T) {
+			s, _ := setupStore(t)
+			if _, err := NewSkill(s, nil, "alpha"); err != nil {
+				t.Fatal(err)
+			}
+			stop := errors.New("stop pruning")
+			h := pruneHooks{}
+			switch stage {
+			case "after marker":
+				h.afterMarker = func() error { return stop }
+			case "after first removal":
+				fired := false
+				h.afterRemove = func(string) error {
+					if fired {
+						return nil
+					}
+					fired = true
+					return stop
+				}
+			}
+			if _, err := pruneCompletedTransactions(s, h); !errors.Is(err, stop) {
+				t.Fatalf("interrupted prune error = %v, want %v", err, stop)
+			}
+			if stage == "after marker" {
+				entries, err := os.ReadDir(s.RecoveryDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				var markers []string
+				for _, entry := range entries {
+					if strings.HasSuffix(entry.Name(), ".pruned") {
+						markers = append(markers, entry.Name())
+					}
+				}
+				if len(markers) != 1 {
+					t.Fatalf("interruption left prune markers %v, want exactly one", markers)
+				}
+				key, _, err := parseTxnPruneName(markers[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				record, err := decodeTxnPrune(s, key, markers[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(record.Revisions) == 0 || record.CompletionName == "" || uint64(len(record.Revisions)) != record.Completion.Sequence {
+					t.Fatalf("prune marker does not bind the complete family: %+v", record)
+				}
+			}
+			if pending, err := PendingTxns(s); err != nil || len(pending) != 0 {
+				t.Fatalf("durable prune record must make partial cleanup safe: pending=%+v err=%v", pending, err)
+			}
+			if _, err := PruneCompletedTransactions(s); err != nil {
+				t.Fatalf("retry must finish prune cleanup: %v", err)
+			}
+			entries, err := os.ReadDir(s.RecoveryDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), "txn-") {
+					t.Fatalf("retry left transaction artifact %s", entry.Name())
+				}
+			}
+		})
+	}
+}
+
+func TestPruneCompletedTransactionsIsolatesDamagedFamilies(t *testing.T) {
+	s, _ := setupStore(t)
+	for _, record := range []*TxnRecord{
+		{Op: "aaa", Name: "damaged", Stage: "committed"},
+		{Op: "zzz", Name: "healthy", Stage: "committed"},
+	} {
+		if err := WriteTxn(s, record); err != nil {
+			t.Fatal(err)
+		}
+		if err := ClearTxn(s, *record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(s.RecoveryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var damagedPath string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "txn-aaa-") && strings.HasSuffix(entry.Name(), ".json") {
+			damagedPath = filepath.Join(s.RecoveryDir(), entry.Name())
+			break
+		}
+	}
+	if damagedPath == "" {
+		t.Fatal("damaged transaction revision not found")
+	}
+	revisionName, err := parseTxnRecordName(filepath.Base(damagedPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(damagedPath, []byte("tampered"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	damagedBefore := map[string][]byte{}
+	entries, err = os.ReadDir(s.RecoveryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "txn-aaa-") || strings.HasPrefix(entry.Name(), "txn-aaa.") {
+			raw, readErr := os.ReadFile(filepath.Join(s.RecoveryDir(), entry.Name()))
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			damagedBefore[entry.Name()] = raw
+		}
+	}
+
+	outcome, err := PruneCompletedTransactions(s)
+	if err == nil || outcome.Transactions != 1 {
+		t.Fatalf("partial prune = %+v, %v; want one healthy family plus an error", outcome, err)
+	}
+	if !strings.Contains(err.Error(), damagedPath) {
+		t.Fatalf("damaged-family error %q lacks exact path %q", err, damagedPath)
+	}
+	for _, want := range []string{
+		filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s-*.json", revisionName.key.op, revisionName.key.id)),
+		filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s.done", revisionName.key.op, revisionName.key.id)),
+		filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s-*.pruned", revisionName.key.op, revisionName.key.id)),
+		"move the complete transaction family", "retry",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("damaged-family error %q lacks remedy detail %q", err, want)
+		}
+	}
+	entries, err = os.ReadDir(s.RecoveryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "txn-zzz-") {
+			t.Fatalf("healthy family was not pruned: %s", entry.Name())
+		}
+	}
+	for name, want := range damagedBefore {
+		got, readErr := os.ReadFile(filepath.Join(s.RecoveryDir(), name))
+		if readErr != nil || !bytes.Equal(got, want) {
+			t.Fatalf("damaged family artifact %s changed: got=%q want=%q err=%v", name, got, want, readErr)
+		}
+	}
+	moved := t.TempDir()
+	for name := range damagedBefore {
+		if err := os.Rename(filepath.Join(s.RecoveryDir(), name), filepath.Join(moved, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := NewSkill(s, nil, "epsilon"); err != nil {
+		t.Fatalf("following the whole-family remedy must not manufacture a pending transaction: %v", err)
+	}
+}
+
+func TestPrunedFamilyWithoutCompletionUsesWholeFamilyRemedy(t *testing.T) {
+	s, _ := setupStore(t)
+	record := &TxnRecord{Op: "prune-remedy", Name: "alpha", Stage: "committed"}
+	if err := WriteTxn(s, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearTxn(s, *record); err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("stop after prune marker")
+	if _, err := pruneCompletedTransactions(s, pruneHooks{afterMarker: func() error { return stop }}); !errors.Is(err, stop) {
+		t.Fatalf("setup prune interruption = %v, want %v", err, stop)
+	}
+	completion := filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s.done", record.Op, record.TxnID))
+	if err := os.Remove(completion); err != nil {
+		t.Fatal(err)
+	}
+	_, err := PruneCompletedTransactions(s)
+	if err == nil {
+		t.Fatal("prune record without completion and with revisions must conflict")
+	}
+	for _, want := range []string{"move the complete transaction family", "*.json", ".done", "*.pruned", "retry"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("pruned-family remedy %q lacks %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "move the prune record aside") {
+		t.Fatalf("pruned-family remedy still prescribes the wedging single-file action: %v", err)
+	}
+	family, err := filepath.Glob(filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s*", record.Op, record.TxnID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := t.TempDir()
+	for _, artifact := range family {
+		if err := os.Rename(artifact, filepath.Join(moved, filepath.Base(artifact))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := NewSkill(s, nil, "beta"); err != nil {
+		t.Fatalf("whole-family abandonment must unblock the following write: %v", err)
+	}
+}
+
+func TestPruneCompletedTransactionsPreservesNonJournalAndPendingRecovery(t *testing.T) {
+	s, _ := setupStore(t)
+	completed := &TxnRecord{Op: "complete", Name: "done", Stage: "committed"}
+	if err := WriteTxn(s, completed); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearTxn(s, *completed); err != nil {
+		t.Fatal(err)
+	}
+	pending := &TxnRecord{Op: "pending", Name: "wait", Stage: "started"}
+	if err := WriteTxn(s, pending); err != nil {
+		t.Fatal(err)
+	}
+	preserved := []string{
+		"adopt-archive-claude-alpha-deadbeef",
+		"removed-alpha-deadbeef",
+		".fu-config-exchange-deadbeefdeadbeef.json",
+	}
+	for _, name := range preserved {
+		path := filepath.Join(s.RecoveryDir(), name)
+		if strings.Contains(name, "archive") || strings.HasPrefix(name, "removed-") {
+			if err := os.Mkdir(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.WriteFile(path, []byte("preserve"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if outcome, err := PruneCompletedTransactions(s); err != nil || outcome.Transactions != 1 {
+		t.Fatalf("prune outcome = %+v, %v", outcome, err)
+	}
+	for _, name := range preserved {
+		if _, err := os.Lstat(filepath.Join(s.RecoveryDir(), name)); err != nil {
+			t.Fatalf("gc removed excluded recovery object %s: %v", name, err)
+		}
+	}
+	pendingTxns, err := PendingTxns(s)
+	if err != nil || len(pendingTxns) != 1 || pendingTxns[0].Op != "pending" {
+		t.Fatalf("gc changed pending transaction: %+v, %v", pendingTxns, err)
+	}
+}
+
+func TestJournalScanFailureIncludesActionableRemedy(t *testing.T) {
+	s, _ := setupStore(t)
+	bad := filepath.Join(s.RecoveryDir(), "txn-malformed.json")
+	if err := os.WriteFile(bad, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewSkill(s, nil, "alpha")
+	if err == nil {
+		t.Fatal("malformed journal must block ordinary writes")
+	}
+	for _, want := range []string{bad, "preserve", "move", "retry"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("journal scan error %q lacks actionable detail %q", err, want)
+		}
+	}
+}
+
+func TestPruneRecordCannotHideTransactionWithoutCompletionMarker(t *testing.T) {
+	s, _ := setupStore(t)
+	record := &TxnRecord{Op: "new", Name: "alpha", Stage: "committed"}
+	if err := WriteTxn(s, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearTxn(s, *record); err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("stop after prune marker")
+	if _, err := pruneCompletedTransactions(s, pruneHooks{afterMarker: func() error { return stop }}); !errors.Is(err, stop) {
+		t.Fatalf("interrupted prune error = %v, want %v", err, stop)
+	}
+	entries, err := os.ReadDir(s.RecoveryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var completion, prune string
+	for _, entry := range entries {
+		switch {
+		case strings.HasSuffix(entry.Name(), ".done"):
+			completion = filepath.Join(s.RecoveryDir(), entry.Name())
+		case strings.HasSuffix(entry.Name(), ".pruned"):
+			prune = filepath.Join(s.RecoveryDir(), entry.Name())
+		}
+	}
+	if completion == "" || prune == "" {
+		t.Fatalf("interrupted family lacks completion or prune marker: completion=%q prune=%q", completion, prune)
+	}
+	if err := os.Remove(completion); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = PendingTxns(s)
+	if err == nil {
+		t.Fatal("a prune record must not hide remaining revisions without their completion marker")
+	}
+	if !strings.Contains(err.Error(), prune) || !strings.Contains(err.Error(), "move") {
+		t.Fatalf("prune conflict %q must name the record and an actionable remedy", err)
+	}
+}
 
 func txnRevisionPaths(t *testing.T, s *store.Store) []string {
 	t.Helper()
@@ -184,7 +568,15 @@ func TestTxnRevisionChainRejectsSemanticReplacement(t *testing.T) {
 		}
 	})
 
-	t.Run("completion remains bound to the exact latest revision", func(t *testing.T) {
+	// A completion marker binds to its newest revision by sequence and digest,
+	// both of which live in the immutable, no-replace-created filename. Round
+	// 18 finding I5 moved that check off the file contents: a completed
+	// transaction's revisions are never read again, so an appended, deleted or
+	// renamed revision is still caught, while in-place content tampering on a
+	// record nothing will ever act on is not. ClearTxn still validates the
+	// whole chain from disk before writing the marker, so the binding is
+	// established against real bytes at the one moment it decides anything.
+	t.Run("completion remains bound to the newest revision filename", func(t *testing.T) {
 		s, _ := setupStore(t)
 		record := &TxnRecord{Op: "complete", Stage: "committed"}
 		if err := WriteTxn(s, record); err != nil {
@@ -197,10 +589,54 @@ func TestTxnRevisionChainRejectsSemanticReplacement(t *testing.T) {
 		if len(paths) != 1 {
 			t.Fatalf("got %d revisions, want 1", len(paths))
 		}
-		rewriteTxnMessage(t, paths[0], "foreign completed revision")
+		if _, err := PendingTxns(s); err != nil {
+			t.Fatalf("the completed transaction must validate: %v", err)
+		}
 
+		// A revision appended past the one the marker names is a semantic
+		// replacement of the transaction's tail and must be rejected. WriteTxn
+		// itself refuses to extend a completed transaction, so the file is
+		// planted directly -- the shape an attacker or a partial restore would
+		// leave behind.
+		raw, err := os.ReadFile(paths[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		planted := strings.Replace(filepath.Base(paths[0]),
+			fmt.Sprintf("-%0*d-", txnSequenceWidth, 1), fmt.Sprintf("-%0*d-", txnSequenceWidth, 2), 1)
+		if planted == filepath.Base(paths[0]) {
+			t.Fatalf("could not derive a higher-sequence name from %q", paths[0])
+		}
+		if err := os.WriteFile(filepath.Join(s.RecoveryDir(), planted), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := PendingTxns(s); err == nil {
-			t.Fatal("a completion marker must not hide a replaced latest revision")
+			t.Fatal("a completion marker must not hide a revision appended after it")
+		}
+	})
+
+	t.Run("a deleted revision breaks a completed chain", func(t *testing.T) {
+		s, _ := setupStore(t)
+		record := &TxnRecord{Op: "gapped", Stage: "started"}
+		if err := WriteTxn(s, record); err != nil {
+			t.Fatal(err)
+		}
+		record.Stage = "committed"
+		if err := WriteTxn(s, record); err != nil {
+			t.Fatal(err)
+		}
+		if err := ClearTxn(s, *record); err != nil {
+			t.Fatal(err)
+		}
+		paths := txnRevisionPaths(t, s)
+		if len(paths) != 2 {
+			t.Fatalf("got %d revisions, want 2", len(paths))
+		}
+		if err := os.Remove(paths[0]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := PendingTxns(s); err == nil {
+			t.Fatal("a completed chain missing a revision must be rejected")
 		}
 	})
 }

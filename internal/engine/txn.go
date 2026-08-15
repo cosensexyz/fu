@@ -37,6 +37,9 @@ type TxnRecord struct {
 	Message        string           `json:"message,omitempty"`
 	ConfigBefore   []byte           `json:"config_before,omitempty"`
 	Payload        *store.OwnedTree `json:"payload,omitempty"`
+	// StagingReservation binds a private staged root before its final name is
+	// published. It closes the create-to-journal ownership gap.
+	StagingReservation *store.StagedRootReservation `json:"staging_reservation,omitempty"`
 	// Declared names entries the operation has committed to creating but has
 	// not created yet, so a crash inside a create->record window leaves a state
 	// recovery can classify instead of one it must refuse. Cleared by the
@@ -44,7 +47,99 @@ type TxnRecord struct {
 	Declared         []store.DeclaredEntry `json:"declared,omitempty"`
 	CommitTree       string                `json:"commit_tree,omitempty"`
 	CompensationTree string                `json:"compensation_tree,omitempty"`
-	revisionDigest   string
+	// SourceFields records the fu.yaml source fields an install operation
+	// wrote alongside the new skill entry, so recovery can reconstruct the
+	// exact expected config (DESIGN §3; consumed by recoverInstallSkill).
+	SourceFields map[string]string `json:"source_fields,omitempty"`
+	// Agents lists the agent directories an adopt operation's phase-three
+	// switching must deliver into (DESIGN §6 AdoptPlan).
+	Agents []string `json:"agents,omitempty"`
+	// WholeDirAgents lists the subset of Agents whose skills directory is
+	// itself a symlink, so recovery knows which entries take the
+	// whole-directory switch path even after the directory has changed
+	// shape.
+	WholeDirAgents []string `json:"whole_dir_agents,omitempty"`
+	// AdoptTargets binds every agent name in an adopt transaction to the
+	// absolute skills path inventoried by the initiating process. Recovery
+	// must validate this binding before resolving an adapter under the current
+	// environment; an agent name by itself is not filesystem authority.
+	AdoptTargets []AdoptTarget `json:"adopt_targets,omitempty"`
+	// Overrides records the per-agent switches an adopt operation wrote for
+	// agents that did not hold the skill before adoption, so recovery can
+	// reconstruct the exact expected config.
+	Overrides map[string]bool `json:"overrides,omitempty"`
+	// Archive tracks the in-flight agent-side archive of one adopted skill's
+	// original content. Only one agent's archive is in flight at a time.
+	Archive *AdoptArchive `json:"archive,omitempty"`
+	// DirSwitch tracks an in-flight whole-directory switch (replacement
+	// sibling + parent-link archive + swap). Only one is in flight at a time.
+	DirSwitch      *DirSwitchState `json:"dir_switch,omitempty"`
+	revisionDigest string
+}
+
+// AdoptTarget is the durable filesystem location of one agent participating
+// in an adopt. Identity and content fields are added as the switch records
+// progressively stronger ownership evidence; SkillsDir is present from the
+// first transaction revision so recovery can never silently retarget HOME.
+type AdoptTarget struct {
+	Agent          string             `json:"agent"`
+	SkillsDir      string             `json:"skills_dir"`
+	WholeDir       bool               `json:"whole_dir,omitempty"`
+	ParentIdentity store.FileIdentity `json:"parent_identity"`
+	EntryIdentity  store.FileIdentity `json:"entry_identity"`
+	EntryKind      string             `json:"entry_kind"`
+	LinkTarget     string             `json:"link_target,omitempty"`
+	SourcePath     string             `json:"source_path"`
+	SourceIdentity store.FileIdentity `json:"source_identity"`
+	Digest         string             `json:"digest"`
+	TargetManifest []DirSwitchEntry   `json:"target_manifest,omitempty"`
+}
+
+// DirSwitchEntry records one direct child in a whole-directory target or
+// replacement directory. Direct-child equality is the view invariant: every
+// non-adopted child is represented by a passthrough symlink to that path.
+type DirSwitchEntry struct {
+	Name       string             `json:"name"`
+	Mode       uint32             `json:"mode"`
+	LinkTarget string             `json:"link_target,omitempty"`
+	Identity   store.FileIdentity `json:"identity,omitempty"`
+}
+
+// AdoptArchive is the durable state of archiving one agent's original skill
+// entry (copy to recovery, then delete the original, then link).
+type AdoptArchive struct {
+	Agent            string             `json:"agent"`
+	Payload          string             `json:"payload"`
+	Retired          string             `json:"retired"`
+	Stage            string             `json:"stage"`
+	OriginalIdentity store.FileIdentity `json:"original_identity"`
+	OriginalMode     uint32             `json:"original_mode"`
+	OriginalKind     string             `json:"original_kind"`
+	OriginalTarget   string             `json:"original_target,omitempty"`
+	LinkArchive      string             `json:"link_archive,omitempty"`
+	SourceManifest   *store.OwnedTree   `json:"source_manifest,omitempty"`
+	Base             *store.OwnedTree   `json:"base,omitempty"`
+	Manifest         *store.OwnedTree   `json:"manifest,omitempty"`
+}
+
+// DirSwitchState is the durable state of one whole-directory switch: a
+// replacement sibling directory holding store links for adopted skills and
+// passthrough links for everything else, the archived parent link, and the
+// swap stage. "building" = sibling under construction, skills untouched;
+// "swapped" = parent link archived, sibling not yet in place (or already
+// swapped); "done" = swap complete, backup pending removal.
+type DirSwitchState struct {
+	Agent           string             `json:"agent"`
+	Target          string             `json:"target"`
+	Sibling         string             `json:"sibling"`
+	SiblingIdentity store.FileIdentity `json:"sibling_identity"`
+	SiblingManifest []DirSwitchEntry   `json:"sibling_manifest,omitempty"`
+	Backup          string             `json:"backup"`
+	BackupIdentity  store.FileIdentity `json:"backup_identity"`
+	BackupMode      uint32             `json:"backup_mode"`
+	LinkArchive     string             `json:"link_archive,omitempty"`
+	CleanupID       string             `json:"cleanup_id"`
+	Stage           string             `json:"stage"`
 }
 
 // opNamePattern is the grammar an operation identifier must satisfy before
@@ -175,7 +270,7 @@ func WriteTxn(st *store.Store, r *TxnRecord) error {
 	previousDigest := ""
 	if r.Sequence == 0 {
 		if r.PreviousDigest != "" || r.revisionDigest != "" {
-			return fmt.Errorf("new transaction %s/%s carries persisted revision state", r.Op, r.TxnID)
+			return fmt.Errorf("transaction %s/%s carries persisted revision state", r.Op, r.TxnID)
 		}
 	} else {
 		journal, err := scanTxnJournal(st)
@@ -233,6 +328,18 @@ func ClearTxn(st *store.Store, r TxnRecord) error {
 	}
 	if r.Sequence == 0 {
 		return fmt.Errorf("transaction %s/%s has no persisted revision to complete", r.Op, r.TxnID)
+	}
+	// A terminal marker on a record still naming in-flight agent-side state
+	// would strand exactly what that state exists to finish: a retired
+	// original with no archive, or a half-swapped skills directory, with the
+	// WAL closed so nothing will ever resume or report it (round 18 finding
+	// C1). Both fields are cleared by their own completion paths, so reaching
+	// here with either set is a bug in the caller, not a user-visible state.
+	if r.Archive != nil {
+		return fmt.Errorf("transaction %s/%s still holds an in-flight adopt archive for agent %q; refusing to complete it", r.Op, r.TxnID, r.Archive.Agent)
+	}
+	if r.DirSwitch != nil {
+		return fmt.Errorf("transaction %s/%s still holds an in-flight whole-directory switch for agent %q; refusing to complete it", r.Op, r.TxnID, r.DirSwitch.Agent)
 	}
 	journal, err := scanTxnJournal(st)
 	if err != nil {
@@ -397,9 +504,28 @@ func decodeTxnCompletion(st *store.Store, key txnKey, name string) (txnCompletio
 type txnJournal struct {
 	revisions map[txnKey][]txnRevision
 	completed map[txnKey]string
+	pruned    map[txnKey]string
+	problems  []error
+	invalid   map[txnKey][]error
 }
 
 func scanTxnJournal(st *store.Store) (txnJournal, error) {
+	journal, err := scanTxnJournalReport(st)
+	if err != nil {
+		return txnJournal{}, err
+	}
+	var problems []error
+	problems = append(problems, journal.problems...)
+	for _, family := range journal.invalid {
+		problems = append(problems, family...)
+	}
+	if err := errors.Join(problems...); err != nil {
+		return txnJournal{}, err
+	}
+	return journal, nil
+}
+
+func scanTxnJournalReport(st *store.Store) (txnJournal, error) {
 	_, rootErr := st.Root()
 	var ents []fs.DirEntry
 	var err error
@@ -418,6 +544,8 @@ func scanTxnJournal(st *store.Store) (txnJournal, error) {
 	journal := txnJournal{
 		revisions: make(map[txnKey][]txnRevision),
 		completed: make(map[txnKey]string),
+		pruned:    make(map[txnKey]string),
+		invalid:   make(map[txnKey][]error),
 	}
 	for _, e := range ents {
 		name := e.Name()
@@ -425,16 +553,29 @@ func scanTxnJournal(st *store.Store) (txnJournal, error) {
 			continue
 		}
 		switch {
+		case strings.HasSuffix(name, ".pruned"):
+			key, _, err := parseTxnPruneName(name)
+			if err != nil {
+				journal.problems = append(journal.problems, fmt.Errorf("transaction prune record %s: %w", txnDisplayPath(st, name), err))
+				continue
+			}
+			if previous, exists := journal.pruned[key]; exists {
+				journal.invalid[key] = append(journal.invalid[key], fmt.Errorf("transaction %s/%s has multiple prune records: %s and %s", key.op, key.id, txnDisplayPath(st, previous), txnDisplayPath(st, name)))
+				continue
+			}
+			journal.pruned[key] = name
 		case strings.HasSuffix(name, ".json"):
 			revision, err := parseTxnRecordName(name)
 			if err != nil {
-				return txnJournal{}, fmt.Errorf("transaction record %s: %w", txnDisplayPath(st, name), err)
+				journal.problems = append(journal.problems, fmt.Errorf("transaction record %s: %w", txnDisplayPath(st, name), err))
+				continue
 			}
 			journal.revisions[revision.key] = append(journal.revisions[revision.key], revision)
 		case strings.HasSuffix(name, ".done"):
 			key, err := parseTxnCompletionName(name)
 			if err != nil {
-				return txnJournal{}, fmt.Errorf("transaction completion %s: %w", txnDisplayPath(st, name), err)
+				journal.problems = append(journal.problems, fmt.Errorf("transaction completion %s: %w", txnDisplayPath(st, name), err))
+				continue
 			}
 			journal.completed[key] = name
 		}
@@ -474,19 +615,46 @@ func validateTxnChain(st *store.Store, key txnKey, revisions []txnRevision) (Txn
 	return latest, nil
 }
 
-// PendingTxns validates every digest-chained revision and returns the latest
-// record for each transaction that has no terminal marker bound to that exact
-// revision. Completion never makes a revision exempt from validation.
+// PendingTxns returns the latest record for each transaction that has no
+// terminal marker bound to that exact revision. Only pending transactions have
+// their full digest chain read and re-hashed; a completed one is recognised
+// from its terminal marker plus the revision filenames, which already commit
+// to their own digests.
+//
+// The stronger rule -- "completion never makes a revision exempt from
+// validation" -- was the original intent, but it had no matching cost model.
+// writeCommandPrologue calls this on every write command, so retaining and
+// re-hashing every completed revision would make a write grow linearly with
+// the store's whole lifetime history
+// (an adopt records ~6 revisions each carrying a full OwnedTree). Worse, one
+// damaged byte in a transaction that finished long ago permanently failed
+// every subsequent write command, with no way to act on the record it broke.
+// store/config_exchange.go made exactly this trade for the config-exchange
+// journal, for the same reasons (round 18 finding I5).
+//
+// What is still checked for a completed transaction: the marker parses, the
+// revision sequences are contiguous from 1, and the marker names the
+// highest-sequence revision by both sequence and digest. What is no longer
+// checked: the PreviousDigest linkage and on-disk bytes of revisions that
+// nothing will ever act on. A pending transaction is unaffected -- it is
+// validated in full before any handler may touch it.
+//
+// `fu gc` separately revalidates completed chains in full before pruning them
+// through a crash-resumable, content-addressed prune record. Pending chains
+// are never pruned.
 func PendingTxns(st *store.Store) ([]TxnRecord, error) {
 	journal, err := scanTxnJournal(st)
 	if err != nil {
 		return nil, err
 	}
-	keys := make(map[txnKey]struct{}, len(journal.revisions)+len(journal.completed))
+	keys := make(map[txnKey]struct{}, len(journal.revisions)+len(journal.completed)+len(journal.pruned))
 	for key := range journal.revisions {
 		keys[key] = struct{}{}
 	}
 	for key := range journal.completed {
+		keys[key] = struct{}{}
+	}
+	for key := range journal.pruned {
 		keys[key] = struct{}{}
 	}
 	orderedKeys := make([]txnKey, 0, len(keys))
@@ -502,47 +670,144 @@ func PendingTxns(st *store.Store) ([]TxnRecord, error) {
 
 	out := make([]TxnRecord, 0, len(journal.revisions))
 	for _, key := range orderedKeys {
+		if pruneName, pruned := journal.pruned[key]; pruned {
+			if _, err := validatePrunedTxn(st, key, pruneName, journal); err != nil {
+				return nil, addPruneFamilyRemedy(st, key, err)
+			}
+			continue
+		}
 		revisions := journal.revisions[key]
 		if len(revisions) == 0 {
 			return nil, fmt.Errorf("transaction completion %s has no matching immutable revision",
 				txnDisplayPath(st, journal.completed[key]))
 		}
+		completionName, completed := journal.completed[key]
+		if completed {
+			marker, err := decodeTxnCompletion(st, key, completionName)
+			if err != nil {
+				return nil, fmt.Errorf("validate transaction completion: %w", err)
+			}
+			if err := matchCompletedTxnRevisions(st, key, revisions, marker, completionName); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		latest, err := validateTxnChain(st, key, revisions)
 		if err != nil {
 			return nil, err
 		}
-		completionName, completed := journal.completed[key]
-		if !completed {
-			out = append(out, latest)
-			continue
-		}
-		marker, err := decodeTxnCompletion(st, key, completionName)
-		if err != nil {
-			return nil, fmt.Errorf("validate transaction completion: %w", err)
-		}
-		if marker.Sequence != latest.Sequence || marker.RevisionDigest != latest.revisionDigest {
-			return nil, fmt.Errorf("transaction completion %s names revision %d/%s but latest revision is %d/%s",
-				txnDisplayPath(st, completionName), marker.Sequence, marker.RevisionDigest, latest.Sequence, latest.revisionDigest)
-		}
+		out = append(out, latest)
 	}
 	return out, nil
+}
+
+// matchCompletedTxnRevisions proves a terminal marker still names this
+// transaction's newest revision without reading a single revision file. Each
+// revision's filename already commits to its own digest -- decodeTxnFile
+// rejects any file whose contents hash to something else -- so comparing the
+// marker against the filenames establishes the same binding the marker exists
+// to record. Contiguity from 1 is checked here too, so a revision cannot be
+// deleted or duplicated without notice.
+func matchCompletedTxnRevisions(st *store.Store, key txnKey, revisions []txnRevision, marker txnCompletion, completionName string) error {
+	ordered := make([]txnRevision, len(revisions))
+	copy(ordered, revisions)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].sequence != ordered[j].sequence {
+			return ordered[i].sequence < ordered[j].sequence
+		}
+		return ordered[i].name < ordered[j].name
+	})
+	for i, revision := range ordered {
+		if expected := uint64(i + 1); revision.sequence != expected {
+			return fmt.Errorf("transaction %s/%s revision chain expected sequence %d, found %d at %s",
+				key.op, key.id, expected, revision.sequence, txnDisplayPath(st, revision.name))
+		}
+	}
+	newest := ordered[len(ordered)-1]
+	if marker.Sequence != newest.sequence || marker.RevisionDigest != newest.digest {
+		return fmt.Errorf("transaction completion %s names revision %d/%s but the newest revision is %d/%s",
+			txnDisplayPath(st, completionName), marker.Sequence, marker.RevisionDigest, newest.sequence, newest.digest)
+	}
+	return nil
 }
 
 // RecoverHandler drives one pending transaction to a terminal state:
 // complete, rolled back, or safe-conflict. Handlers append a terminal marker.
 type RecoverHandler func(*store.Store, TxnRecord) error
 
+type recoverReporter func(*store.Store, TxnRecord) (Result, error)
+
+type recoveryConflictRemedyError struct {
+	err error
+}
+
+func (e *recoveryConflictRemedyError) Error() string { return e.err.Error() }
+func (e *recoveryConflictRemedyError) Unwrap() error { return e.err }
+
+func addRecoveryConflictRemedy(st *store.Store, record TxnRecord, err error) error {
+	if !errors.Is(err, ErrTxnConflict) {
+		return err
+	}
+	var remedied *recoveryConflictRemedyError
+	if errors.As(err, &remedied) {
+		return err
+	}
+	revisions, completion, pruned := txnFamilyLocations(st, txnKey{op: record.Op, id: record.TxnID})
+	return &recoveryConflictRemedyError{err: fmt.Errorf(
+		"%w; inspect the recorded operation state at %s, %s, and %s; preserve the complete transaction family before manual repair; to abandon this recovery, move every transaction family file out of the recovery directory, including revisions matching %s, completion marker %s, and prune records matching %s, then retry",
+		err,
+		filepath.Join(st.SkillsDir(), record.Name),
+		filepath.Join(st.StagingDir(), record.Name),
+		st.RecoveryDir(),
+		revisions,
+		completion,
+		pruned,
+	)}
+}
+
+func txnFamilyLocations(st *store.Store, key txnKey) (revisions, completion, pruned string) {
+	revisions = filepath.Join(st.RecoveryDir(), fmt.Sprintf("txn-%s-%s-*.json", key.op, key.id))
+	completion = filepath.Join(st.RecoveryDir(), fmt.Sprintf("txn-%s-%s.done", key.op, key.id))
+	pruned = filepath.Join(st.RecoveryDir(), fmt.Sprintf("txn-%s-%s-*.pruned", key.op, key.id))
+	return revisions, completion, pruned
+}
+
+func addPruneFamilyRemedy(st *store.Store, key txnKey, err error) error {
+	if err == nil {
+		return nil
+	}
+	revisions, completion, pruned := txnFamilyLocations(st, key)
+	return fmt.Errorf(
+		"%w; preserve the complete transaction family before manual repair; to abandon this damaged completed transaction, move the complete transaction family out of the recovery directory, including revisions matching %s, completion marker %s, and prune records matching %s, then retry",
+		err, revisions, completion, pruned,
+	)
+}
+
+func addJournalScanRemedy(st *store.Store, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w; preserve the affected journal files under %s, move the exact malformed or damaged files named above out of that directory, then retry",
+		err, st.RecoveryDir())
+}
+
 var (
 	// recoverHandlersMu guards recoverHandlers. Registration normally
 	// happens during init, before any command runs, but the lock keeps
 	// that from being a correctness requirement callers must remember.
 	recoverHandlersMu sync.RWMutex
-	recoverHandlers   = map[string]RecoverHandler{}
+	recoverHandlers   = map[string]recoverReporter{}
 )
 
 // RegisterRecoverHandler is called by op implementations (adopt/update
 // in later plans).
 func RegisterRecoverHandler(op string, h RecoverHandler) {
+	RegisterRecoverReporter(op, func(st *store.Store, record TxnRecord) (Result, error) {
+		return Result{}, h(st, record)
+	})
+}
+
+func RegisterRecoverReporter(op string, h recoverReporter) {
 	recoverHandlersMu.Lock()
 	defer recoverHandlersMu.Unlock()
 	recoverHandlers[op] = h
@@ -561,24 +826,33 @@ func deleteRecoverHandler(op string) {
 // RecoverPending is the unified recovery entry — the mandatory first
 // step of every write command after taking the lock (DESIGN §2).
 func RecoverPending(st *store.Store) error {
+	_, err := RecoverPendingReporting(st)
+	return err
+}
+
+// RecoverPendingReporting performs unified recovery and returns durable
+// user-facing findings produced while safely isolating a transaction target.
+func RecoverPendingReporting(st *store.Store) (res Result, retErr error) {
 	if err := st.RecoverConfigExchanges(); err != nil {
-		return fmt.Errorf("recover pending config exchanges: %w", err)
+		return res, fmt.Errorf("recover pending config exchanges: %w", err)
 	}
 	pend, err := PendingTxns(st)
 	if err != nil {
-		return fmt.Errorf("list pending transactions: %w", err)
+		return res, fmt.Errorf("list pending transactions: %w", addJournalScanRemedy(st, err))
 	}
 	for _, r := range pend {
 		recoverHandlersMu.RLock()
 		h, ok := recoverHandlers[r.Op]
 		recoverHandlersMu.RUnlock()
 		if !ok {
-			return fmt.Errorf("%w: %q (newer fu required, or resolve manually under %s)",
+			return res, fmt.Errorf("%w: %q (newer fu required, or resolve manually under %s)",
 				ErrUnknownTxn, r.Op, st.RecoveryDir())
 		}
-		if err := h(st, r); err != nil {
-			return fmt.Errorf("recover transaction %q: %w", r.Op, err)
+		recovered, err := h(st, r)
+		mergeResult(&res, recovered)
+		if err != nil {
+			return res, fmt.Errorf("recover transaction %q: %w", r.Op, addRecoveryConflictRemedy(st, r, err))
 		}
 	}
-	return nil
+	return res, nil
 }

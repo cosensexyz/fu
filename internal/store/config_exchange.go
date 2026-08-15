@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -140,6 +141,7 @@ func writeConfigExchangeRecord(archive *checkedRoot, record configExchangeRecord
 }
 
 func inspectConfigObject(root *checkedRoot, name string) (configObjectState, error) {
+	defer keepDescriptorOwnersAlive(root)
 	file, stat, err := openRegularFileAt(int(root.dir.Fd()), name)
 	if errors.Is(err, unix.ENOENT) {
 		return configObjectState{}, nil
@@ -152,11 +154,12 @@ func inspectConfigObject(root *checkedRoot, name string) (configObjectState, err
 		_ = file.Close()
 		return configObjectState{}, readErr
 	}
+	if int64(len(raw)) > MaxConfigBytes {
+		_ = file.Close()
+		return configObjectState{}, fmt.Errorf("regular file %q exceeds config limit %d", name, MaxConfigBytes)
+	}
 	if err := finishRegularFileRead(file, name, stat, int64(len(raw)), regularFileReadHooks{}); err != nil {
 		return configObjectState{}, err
-	}
-	if int64(len(raw)) > MaxConfigBytes {
-		return configObjectState{}, fmt.Errorf("regular file %q exceeds config limit %d", name, MaxConfigBytes)
 	}
 	return configObjectState{
 		exists:   true,
@@ -170,6 +173,7 @@ func configObjectMatches(state configObjectState, identity FileIdentity, digest 
 }
 
 func configExchangeCompleted(archive *checkedRoot, record configExchangeRecord, raw []byte) (bool, error) {
+	defer keepDescriptorOwnersAlive(archive)
 	doneName, err := configExchangeDoneName(record.Candidate)
 	if err != nil {
 		return false, err
@@ -193,6 +197,7 @@ func configExchangeCompleted(archive *checkedRoot, record configExchangeRecord, 
 }
 
 func completeConfigExchange(archive *checkedRoot, record configExchangeRecord, raw []byte, outcome string) error {
+	defer keepDescriptorOwnersAlive(archive)
 	doneName, err := configExchangeDoneName(record.Candidate)
 	if err != nil {
 		return err
@@ -219,6 +224,7 @@ func readPendingConfigExchangeRecords(archive *checkedRoot) ([]struct {
 	record configExchangeRecord
 	raw    []byte
 }, error) {
+	defer keepDescriptorOwnersAlive(archive)
 	dir, err := reopenDirNoFollow(int(archive.dir.Fd()), ".", archive.display, false, 0o755)
 	if err != nil {
 		return nil, err
@@ -293,6 +299,7 @@ func recoverPendingConfigExchanges(target, scratch, archive *checkedRoot) error 
 }
 
 func recoverConfigExchange(target, scratch, archive *checkedRoot, record configExchangeRecord, raw []byte) error {
+	defer keepDescriptorOwnersAlive(target, scratch, archive)
 	candidate, err := inspectConfigObject(scratch, record.Candidate)
 	if err != nil {
 		return fmt.Errorf("inspect config candidate %s/%s during recovery: %w", scratch.display, record.Candidate, err)
@@ -322,11 +329,16 @@ func recoverConfigExchange(target, scratch, archive *checkedRoot, record configE
 		}
 		return completeConfigExchange(archive, record, raw, "withdrawn-before-publication")
 	}
-	if active.exists && active.identity == record.Staged && active.digest == record.DataDigest {
+	if configObjectMatches(active, record.Staged, record.DataDigest) &&
+		current.exists && current.identity == record.Previous {
+		outcome := "withdrawn-after-precondition-mismatch"
+		if current.digest == record.ExpectDigest {
+			outcome = "withdrawn-with-previous-current"
+		}
 		if err := archiveNamedConfigEntry(scratch, configSwapName, archive, record.Staged); err != nil {
 			return fmt.Errorf("archive unpublished config exchange during recovery: %w", err)
 		}
-		return completeConfigExchange(archive, record, raw, "withdrawn-before-exchange")
+		return completeConfigExchange(archive, record, raw, outcome)
 	}
 	if configObjectMatches(active, record.Previous, record.ExpectDigest) &&
 		configObjectMatches(current, record.Staged, record.DataDigest) {
@@ -359,10 +371,27 @@ func recoverConfigExchange(target, scratch, archive *checkedRoot, record configE
 		current.exists && current.identity == record.Previous && !candidate.exists && !active.exists {
 		return completeConfigExchange(archive, record, raw, "withdrawn")
 	}
-	return fmt.Errorf("config exchange %q cannot be recovered safely: recorded objects changed or occupy conflicting locations; all versions are preserved", record.Candidate)
+	return configExchangeConflictError(target, scratch, archive, record)
+}
+
+func configExchangeConflictError(target, scratch, archive *checkedRoot, record configExchangeRecord) error {
+	recordName, err := configExchangeRecordName(record.Candidate)
+	if err != nil {
+		recordName = "<invalid-config-exchange-record>"
+	}
+	paths := []string{
+		filepath.Join(target.display, "fu.yaml"),
+		filepath.Join(scratch.display, record.Candidate),
+		filepath.Join(scratch.display, configSwapName),
+		filepath.Join(archive.display, recordName),
+		filepath.Join(archive.display, configArchiveName(record.Previous)),
+		filepath.Join(archive.display, configArchiveName(record.Staged)),
+	}
+	return fmt.Errorf("config exchange cannot be recovered safely because recorded objects changed or occupy conflicting locations; preserve these versions, compare them, move changed or conflicting entries aside, then retry: %s", strings.Join(paths, ", "))
 }
 
 func revalidateConfigExchangePair(target, scratch *checkedRoot, targetIdentity, scratchIdentity FileIdentity) error {
+	defer keepDescriptorOwnersAlive(target, scratch)
 	targetStat, err := statAt(int(target.dir.Fd()), "fu.yaml")
 	if err != nil {
 		return err

@@ -41,7 +41,9 @@ type Agent interface {
 
 // All lists every known adapter; adding an agent means one new file plus
 // one line here.
-func All() []Agent { return []Agent{Claude{}, Codex{}} }
+func All() []Agent {
+	return []Agent{Claude{}, Codex{}}
+}
 
 // Detected filters All to installed agents (detected == managed,
 // SPEC rule 4).

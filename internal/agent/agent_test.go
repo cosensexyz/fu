@@ -12,8 +12,12 @@ func TestDetectAndDirs(t *testing.T) {
 	if got := len(Detected()); got != 0 {
 		t.Fatalf("nothing installed, want 0 detected, got %d", got)
 	}
-	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	det := Detected()
 	if len(det) != 2 {
 		t.Fatalf("want 2 detected, got %d", len(det))

@@ -15,7 +15,7 @@ func TestScanMultiSkillRepo(t *testing.T) {
 	// .git must be skipped even if it contains a SKILL.md-like file
 	writeSkill(t, filepath.Join(root, ".git", "fake"), "name: fake\ndescription: d")
 
-	valid, invalid, err := Scan(root)
+	valid, invalid, err := ScanFS(os.DirFS(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestScanMultiSkillRepo(t *testing.T) {
 
 func TestScanRootIsSkill(t *testing.T) {
 	root := writeSkill(t, filepath.Join(t.TempDir(), "solo"), "name: solo\ndescription: d")
-	valid, _, err := Scan(root)
+	valid, _, err := ScanFS(os.DirFS(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,19 @@ func TestScanRootIsSkill(t *testing.T) {
 	}
 }
 
-// TestScanSkillNotDescendedInto guards the filepath.SkipDir call after a
+func TestScanFSReturnsSlashRelativeCandidates(t *testing.T) {
+	root := t.TempDir()
+	writeSkill(t, filepath.Join(root, "nested", "alpha"), "name: alpha\ndescription: d")
+	valid, invalid, err := ScanFS(os.DirFS(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invalid) != 0 || len(valid) != 1 || valid[0].Dir != "nested/alpha" {
+		t.Fatalf("valid=%+v invalid=%v", valid, invalid)
+	}
+}
+
+// TestScanSkillNotDescendedInto guards the fs.SkipDir return after a
 // valid candidate is recorded: a skill nested directly inside another
 // valid skill must not itself be reported. Unlike the nested/beta case in
 // TestScanMultiSkillRepo (which nests through a plain, non-skill
@@ -50,7 +62,7 @@ func TestScanSkillNotDescendedInto(t *testing.T) {
 	writeSkill(t, filepath.Join(root, "outer"), "name: outer\ndescription: d")
 	writeSkill(t, filepath.Join(root, "outer", "inner"), "name: inner\ndescription: d")
 
-	valid, _, err := Scan(root)
+	valid, _, err := ScanFS(os.DirFS(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,45 +71,17 @@ func TestScanSkillNotDescendedInto(t *testing.T) {
 	}
 }
 
-// TestScanRelativeRootYieldsAbsoluteDir checks that Candidate.Dir is
-// absolute (per its documented contract) even when the caller passes a
-// relative root.
-func TestScanRelativeRootYieldsAbsoluteDir(t *testing.T) {
-	root := t.TempDir()
-	writeSkill(t, filepath.Join(root, "alpha"), "name: alpha\ndescription: d")
-
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(wd) })
-	if err := os.Chdir(root); err != nil {
-		t.Fatal(err)
-	}
-
-	valid, _, err := Scan(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(valid) != 1 {
-		t.Fatalf("want 1 valid, got %d: %+v", len(valid), valid)
-	}
-	if !filepath.IsAbs(valid[0].Dir) {
-		t.Fatalf("want absolute Dir for a relative root, got %q", valid[0].Dir)
-	}
-}
-
 // TestScanMissingRootIsFatal checks that an error on root itself (as
 // opposed to a descendant) still aborts the scan and is returned as err.
 func TestScanMissingRootIsFatal(t *testing.T) {
-	_, _, err := Scan(filepath.Join(t.TempDir(), "does-not-exist"))
+	_, _, err := ScanFS(os.DirFS(filepath.Join(t.TempDir(), "does-not-exist")))
 	if err == nil {
 		t.Fatal("want non-nil err for a missing root")
 	}
 }
 
 // TestScanRootNotDirectoryIsFatal checks the other root-is-unusable case
-// named by the finding: root exists but is a plain file. filepath.WalkDir
+// named by the finding: root exists but is a plain file. fs.WalkDir
 // does not surface this as a werr (it just visits the single file and
 // returns nil), so Scan must reject it explicitly.
 func TestScanRootNotDirectoryIsFatal(t *testing.T) {
@@ -106,7 +90,7 @@ func TestScanRootNotDirectoryIsFatal(t *testing.T) {
 	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := Scan(f); err == nil {
+	if _, _, err := ScanFS(os.DirFS(f)); err == nil {
 		t.Fatal("want non-nil err when root is not a directory")
 	}
 }
@@ -145,27 +129,27 @@ func TestScanUnreadableDirIsIsolated(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Chmod(bad, 0o755) })
 
-	valid, invalid, err := Scan(root)
+	valid, invalid, err := ScanFS(os.DirFS(root))
 	if err != nil {
 		t.Fatalf("want nil err, got %v", err)
 	}
 	if len(valid) != 1 || valid[0].Meta.Name != "good" {
 		t.Fatalf("want good still found, got %+v", valid)
 	}
-	if _, ok := invalid[bad]; !ok {
-		t.Fatalf("want %q recorded in invalid, got %v", bad, invalid)
+	if _, ok := invalid["bad"]; !ok {
+		t.Fatalf("want %q recorded in invalid, got %v", "bad", invalid)
 	}
 }
 
 // TestScanUnreadableDescendantWalkErrorIsIsolated exercises the actual
-// mechanism finding 1 is about: filepath.WalkDir's error-carrying second
+// mechanism finding 1 is about: fs.WalkDir's error-carrying second
 // callback invocation for a directory it failed to read.
 //
 // "bad" is given execute-but-not-read permission (0o111): looking up a
 // specific known filename (what ParseMeta does for SKILL.md) still
 // resolves as "not found" via ErrNoSkillFile, so Scan decides to descend
 // into "bad" -- but then enumerating "bad" via ReadDir fails with
-// permission denied, and filepath.WalkDir reports that failure by
+// permission denied, and fs.WalkDir reports that failure by
 // invoking the walk callback a second time with a non-nil err for the
 // same path. Before this fix, Scan propagated that error unconditionally
 // and aborted the entire scan (verified: valid came back empty, "good"
@@ -186,14 +170,14 @@ func TestScanUnreadableDescendantWalkErrorIsIsolated(t *testing.T) {
 	}
 	t.Cleanup(func() { os.Chmod(bad, 0o755) })
 
-	valid, invalid, err := Scan(root)
+	valid, invalid, err := ScanFS(os.DirFS(root))
 	if err != nil {
 		t.Fatalf("want nil err, got %v", err)
 	}
 	if len(valid) != 1 || valid[0].Meta.Name != "good" {
 		t.Fatalf("want good still found, got %+v", valid)
 	}
-	if _, ok := invalid[bad]; !ok {
-		t.Fatalf("want %q recorded in invalid, got %v", bad, invalid)
+	if _, ok := invalid["bad"]; !ok {
+		t.Fatalf("want %q recorded in invalid, got %v", "bad", invalid)
 	}
 }

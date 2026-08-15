@@ -2,6 +2,8 @@
 package engine
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -65,7 +67,7 @@ import (
 // occupied skill" write op is what actually reaches for it.
 func TestWriteOperationsNeverSilentlyTouchForeignContent(t *testing.T) {
 	for _, fx := range foreignFixtures() {
-		for _, op := range writeOps() {
+		for _, op := range writeOps(t) {
 			t.Run(op.label+"/"+fx.label, func(t *testing.T) {
 				s, _ := setupStore(t)
 				dir := t.TempDir()
@@ -673,10 +675,36 @@ type writeOp struct {
 	run   func(s *store.Store, agents []agent.Agent) (Result, error)
 }
 
-func writeOps() []writeOp {
+// writeOps returns the write operations the foreign-content invariant
+// matrix runs. add and rm fit the harness directly (round 11 finding M1):
+// the candidate name and the removed seed name are both distinct from the
+// fixture names, so a fixture planted at any position exercises the
+// reconcile-conflict reporting path. adopt is deliberately excluded: it
+// legitimately archives and deletes the *targeted* entries, so it cannot
+// run against a fixture that doubles as its target; its non-targeted-entry
+// discipline is covered by the dedicated adopt tests instead.
+func writeOps(t *testing.T) []writeOp {
+	srcDir := t.TempDir()
+	writeSkillTree(t, srcDir, "added-skill", "---\nname: added-skill\ndescription: d\n---\n")
+	p := prepareLocal(t, srcDir)
+	cands, _, err := ScanSource(p)
+	if err != nil {
+		t.Fatalf("setup: scan add source failed: %v", err)
+	}
+	if len(cands) != 1 {
+		t.Fatalf("setup: add source candidates = %+v", cands)
+	}
+	fields := localFields(t, p, cands[0].Subdir)
 	return []writeOp{
 		{"new unrelated skill", func(s *store.Store, agents []agent.Agent) (Result, error) {
 			return NewSkill(s, agents, "freshly-added")
+		}},
+		{"add skill from source", func(s *store.Store, agents []agent.Agent) (Result, error) {
+			return AddSkill(s, agents, p, cands[0], fields)
+		}},
+		{"rm seed", func(s *store.Store, agents []agent.Agent) (Result, error) {
+			outcome, err := RemoveSkill(s, agents, "seed")
+			return outcome.Operation.Reconcile, err
 		}},
 		{"disable seed globally", func(s *store.Store, agents []agent.Agent) (Result, error) {
 			return SetGlobal(s, agents, "seed", false)
@@ -687,5 +715,174 @@ func writeOps() []writeOp {
 		{"enable occupied skill", func(s *store.Store, agents []agent.Agent) (Result, error) {
 			return SetGlobal(s, agents, "occupied", true)
 		}},
+	}
+}
+
+// jsonRoundTrip marshals and unmarshals a map, the way a transaction record
+// stores one in the WAL: the round trip produces a different map instance
+// whose iteration order is unrelated to the original's.
+func jsonRoundTrip[V any](t *testing.T, in map[string]V) map[string]V {
+	t.Helper()
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]V
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestRecoveredConfigMatchesOperationBytes pins the byte-exactness contract
+// between the config an operation writes and the config recovery
+// reconstructs from the transaction record (review finding C1). The record
+// JSON-round-trips Go maps, so reconstruction iterates a differently
+// ordered map than the operation did; insertion order must be canonical or
+// a committed git-source add / multi-override adopt can never validate on
+// recovery and stays pending forever. The loop repeats because the
+// nondeterminism it guards is itself per-iteration; before the canonical
+// ordering fix this fails within a handful of iterations.
+func TestRecoveredConfigMatchesOperationBytes(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("0", 64)
+	fields := map[string]string{
+		"type":     "git",
+		"url":      "file:///tmp/repo.git",
+		"ref":      "main",
+		"ref_kind": "branch",
+		"commit":   strings.Repeat("ab", 20),
+		"subdir":   "alpha",
+	}
+	overrides := map[string]bool{"codex": false, "gemini": false, "peridot": false}
+	for i := 0; i < 100; i++ {
+		s, _ := setupStore(t)
+		before, err := os.ReadFile(s.ConfigPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Operation side: the mutations a real adopt writes to fu.yaml (the
+		// overrides loop is sortedNames, matching adoptOne's Mutate).
+		opCfg, err := store.LoadConfigBytes(before, "fu.yaml at test start")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := opCfg.AddSkill("alpha", digest); err != nil {
+			t.Fatal(err)
+		}
+		opCfg.SetSourceFields("alpha", fields)
+		for _, name := range sortedNames(overrides) {
+			opCfg.SetAgent("alpha", name, overrides[name])
+		}
+		opBytes, err := opCfg.Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Recovery side: the same mutations through the round-tripped maps
+		// the transaction record carries, via the real reconstruction.
+		rec := TxnRecord{
+			Op: "adopt", Name: "alpha", Digest: digest, ConfigBefore: before,
+			SourceFields: jsonRoundTrip(t, fields),
+			Overrides:    jsonRoundTrip(t, overrides),
+		}
+		recBytes, err := expectedAdoptConfig(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(opBytes, recBytes) {
+			t.Fatalf("recovered adopt config differs from the operation config\n--- operation ---\n%s\n--- recovered ---\n%s", opBytes, recBytes)
+		}
+
+		// The install reconstruction (source fields only, no overrides).
+		opCfg2, err := store.LoadConfigBytes(before, "fu.yaml at test start")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := opCfg2.AddSkill("alpha", digest); err != nil {
+			t.Fatal(err)
+		}
+		opCfg2.SetSourceFields("alpha", fields)
+		opBytes2, err := opCfg2.Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec2 := TxnRecord{
+			Op: "add", Name: "alpha", Digest: digest, ConfigBefore: before,
+			SourceFields: jsonRoundTrip(t, fields),
+		}
+		recBytes2, err := expectedInstallConfig(rec2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(opBytes2, recBytes2) {
+			t.Fatalf("recovered install config differs from the operation config\n--- operation ---\n%s\n--- recovered ---\n%s", opBytes2, recBytes2)
+		}
+	}
+}
+
+// TestValidatorsAcceptFirstRevisionShape pins the recovery-family invariant
+// (round 9 recommendation): every transaction op's validator must accept
+// its own first-revision shape -- "started" with a nil payload and nil
+// digest -- because the pipeline writes exactly that revision before any
+// operation code runs. A validator regression here would deadlock every
+// write command after a crash in the opening window, the same failure class
+// the crash tests cover behaviorally.
+func TestValidatorsAcceptFirstRevisionShape(t *testing.T) {
+	startHead := strings.Repeat("ab", 20)
+	configBefore := []byte("---\nskills: {}\n")
+	targets := []string{filepath.Join("staging", "alpha"), filepath.Join("store", "skills", "alpha")}
+	base := TxnRecord{StartHead: startHead, ConfigBefore: configBefore, Stage: "started", Targets: targets}
+	for _, tc := range []struct {
+		op   string
+		want string
+		run  func(record TxnRecord) error
+	}{
+		{"new", "new: alpha", validateInstallTxn},
+		{"add", "add: alpha", validateInstallTxn},
+		{"adopt", "adopt: alpha", validateAdoptTxn},
+		{"rm", "rm: alpha", validateRemoveTxn},
+	} {
+		record := base
+		record.Op = tc.op
+		record.Name = "alpha"
+		record.Message = tc.want
+		if err := tc.run(record); err != nil {
+			t.Fatalf("%s first revision must validate: %v", tc.op, err)
+		}
+	}
+}
+
+func TestStartedAdoptHasNoExpectedConfigMutation(t *testing.T) {
+	record := TxnRecord{
+		Op: "adopt", Name: "alpha", Stage: "started",
+		ConfigBefore: []byte("version: 1\nskills: {}\n"),
+	}
+	got, err := expectedAdoptConfig(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("expected config = %q, want nil before a digest exists", got)
+	}
+}
+
+func TestAdoptTxnLaterStagesRequireDigest(t *testing.T) {
+	startHead := strings.Repeat("ab", 20)
+	payload := &store.OwnedTree{
+		RootIdentity: store.FileIdentity{Device: 1, Inode: 1},
+		RootMode:     uint32(os.ModeDir | 0o755),
+	}
+	for _, stage := range []string{"prepared", "config-saved", "published"} {
+		record := TxnRecord{
+			Op: "adopt", Name: "alpha", Stage: stage,
+			StartHead: startHead, Message: "adopt: alpha",
+			Targets:      []string{filepath.Join("staging", "alpha"), filepath.Join("store", "skills", "alpha")},
+			ConfigBefore: []byte("version: 1\nskills: {}\n"), Payload: payload,
+		}
+		err := validateAdoptTxn(record)
+		if err == nil || !strings.Contains(err.Error(), "digest") {
+			t.Fatalf("stage %s error = %v, want missing-digest refusal", stage, err)
+		}
 	}
 }

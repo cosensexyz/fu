@@ -22,7 +22,36 @@ const (
 	// one.
 	entrySymlink = "L"
 	fieldSep     = "\x00"
+	// MaxSourceFileBytes is the shared per-file boundary for projection,
+	// digesting, and copying source content.
+	MaxSourceFileBytes int64 = 64 << 20
 )
+
+func digestProjectedFile(fsys fs.FS, name string, info fs.FileInfo) (string, error) {
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s has unsupported mode %v and cannot be part of a skill", name, info.Mode())
+	}
+	if info.Size() > MaxSourceFileBytes {
+		return "", fmt.Errorf("%s size %d exceeds the shared 64 MiB source-file limit", name, info.Size())
+	}
+	f, err := fsys.Open(name)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	n, copyErr := io.Copy(h, io.LimitReader(f, MaxSourceFileBytes+1))
+	closeErr := f.Close()
+	if copyErr != nil {
+		return "", copyErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if n > MaxSourceFileBytes {
+		return "", fmt.Errorf("%s exceeded the shared 64 MiB source-file limit while being read", name)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 // ManifestEntry is one already-authorized filesystem entry projected into a
 // skill digest. File digests use the same "sha256:<hex>" form as the store's
@@ -124,7 +153,12 @@ func DigestManifest(entries []ManifestEntry) (string, error) {
 // symlink literally named "link1 -> a" targeting "b" would render
 // identically to a symlink named "link1" targeting "a -> b".
 func Digest(dir string) (string, error) {
-	return DigestFS(os.DirFS(dir), ".")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	return DigestFS(root.FS(), ".")
 }
 
 // DigestFS computes the same projection within an fs.FS. It lets write
@@ -137,14 +171,12 @@ func DigestFS(fsys fs.FS, dir string) (string, error) {
 			return werr
 		}
 		if d.Name() == ".git" {
-			// Excluded on name alone, at any depth, whatever kind of entry
-			// it is -- directory (normal clone), regular file
-			// (worktree/submodule pointer), or symlink. Round 6 finding: the
-			// symlink case used to fall through to the symlink arm below and
-			// enter the digest, while store.stageAll excludes .git by name
-			// regardless of type. That disagreement is permanent, since it
-			// makes digest(store) differ from digest(clone) for a skill
-			// nobody has touched.
+			// Directories and regular files are projection metadata and are
+			// excluded at any depth. A symlink is refused: silently hiding it
+			// here would disagree with ProjectDir, the live copy projection.
+			if d.Type()&fs.ModeSymlink != 0 {
+				return fmt.Errorf("%s is a .git symlink and cannot be part of a skill projection", p)
+			}
 			if d.IsDir() {
 				return fs.SkipDir
 			}
@@ -189,20 +221,11 @@ func DigestFS(fsys fs.FS, dir string) (string, error) {
 			if d.Type()&^fs.ModeSymlink&^fs.ModeDir != 0 {
 				return fmt.Errorf("%s has unsupported mode %v and cannot be part of a skill digest", rel, d.Type())
 			}
-			f, err := fsys.Open(p)
+			info, err := d.Info()
 			if err != nil {
 				return err
 			}
-			h := sha256.New()
-			_, copyErr := io.Copy(h, f)
-			closeErr := f.Close() // explicit close (not defer): this runs in a walk loop, not a single-shot function
-			if copyErr != nil {
-				return copyErr
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-			info, err := d.Info()
+			digest, err := digestProjectedFile(fsys, p, info)
 			if err != nil {
 				return err
 			}
@@ -210,7 +233,7 @@ func DigestFS(fsys fs.FS, dir string) (string, error) {
 			if info.Mode()&0o100 != 0 {
 				exec = "1"
 			}
-			records = append(records, strings.Join([]string{entryFile, rel, hex.EncodeToString(h.Sum(nil)), exec}, fieldSep))
+			records = append(records, strings.Join([]string{entryFile, rel, digest, exec}, fieldSep))
 		}
 		return nil
 	})

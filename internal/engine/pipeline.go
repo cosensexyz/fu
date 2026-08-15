@@ -36,8 +36,8 @@ type Op struct {
 	Txn *TxnRecord
 	// Publish, when non-nil, moves content prepared during Mutate from
 	// staging into the store. It runs after the config has been saved and
-	// before the commit (round 7 finding, DESIGN §6's "准备 → 落盘 store →
-	// commit"). Ops that only edit the config leave it nil.
+	// before the commit (round 7 finding, DESIGN §6's prepare → publish to
+	// store → commit order). Ops that only edit the config leave it nil.
 	//
 	// The order matters, and is chosen for which half-finished state is the
 	// better one to be left in. Publishing before the config was saved is
@@ -51,12 +51,130 @@ type Op struct {
 	// complete. One is silent and stuck; the other is visible and
 	// recoverable.
 	Publish func(st *store.Store) error
+	// PostCommit runs after the operation commit is written but while the
+	// transaction WAL is still open, so a crash inside it is continued by
+	// the transaction's recovery handler. Adopt uses it for the agent-side
+	// switching whose durable half (archives) must be resumable (DESIGN §6
+	// AdoptPlan phase 3).
+	PostCommit func(st *store.Store) error
 	// Cleanup removes staging content for a non-transaction observed rollback.
 	Cleanup func(st *store.Store) error
+	outcome *OperationOutcome
+}
+
+// OperationOutcome reports how far one mutation reached after its durable
+// Git publication. The fields are monotonic: a completed phase remains true
+// when a later phase reports an error. RecoveryPending specifically means a
+// committed transaction still has no validated terminal WAL marker.
+type OperationOutcome struct {
+	Name               string
+	Committed          bool
+	PostCommitComplete bool
+	WALComplete        bool
+	CanonicalChecked   bool
+	ReconcileComplete  bool
+	RecoveryPending    bool
+	Reconcile          Result
+}
+
+// DurablyStarted reports whether the operation crossed either durable
+// publication boundary. PostCommitComplete implies a written commit even if a
+// caller received an older or partially populated outcome value.
+func (o OperationOutcome) DurablyStarted() bool {
+	return o.Committed || o.PostCommitComplete
+}
+
+type operationSetupError struct{ err error }
+
+func (e operationSetupError) Error() string { return e.err.Error() }
+func (e operationSetupError) Unwrap() error { return e.err }
+
+func asOperationSetupError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return operationSetupError{err: err}
+}
+
+func isOperationSetupError(err error) bool {
+	var setupErr operationSetupError
+	return errors.As(err, &setupErr)
+}
+
+type operationStoreError struct{ err error }
+
+func (e operationStoreError) Error() string { return e.err.Error() }
+func (e operationStoreError) Unwrap() error { return e.err }
+
+func asOperationStoreError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return operationStoreError{err: err}
+}
+
+func isOperationStoreError(err error) bool {
+	var storeErr operationStoreError
+	return errors.As(err, &storeErr)
 }
 
 func Run(st *store.Store, agents []agent.Agent, op Op) (Result, error) {
 	return run(st, agents, op, hooks{})
+}
+
+// writeCommandPrologue gives write commands that perform discovery before
+// constructing an Op the same mandatory recovery boundary as Run. It is
+// intentionally complete even when discovery later yields zero operations.
+func writeCommandPrologue(st *store.Store, agents []agent.Agent) (res Result, retErr error) {
+	session, err := st.BeginWrite()
+	if err != nil {
+		return res, fmt.Errorf("open checked write prologue: %w", err)
+	}
+	defer func() {
+		retErr = errors.Join(retErr, session.Close())
+	}()
+	checked := session.Store
+	homeRoot, err := checked.Root()
+	if err != nil {
+		return res, fmt.Errorf("use checked write root: %w", err)
+	}
+	storeRoot, err := checked.StoreRoot()
+	if err != nil {
+		return res, fmt.Errorf("use checked store root: %w", err)
+	}
+	retErr = withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
+		recoveryResult, err := RecoverPendingReporting(checked)
+		mergeResult(&res, recoveryResult)
+		if err != nil {
+			return fmt.Errorf("recover pending transactions: %w", err)
+		}
+		cfg, err := store.LoadConfigRoot(storeRoot, "fu.yaml", st.ConfigPath())
+		if err != nil {
+			return fmt.Errorf("load config %s: %w", st.ConfigPath(), err)
+		}
+		if err := cfg.CheckWritable(); err != nil {
+			return fmt.Errorf("check config writable: %w", err)
+		}
+		if err := checked.Sweep(); err != nil {
+			return fmt.Errorf("sweep external edits: %w", err)
+		}
+		if err := session.CheckCanonicalPath(); err != nil {
+			return err
+		}
+		reconcileResult, err := reconcileChecked(checked, cfg, agents, nil)
+		mergeResult(&res, reconcileResult)
+		if err != nil {
+			if errors.Is(err, ErrOperationFailed) {
+				// Per-agent failures are durable findings, but they do not make
+				// unrelated candidate work unsafe. Carry them into the command's
+				// result and let the final/abort boundary choose exit status.
+				return nil
+			}
+			return fmt.Errorf("reconcile links after write prologue: %w", err)
+		}
+		return nil
+	})
+	return res, retErr
 }
 
 // hooks is a test-only seam: each non-nil function runs at the durable
@@ -66,16 +184,36 @@ func Run(st *store.Store, agents []agent.Agent, op Op) (Result, error) {
 // zero value -- the same arrangement reconcile's beforeApply and
 // Store.commitWithHook already use.
 type hooks struct {
-	afterTxnStart         func() error
-	afterStagingCreate    func() error
-	afterStagingOwnership func() error
-	afterStagingScaffold  func() error
-	afterMutate           func() error
-	afterSave             func() error
-	beforePublish         func() error
-	afterPublish          func() error
-	afterCommit           func() error
-	commit                func(*store.Store, string, store.PreparedCommit) (store.CommitOutcome, error)
+	afterTxnStart               func() error
+	afterStagingCreate          func() error
+	afterStagingOwnership       func() error
+	afterStagingScaffold        func() error
+	afterDeclaredTxn            func() error       // add: declaration written, copy not started
+	afterCopy                   func() error       // add: copy verified, manifest not yet recorded
+	afterSnapshot               func() error       // rm: content snapshotted, not yet quarantined
+	afterQuarantine             func() error       // rm: content quarantined, config not yet touched
+	afterAdoptSwitch            func() error       // adopt: first agent switched, rest pending
+	beforeAdoptRetire           func() error       // adopt: original approved, retirement not yet attempted
+	afterAdoptRetire            func() error       // adopt: original retired, exact archive not yet copied
+	afterAdoptArchiveCopy       func() error       // adopt: exact archive recorded, retired original remains
+	afterDirSwitchChildCreate   func(string) error // adopt: replacement child created, identity not yet recorded
+	afterDirSwitchBuild         func() error       // adopt: replacement dir built, swapped WAL not yet recorded
+	beforeDirSwitchArchive      func() error       // adopt: swapped WAL recorded, parent link not yet archived
+	afterDirSwitchSwap          func() error       // adopt: parent link archived, swap not yet run
+	afterDirSwitchLand          func() error       // adopt: replacement landed, done revision not yet recorded
+	beforeDirSwitchChildRetire  func(string) error
+	beforeDirSwitchRootRetire   func(string) error
+	beforeDirSwitchBackupRetire func(string) error
+	beforeAdoptTargetCapture    func() error
+	afterAdoptLinkRead          func() error
+	beforeAdoptSourcePair       func() error
+	scanAdoptAgent              func(agent.Agent, string) (AgentState, error)
+	afterMutate                 func() error
+	afterSave                   func() error
+	beforePublish               func() error
+	afterPublish                func() error
+	afterCommit                 func() error
+	commit                      func(*store.Store, string, store.PreparedCommit) (store.CommitOutcome, error)
 }
 
 func (h hooks) fire(f func() error) error {
@@ -83,6 +221,13 @@ func (h hooks) fire(f func() error) error {
 		return nil
 	}
 	return f()
+}
+
+func (h hooks) scanAdoptInventory(a agent.Agent, storeSkillsDir string) (AgentState, error) {
+	if h.scanAdoptAgent != nil {
+		return h.scanAdoptAgent(a, storeSkillsDir)
+	}
+	return ScanAgent(a, storeSkillsDir)
 }
 
 func (h hooks) commitStore(st *store.Store, message string, prepared store.PreparedCommit) (store.CommitOutcome, error) {
@@ -95,7 +240,7 @@ func (h hooks) commitStore(st *store.Store, message string, prepared store.Prepa
 func run(st *store.Store, agents []agent.Agent, op Op, h hooks) (res Result, err error) {
 	session, err := st.BeginWrite()
 	if err != nil {
-		return res, fmt.Errorf("open checked write session: %w", err)
+		return res, asOperationSetupError(fmt.Errorf("open checked write session: %w", err))
 	}
 	// Joined rather than discarded, matching reconcileChecked: a close error
 	// here means the pinned descriptors did not release cleanly, which is not
@@ -108,14 +253,17 @@ func run(st *store.Store, agents []agent.Agent, op Op, h hooks) (res Result, err
 	checked := session.Store
 	homeRoot, err := checked.Root()
 	if err != nil {
-		return res, fmt.Errorf("use checked write root: %w", err)
+		return res, asOperationSetupError(fmt.Errorf("use checked write root: %w", err))
 	}
 	storeRoot, err := checked.StoreRoot()
 	if err != nil {
-		return res, fmt.Errorf("use checked store root: %w", err)
+		return res, asOperationSetupError(fmt.Errorf("use checked store root: %w", err))
 	}
+	setupComplete := false
 	err = withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
-		if err := RecoverPending(checked); err != nil {
+		recoveryResult, err := RecoverPendingReporting(checked)
+		mergeResult(&res, recoveryResult)
+		if err != nil {
 			return fmt.Errorf("recover pending transactions: %w", err)
 		}
 		// The bytes come back with the parsed config so the two cannot
@@ -159,9 +307,15 @@ func run(st *store.Store, agents []agent.Agent, op Op, h hooks) (res Result, err
 		if !bytes.Equal(configBefore, configLoaded) {
 			return fmt.Errorf("%w: %s changed while the operation was starting", ErrConcurrentStoreChange, st.ConfigPath())
 		}
+		setupComplete = true
 		if op.Preflight != nil {
+			// Unwrapped. The pipeline stage that rejected the command is fu's
+			// vocabulary, not the user's: `fu rm ghost` read "check operation
+			// preconditions: unknown skill \"ghost\"", which buries the one
+			// part that matters behind an implementation detail (round 18
+			// finding M20).
 			if err := op.Preflight(checked, cfg); err != nil {
-				return fmt.Errorf("check operation preconditions: %w", err)
+				return err
 			}
 		}
 		var configExpected []byte
@@ -175,14 +329,17 @@ func run(st *store.Store, agents []agent.Agent, op Op, h hooks) (res Result, err
 			op.Txn.Message = op.Message
 			op.Txn.ConfigBefore = append(op.Txn.ConfigBefore[:0], configBefore...)
 			if err := WriteTxn(checked, op.Txn); err != nil {
-				return fmt.Errorf("write transaction before mutation: %w", err)
+				return asOperationStoreError(fmt.Errorf("write transaction before mutation: %w", err))
 			}
 			if err := h.fire(h.afterTxnStart); err != nil {
 				return rollback(checked, op, configBefore, configExpected, nil, err)
 			}
 		}
 		if err := op.Mutate(checked, cfg); err != nil {
-			return rollback(checked, op, configBefore, configExpected, nil, fmt.Errorf("execute mutation: %w", err))
+			// Unwrapped for the same reason as Preflight above: `fu enable
+			// ghost` should say `unknown skill "ghost"`, not "execute
+			// mutation: unknown skill \"ghost\"".
+			return rollback(checked, op, configBefore, configExpected, nil, err)
 		}
 		if err := h.fire(h.afterMutate); err != nil {
 			return rollback(checked, op, configBefore, configExpected, nil, err)
@@ -246,27 +403,65 @@ func run(st *store.Store, agents []agent.Agent, op Op, h hooks) (res Result, err
 		if err != nil {
 			commitErr := fmt.Errorf("commit to store: %w", err)
 			if outcome.Written {
+				if op.outcome != nil {
+					op.outcome.Committed = true
+					op.outcome.RecoveryPending = op.Txn != nil
+				}
 				return fmt.Errorf("%w (commit %s was written; preserving its config, content, and transaction record for recovery)", commitErr, outcome.Hash.String())
 			}
 			return rollback(checked, op, configBefore, configExpected, &prepared, commitErr)
 		}
+		if op.outcome != nil {
+			op.outcome.Committed = outcome.Written
+			op.outcome.RecoveryPending = outcome.Written && op.Txn != nil
+		}
 		if err := h.fire(h.afterCommit); err != nil {
 			return err
+		}
+		if op.PostCommit != nil {
+			if err := op.PostCommit(checked); err != nil {
+				return fmt.Errorf("post-commit phase: %w", err)
+			}
+		}
+		if op.outcome != nil {
+			op.outcome.PostCommitComplete = true
 		}
 		if op.Txn != nil {
 			if err := ClearTxn(checked, *op.Txn); err != nil {
 				return fmt.Errorf("clear completed transaction: %w", err)
 			}
 		}
+		if op.outcome != nil {
+			op.outcome.WALComplete = true
+			op.outcome.RecoveryPending = false
+		}
 		if err := session.CheckCanonicalPath(); err != nil {
 			return err
 		}
-		res, err = reconcileChecked(checked, cfg, agents, nil)
+		if op.outcome != nil {
+			op.outcome.CanonicalChecked = true
+		}
+		reconcileResult, err := reconcileChecked(checked, cfg, agents, nil)
+		mergeResult(&res, reconcileResult)
+		if op.outcome != nil {
+			// ErrOperationFailed means the pass ran to completion and found
+			// per-agent failures -- that phase did happen. Any other error
+			// means reconcile never ran, and recording it as complete made
+			// the phase vector lie about a phase it never reached (round 18
+			// finding I3).
+			op.outcome.ReconcileComplete = err == nil || errors.Is(err, ErrOperationFailed)
+		}
 		if err != nil {
 			return fmt.Errorf("reconcile links: %w", err)
 		}
 		return nil
 	})
+	if op.outcome != nil {
+		op.outcome.Reconcile = res
+	}
+	if err != nil && !setupComplete {
+		err = asOperationSetupError(err)
+	}
 	return res, err
 }
 

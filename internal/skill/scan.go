@@ -4,51 +4,37 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"path/filepath"
+	"path"
 )
 
-// Candidate is a directory holding a valid SKILL.md, found by Scan.
+// Candidate is a directory holding a valid SKILL.md.
 type Candidate struct {
-	Dir  string // absolute path
+	Dir  string // slash-relative path rooted at the scanned fs.FS
 	Meta Meta
 }
 
-// Scan walks root and returns every directory containing a SKILL.md.
-// root is resolved to an absolute path before walking, so every
-// Candidate.Dir is absolute regardless of what the caller passed in.
-// .git is skipped entirely; skills are not searched inside skills.
-//
-// A problem with root itself (missing, unreadable, or not a directory)
-// is fatal and returned as err, since there is nothing left to scan. A
-// problem reading a descendant is instead recorded into the invalid
-// map, keyed by that path, and the walk continues with the rest of the
-// tree: one unreadable item must not prevent the others from being
-// processed.
-func Scan(root string) (valid []Candidate, invalid map[string]error, err error) {
+// ScanFS is Scan's descriptor-friendly form. Candidate and invalid paths are
+// clean slash-relative names, with "." representing the filesystem root.
+func ScanFS(fsys fs.FS) (valid []Candidate, invalid map[string]error, err error) {
 	invalid = map[string]error{}
-	absRoot, aerr := filepath.Abs(root)
-	if aerr != nil {
-		return valid, invalid, aerr
-	}
-
-	err = filepath.WalkDir(absRoot, func(p string, d fs.DirEntry, werr error) error {
+	err = fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
-			if p == absRoot {
+			if p == "." {
 				return werr // root itself is unusable: fatal, abort the scan
 			}
 			invalid[p] = werr // descendant is unusable: isolate it, keep walking
 			return nil
 		}
-		if p == absRoot && !d.IsDir() {
+		if p == "." && !d.IsDir() {
 			return fmt.Errorf("%s: not a directory", p)
 		}
 		if !d.IsDir() {
 			return nil
 		}
 		if d.Name() == ".git" {
-			return filepath.SkipDir
+			return fs.SkipDir
 		}
-		m, perr := ParseMeta(p)
+		m, perr := ParseMetaFS(fsys, p)
 		// errors.Is rather than == : this is the only sentinel comparison
 		// in production code that used ==. If ParseMeta ever wraps this
 		// error, == would silently misclassify every directory lacking a
@@ -59,14 +45,24 @@ func Scan(root string) (valid []Candidate, invalid map[string]error, err error) 
 		}
 		if perr != nil {
 			invalid[p] = perr
-			return filepath.SkipDir
+			return fs.SkipDir
 		}
-		if verr := Validate(m, filepath.Base(p)); verr != nil {
+		if verr := Validate(m, dirNameFS(m, p)); verr != nil {
 			invalid[p] = verr
-			return filepath.SkipDir
+			return fs.SkipDir
 		}
 		valid = append(valid, Candidate{Dir: p, Meta: m})
-		return filepath.SkipDir
+		return fs.SkipDir
 	})
 	return valid, invalid, err
+}
+
+func dirNameFS(m Meta, p string) string {
+	// A root-level SKILL.md has no directory basename to validate against, so
+	// its declared name supplies the identity. Nested skills must instead match
+	// their actual source directory (SPEC rule 1).
+	if p == "." {
+		return m.Name
+	}
+	return path.Base(p)
 }

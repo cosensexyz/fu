@@ -8,10 +8,45 @@ import (
 	"strings"
 	"testing"
 
+	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/index"
 	"github.com/go-git/go-git/v5/storage"
 )
+
+func TestGoGitV519HardResetDeletesUntrackedAndIgnoredFiles(t *testing.T) {
+	s, err := Init(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Dir(), ".gitignore"), []byte("ignored.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Commit("test: ignore rule"); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"untracked.txt", "ignored.txt"} {
+		if err := os.WriteFile(filepath.Join(s.Dir(), name), []byte("residue"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	head, err := s.Repo.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt, err := s.Repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.Reset(&git.ResetOptions{Mode: git.HardReset, Commit: head.Hash()}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"untracked.txt", "ignored.txt"} {
+		if _, err := os.Stat(filepath.Join(s.Dir(), name)); !os.IsNotExist(err) {
+			t.Fatalf("go-git v5.19.2 hard reset must delete %s; stat error = %v", name, err)
+		}
+	}
+}
 
 // A-B-C → revert 1 → D(parent=C, tree=B) → revert 1 → E(parent=D, tree=C)
 func TestRevertSnapshotForward(t *testing.T) {

@@ -46,6 +46,13 @@ func NewSkill(st *store.Store, agents []agent.Agent, name string) (Result, error
 // hooks (see run), so a test can inject the failures that happen at each
 // durable boundary and assert what the store is left holding.
 func newSkill(st *store.Store, agents []agent.Agent, name string, h hooks) (Result, error) {
+	return newSkillTracked(st, agents, name, h, nil)
+}
+
+func newSkillTracked(st *store.Store, agents []agent.Agent, name string, h hooks, outcome *OperationOutcome) (Result, error) {
+	if outcome != nil {
+		outcome.Name = name
+	}
 	if err := skill.ValidateName(name); err != nil {
 		return Result{}, err
 	}
@@ -57,6 +64,7 @@ func newSkill(st *store.Store, agents []agent.Agent, name string, h hooks) (Resu
 	return run(st, agents, Op{
 		Message:        "new: " + name,
 		Txn:            txn,
+		outcome:        outcome,
 		AllowedChanges: []string{"fu.yaml", filepath.ToSlash(filepath.Join("skills", name))},
 		ValidatePrepared: func(st *store.Store, prepared store.PreparedCommit) error {
 			if txn.Payload == nil {
@@ -107,13 +115,6 @@ func newSkill(st *store.Store, agents []agent.Agent, name string, h hooks) (Resu
 			// CreateStagedRootOwned for why an ordinary Mkdir followed by a
 			// snapshot of the same pathname proves nothing about which
 			// directory was enumerated.
-			rootPayload, err := st.CreateStagedRootOwned(staged, 0o755)
-			if err != nil {
-				return fmt.Errorf("create staging area %s exclusively: %w", filepath.Join(st.StagingDir(), name), err)
-			}
-			if err := h.fire(h.afterStagingCreate); err != nil {
-				return err
-			}
 			// The scaffold is declared in the same revision that records the
 			// root, so the window between creating it and recording it is one
 			// recovery can classify: the file is either absent, or present with
@@ -121,10 +122,10 @@ func newSkill(st *store.Store, agents []agent.Agent, name string, h hooks) (Resu
 			// that window left fu's own file looking like foreign interference,
 			// and every later write command refused.
 			content := fmt.Sprintf(skillTemplate, name)
-			txn.Payload = &rootPayload
 			txn.Declared = []store.DeclaredEntry{store.NewDeclaredFile("SKILL.md", 0o644, []byte(content))}
-			if err := WriteTxn(st, txn); err != nil {
-				return fmt.Errorf("record staging-root ownership: %w", err)
+			rootPayload, err := createTxnStagedRoot(st, txn, staged, 0o755, h)
+			if err != nil {
+				return err
 			}
 			if err := h.fire(h.afterStagingOwnership); err != nil {
 				return err
@@ -221,12 +222,20 @@ func checkNewSkillAvailable(st *store.Store, cfg *store.Config, name string) err
 // SetGlobal flips a skill's global switch (the default all agents
 // follow, SPEC §4.1).
 func SetGlobal(st *store.Store, agents []agent.Agent, name string, on bool) (Result, error) {
+	return setGlobalTracked(st, agents, name, on, hooks{}, nil)
+}
+
+func setGlobalTracked(st *store.Store, agents []agent.Agent, name string, on bool, h hooks, outcome *OperationOutcome) (Result, error) {
+	if outcome != nil {
+		outcome.Name = name
+	}
 	verb := "disable"
 	if on {
 		verb = "enable"
 	}
-	return Run(st, agents, Op{
+	return run(st, agents, Op{
 		Message:        fmt.Sprintf("%s: %s", verb, name),
+		outcome:        outcome,
 		AllowedChanges: []string{"fu.yaml"},
 		Mutate: func(_ *store.Store, cfg *store.Config) error {
 			if !cfg.HasSkill(name) {
@@ -235,21 +244,29 @@ func SetGlobal(st *store.Store, agents []agent.Agent, name string, on bool) (Res
 			cfg.SetEnabled(name, on)
 			return nil
 		},
-	})
+	}, h)
 }
 
 // SetAgentSwitch sets one agent's switch; a value equal to global is
 // normalized away (SPEC §4.1 same-value normalization).
 func SetAgentSwitch(st *store.Store, agents []agent.Agent, name, agentName string, on bool) (Result, error) {
+	return setAgentSwitchTracked(st, agents, name, agentName, on, hooks{}, nil)
+}
+
+func setAgentSwitchTracked(st *store.Store, agents []agent.Agent, name, agentName string, on bool, h hooks, outcome *OperationOutcome) (Result, error) {
+	if outcome != nil {
+		outcome.Name = name
+	}
 	if _, ok := agent.ByName(agentName); !ok {
-		return Result{}, fmt.Errorf("unknown agent %q", agentName)
+		return Result{}, fmt.Errorf("%w %q", ErrUnknownAgent, agentName)
 	}
 	verb := "disable"
 	if on {
 		verb = "enable"
 	}
-	return Run(st, agents, Op{
+	return run(st, agents, Op{
 		Message:        fmt.Sprintf("%s: %s --agent %s", verb, name, agentName),
+		outcome:        outcome,
 		AllowedChanges: []string{"fu.yaml"},
 		Mutate: func(_ *store.Store, cfg *store.Config) error {
 			if !cfg.HasSkill(name) {
@@ -258,5 +275,5 @@ func SetAgentSwitch(st *store.Store, agents []agent.Agent, name, agentName strin
 			cfg.SetAgent(name, agentName, on)
 			return nil
 		},
-	})
+	}, h)
 }

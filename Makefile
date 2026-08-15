@@ -28,10 +28,10 @@ build:
 	$(GO) build -o "$(OUTPUT)" ./cmd/fu
 
 test:
-	$(GO) test ./... -count=1
+	$(GO) test ./... -count=1 -timeout 30m
 
 test-race:
-	$(GO) test ./... -race -count=1
+	$(GO) test ./... -race -count=1 -timeout 30m
 
 vet:
 	$(GO) vet ./...

@@ -4,6 +4,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -101,6 +102,8 @@ func execute(root *cobra.Command, args []string) int {
 	if args == nil {
 		args = []string{}
 	}
+	args = normalizeGoTestStyleFlags(root, args)
+	initUsageClassifiedCompletion(root, args)
 	root.SetArgs(args)
 	err := root.Execute()
 	if err == nil {
@@ -109,12 +112,114 @@ func execute(root *cobra.Command, args []string) int {
 	fmt.Fprintln(root.ErrOrStderr(), "error:", err)
 	var uerr *UsageError
 	if errors.As(err, &uerr) {
+		// Print usage for the command that was actually dispatched. Only the
+		// exit code was fixed the first time round; the missing usage text --
+		// the other half of the same defect, and the half that tells the user
+		// what to type instead -- stayed missing, so `fu add` emitted
+		// "error: accepts 1 arg(s), received 0" and nothing else (round 18
+		// finding M23).
+		target := root
+		if found, _, findErr := root.Find(args); findErr == nil && found != nil {
+			target = found
+		}
+		fmt.Fprintln(root.ErrOrStderr(), target.UsageString())
 		return 2
 	}
 	if isUnknownCommand(root, args) {
+		// The same usage text the UsageError branch prints. Both paths exit 2,
+		// so printing it for one and not the other made exit 2 sometimes carry
+		// the answer to "what should I have typed" and sometimes not. Root's
+		// usage is the right one here: the command the user named does not
+		// exist, so there is no more specific usage to show.
+		fmt.Fprintln(root.ErrOrStderr(), root.UsageString())
 		return 2
 	}
 	return 1
+}
+
+// initUsageClassifiedCompletion lets Cobra build its own completion command
+// tree, then applies Fu's typed argument-error boundary to that generated
+// tree. Pre-registering a hand-written replacement would duplicate Cobra's
+// shell generators and flags; initializing here also preserves the command's
+// configured output writer, which tests and alternate front ends may replace
+// after constructing the root.
+func initUsageClassifiedCompletion(root *cobra.Command, args []string) {
+	root.InitDefaultCompletionCmd(args...)
+	completion, _, err := root.Find([]string{"completion"})
+	if err != nil || completion == nil || completion == root {
+		return
+	}
+	wrapCommandArgsAsUsage(completion)
+}
+
+func wrapCommandArgsAsUsage(cmd *cobra.Command) {
+	if cmd.Args != nil {
+		cmd.Args = usageArgs(cmd.Args)
+	}
+	for _, child := range cmd.Commands() {
+		wrapCommandArgsAsUsage(child)
+	}
+}
+
+// normalizeGoTestStyleFlags compensates for pflag silently skipping tokens in
+// Go's single-dash -test.* namespace. Only tokens parsed as options are
+// rewritten: values of known flags, arguments after --, and completion input
+// are user data and must remain byte-for-byte unchanged.
+func normalizeGoTestStyleFlags(root *cobra.Command, args []string) []string {
+	normalized := make([]string, len(args))
+	copy(normalized, args)
+	if len(normalized) != 0 && (normalized[0] == "__complete" || normalized[0] == "__completeNoDesc") {
+		return normalized
+	}
+	command, _, _ := root.Find(normalized)
+	if command == nil {
+		command = root
+	}
+
+	skipValue := false
+	for i, arg := range normalized {
+		if arg == "--" {
+			break
+		}
+		if skipValue {
+			skipValue = false
+			continue
+		}
+		if flagTakesSeparateValue(command, arg) {
+			skipValue = true
+			continue
+		}
+		if strings.HasPrefix(arg, "-test.") {
+			normalized[i] = "-" + arg
+		}
+	}
+	return normalized
+}
+
+func flagTakesSeparateValue(command *cobra.Command, arg string) bool {
+	if strings.Contains(arg, "=") {
+		return false
+	}
+	var flagName string
+	var shorthand bool
+	switch {
+	case strings.HasPrefix(arg, "--"):
+		flagName = strings.TrimPrefix(arg, "--")
+	case len(arg) == 2 && strings.HasPrefix(arg, "-"):
+		flagName, shorthand = arg[1:], true
+	default:
+		return false
+	}
+	var flagNoOptDefVal string
+	var found bool
+	if shorthand {
+		if flag := command.Flags().ShorthandLookup(flagName); flag != nil {
+			flagNoOptDefVal, found = flag.NoOptDefVal, true
+		}
+	} else if flag := command.Flag(flagName); flag != nil {
+		flagNoOptDefVal, found = flag.NoOptDefVal, true
+	}
+	return found && flagNoOptDefVal == ""
 }
 
 // isUnknownCommand reports whether args fail to resolve to a real command,

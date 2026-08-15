@@ -13,6 +13,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/cache"
 	"github.com/go-git/go-git/v5/storage/filesystem"
+	"golang.org/x/sys/unix"
 )
 
 var bootstrapConfig = []byte("version: 1\nskills: {}\n")
@@ -158,6 +159,28 @@ func (s *Store) StagingRoot() (*os.Root, error) {
 		return nil, errors.New("store is not attached to a checked staging-root session")
 	}
 	return s.writeRoots.staging.root, nil
+}
+
+// StagingIdentity returns the inode identity validated when the store was
+// opened. Source preparation compares it with the staging pathname before it
+// creates scratch content there.
+func (s *Store) StagingIdentity() (FileIdentity, error) {
+	if s.stagingIdentity == nil {
+		return FileIdentity{}, errors.New("store has no validated staging directory identity; reopen it before writing")
+	}
+	root, err := openCheckedTop(s.StagingDir(), s.stagingIdentity)
+	if err != nil {
+		return FileIdentity{}, fmt.Errorf("validated staging directory was replaced or is unavailable: %w", err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(root.dir.Fd()), &stat); err != nil {
+		_ = root.close()
+		return FileIdentity{}, fmt.Errorf("inspect validated staging directory identity: %w", err)
+	}
+	if err := root.close(); err != nil {
+		return FileIdentity{}, fmt.Errorf("close validated staging directory identity descriptors: %w", err)
+	}
+	return identityFromStat(&stat), nil
 }
 
 func (s *Store) RecoveryRoot() (*os.Root, error) {
@@ -405,7 +428,12 @@ func Init(home string) (*Store, error) {
 	// An existing fu.yaml is necessarily the exact bootstrap document:
 	// checkResumableStoreDir rejects every other shape before Init writes.
 	if _, err := os.Stat(s.ConfigPath()); os.IsNotExist(err) {
-		if err := WriteFileAtomic(s.ConfigPath(), bootstrapConfig, 0o644); err != nil {
+		// The no-replace writer, not the replacing one: this branch runs only
+		// when the destination is absent, so nothing is being overwritten, and
+		// it holds the descriptor through publication and validates the
+		// installed object. That leaves WriteFileAtomic with no production
+		// caller at all (round 18 finding M4).
+		if err := WriteFileAtomicNoReplace(s.ConfigPath(), bootstrapConfig, 0o644); err != nil {
 			return nil, fmt.Errorf("write config %s: %w", s.ConfigPath(), err)
 		}
 	} else if err != nil {

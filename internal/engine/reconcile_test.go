@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -321,7 +322,7 @@ func TestReconcileCrossNameLinkIsForeignNotRebuilt(t *testing.T) {
 //
 // This test used to assert that Reconcile recreated the link pointing at
 // the same (still-absent) target -- i.e. it built another dangling
-// symlink. That was wrong: since this plan ships no `fu rm`, hand
+// symlink. That was wrong: `fu rm` refuses a name LoadConfig isolated, so hand
 // deletion under $FU_HOME is the *only* way a skill's store-side content
 // disappears, making this the ordinary path, not an edge case. The old
 // behavior meant `fu list` kept reporting the skill as on forever, with
@@ -724,7 +725,12 @@ func TestReconcileVanishedEntryIsNotReportedAsOccupied(t *testing.T) {
 	})
 }
 
-// verifyFuLink is the exact guard Reconcile runs immediately before every
+func verifyFuLink(root agentDirReader, name, storeSkillsDir string) (bool, error) {
+	_, _, owned, err := inspectFuLink(root, name, storeSkillsDir)
+	return owned, err
+}
+
+// verifyFuLink is a test-only adapter over the production inspection helper.
 // RemoveLink, closing the TOCTOU window between the scan that produced
 // Diff's decision and the moment of removal (DESIGN §2). A live race
 // cannot be reproduced deterministically inside one synchronous
@@ -860,6 +866,51 @@ func TestReconcileRemoveLinkReVerifiesBeforeRemoving(t *testing.T) {
 	}
 	if string(got) != swappedContent {
 		t.Fatalf("content swapped in during the race must survive untouched, got %q", got)
+	}
+}
+
+func TestReconcileRetiresApprovedLinkBeforeRemoval(t *testing.T) {
+	s, cfg := setupStore(t, "alpha")
+	dir := t.TempDir()
+	agents := []agent.Agent{fakeAgent{"claude", dir}}
+
+	if _, err := reconcile(s, cfg, agents, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg.SetEnabled("alpha", false)
+
+	const foreign = "foreign content"
+	replaced := false
+	h := reconcileHooks{
+		beforeLinkRetire: func(_ agent.Agent, act Action) {
+			if act.Skill != "alpha" {
+				return
+			}
+			if err := os.Remove(act.LinkPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(act.LinkPath, []byte(foreign), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			replaced = true
+		},
+	}
+	res, err := reconcileWithHooks(s, cfg, agents, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replaced {
+		t.Fatal("test setup error: retirement boundary hook did not run")
+	}
+	if len(res.Conflicts) != 1 || res.Conflicts[0].Skill != "alpha" {
+		t.Fatalf("replacement at the retirement boundary must be a conflict: %+v", res)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "alpha"))
+	if err != nil {
+		t.Fatalf("foreign replacement must remain at its original name: %v", err)
+	}
+	if string(got) != foreign {
+		t.Fatalf("foreign replacement changed: got %q", got)
 	}
 }
 
@@ -1718,5 +1769,183 @@ func TestInvalidNameSuppressionFollowsWhoActuallyReportsIt(t *testing.T) {
 				t.Errorf("want %d invalid report(s), got %+v -- %s", tc.wantInvalid, res.Invalid, tc.why)
 			}
 		})
+	}
+}
+
+// TestReconcileConflictNamesRetiredPathWhenRestoreFails pins the fix for round
+// 18 finding M10, which shipped with no test: nothing set or asserted
+// Action.Target on a conflict, so deleting the assignment left the suite
+// green. This is the one path where fu moved its own link aside and could not
+// put it back because the original name was reoccupied. The object is then
+// parked under a dot-name, and the retired path is the user's only pointer to
+// where their content went -- without it the report reads "occupied by
+// unmanaged content", naming a path they can look at while the thing fu
+// actually moved sits somewhere nothing mentions.
+func TestReconcileConflictNamesRetiredPathWhenRestoreFails(t *testing.T) {
+	s, cfg := setupStore(t, "alpha")
+	dir := t.TempDir()
+	agents := []agent.Agent{fakeAgent{"claude", dir}}
+	if _, err := reconcile(s, cfg, agents, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg.SetEnabled("alpha", false)
+
+	const squatter = "squatter arrived after the retire"
+	fired := false
+	h := reconcileHooks{
+		// Fail the post-move validation by retargeting the retired link, and
+		// reoccupy the original name in the same window so the restore hits
+		// EEXIST. Both halves are needed: without the first there is nothing
+		// to restore, without the second the restore succeeds.
+		afterLinkRetire: func(_ agent.Agent, act Action, retired string) {
+			if act.Skill != "alpha" {
+				return
+			}
+			retiredPath := filepath.Join(dir, retired)
+			if err := os.Remove(retiredPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join(s.SkillsDir(), "elsewhere"), retiredPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(act.LinkPath, []byte(squatter), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fired = true
+		},
+	}
+	res, err := reconcileWithHooks(s, cfg, agents, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fired {
+		t.Fatal("test setup error: the post-retire hook did not run")
+	}
+	if len(res.Conflicts) != 1 || res.Conflicts[0].Skill != "alpha" {
+		t.Fatalf("a failed restore must be reported as a conflict: %+v", res)
+	}
+	target := res.Conflicts[0].Target
+	if target == "" {
+		t.Fatal("the conflict must name where fu's own link was parked")
+	}
+	if !strings.Contains(filepath.Base(target), ".fu-retired-") {
+		t.Fatalf("the conflict must name the retired path, got %q", target)
+	}
+	if _, statErr := os.Lstat(target); statErr != nil {
+		t.Fatalf("the named path must be where the object actually is: %v", statErr)
+	}
+	// The content that arrived at the original name is untouched.
+	got, readErr := os.ReadFile(filepath.Join(dir, "alpha"))
+	if readErr != nil || string(got) != squatter {
+		t.Fatalf("content at the reoccupied name must survive: %q, %v", got, readErr)
+	}
+}
+
+// TestResultEmptyCoversEveryReportedField pins Result.Empty per field. It is
+// the engine's verdict on whether a run produced anything to say, and the CLI
+// used to compute an eleven-field version of it independently -- which had
+// already drifted, omitting DisabledForeign, so a run could print a
+// disabled-foreign diagnostic and then claim nothing happened (round 18
+// finding I20). The fix shipped with no test at all: `grep '\.Empty()'` over
+// the test files returned nothing, so deleting any single condition here
+// restored the defect with a green suite.
+func TestResultEmptyCoversEveryReportedField(t *testing.T) {
+	action := []Action{{AgentName: "claude", Skill: "alpha"}}
+	cases := map[string]Result{
+		"conflicts":        {Conflicts: action},
+		"disabled foreign": {DisabledForeign: action},
+		"missing":          {Missing: action},
+		"reserved":         {Reserved: action},
+		"invalid":          {Invalid: action},
+		"skipped":          {Skipped: []string{"claude"}},
+		"failed":           {Failed: []FailedAction{{Action{AgentName: "claude"}, errors.New("boom")}}},
+	}
+	if !(Result{}).Empty() {
+		t.Fatal("a zero Result must be empty")
+	}
+	for name, res := range cases {
+		if res.Empty() {
+			t.Fatalf("a Result carrying %s is not empty", name)
+		}
+	}
+	// Foreign is the one field that does not count, on the same grounds as
+	// UserReports: it is inventory for a future `fu status`, not a finding
+	// about this run, and printResult never prints it.
+	if !(Result{Foreign: action}).Empty() {
+		t.Fatal("Foreign is inventory, not a finding, so it must not make a run non-empty")
+	}
+}
+
+// TestAdoptResultEmptyCoversEveryReportedField is the same property one level
+// up, including the Reconcile half that carried the drift.
+func TestAdoptResultEmptyCoversEveryReportedField(t *testing.T) {
+	summary := []AdoptSummary{{Name: "alpha"}}
+	cases := map[string]AdoptResult{
+		"adopted":   {Adopted: summary},
+		"pending":   {Pending: summary},
+		"conflicts": {Conflicts: []string{"alpha"}},
+		"skipped":   {Skipped: []string{"alpha"}},
+		"warnings":  {Warnings: []string{"w"}},
+		"failed":    {Failed: []FailedAction{{Action{Skill: "alpha"}, errors.New("boom")}}},
+		"reconcile disabled-foreign": {Reconcile: Result{
+			DisabledForeign: []Action{{AgentName: "claude", Skill: "alpha"}},
+		}},
+	}
+	if !(AdoptResult{}).Empty() {
+		t.Fatal("a zero AdoptResult must be empty")
+	}
+	for name, res := range cases {
+		if res.Empty() {
+			t.Fatalf("an AdoptResult carrying %s is not empty", name)
+		}
+	}
+}
+
+// TestUserReportsCollapsesRepeatedFindings pins the dedupe at the visibility
+// boundary. A batch command runs one transaction per item and each ends with
+// its own reconcile, so mergeResult accumulates the same standing finding once
+// per item: `fu add --all` over three skills with one pre-existing foreign
+// directory printed the same conflict line three times, and three identical
+// lines read as three separate conflicts. Output was O(candidates × findings).
+func TestUserReportsCollapsesRepeatedFindings(t *testing.T) {
+	conflict := Action{AgentName: "claude", Skill: "alpha"}
+	var accumulated Result
+	for range 3 {
+		mergeResult(&accumulated, Result{Conflicts: []Action{conflict}})
+	}
+	reports := accumulated.UserReports()
+	if len(reports) != 1 {
+		t.Fatalf("one standing finding must render once, got %d: %+v", len(reports), reports)
+	}
+	// The accumulated Result itself is untouched: it is the structured value a
+	// second front end consumes, and each operation really did produce one.
+	if len(accumulated.Conflicts) != 3 {
+		t.Fatalf("the collapse belongs to UserReports, not mergeResult: %+v", accumulated.Conflicts)
+	}
+	// Distinct findings still all reach the user.
+	var mixed Result
+	mergeResult(&mixed, Result{Conflicts: []Action{conflict, {AgentName: "codex", Skill: "alpha"}}})
+	mergeResult(&mixed, Result{Conflicts: []Action{{AgentName: "claude", Skill: "beta"}}})
+	if got := len(mixed.UserReports()); got != 3 {
+		t.Fatalf("distinct findings must all render, got %d", got)
+	}
+	// A conflict naming the retired path is not the same finding as a bare one
+	// for the same name: collapsing it would drop the user's only pointer to
+	// where their content went.
+	var withTarget Result
+	mergeResult(&withTarget, Result{Conflicts: []Action{conflict}})
+	mergeResult(&withTarget, Result{Conflicts: []Action{{
+		AgentName: "claude", Skill: "alpha", Target: "/home/u/.claude/skills/.fu-retired-ab",
+	}}})
+	if got := len(withTarget.UserReports()); got != 2 {
+		t.Fatalf("a conflict naming the retired path must survive the collapse, got %d", got)
+	}
+	// Failures with different causes are different findings.
+	var failures Result
+	mergeResult(&failures, Result{Failed: []FailedAction{{Action{AgentName: "claude"}, errors.New("one")}}})
+	mergeResult(&failures, Result{Failed: []FailedAction{{Action{AgentName: "claude"}, errors.New("one")}}})
+	mergeResult(&failures, Result{Failed: []FailedAction{{Action{AgentName: "claude"}, errors.New("two")}}})
+	if got := len(failures.UserReports()); got != 2 {
+		t.Fatalf("failures must collapse by cause, got %d", got)
 	}
 }

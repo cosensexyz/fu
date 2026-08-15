@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -27,6 +28,16 @@ type checkedRoots struct {
 	git      *checkedRoot
 	staging  *checkedRoot
 	recovery *checkedRoot
+}
+
+// keepDescriptorOwnersAlive is deferred by functions that pass a raw Fd to a
+// syscall without otherwise retaining the owning Go object until that syscall
+// and all follow-up checks finish. The defer stores the owners until function
+// return; the KeepAlive calls then establish the required liveness boundary.
+func keepDescriptorOwnersAlive(owners ...any) {
+	for _, owner := range owners {
+		runtime.KeepAlive(owner)
+	}
 }
 
 func openPinnedTop(path string) (*checkedRoot, error) {
@@ -86,6 +97,7 @@ func openCheckedTop(path string, want os.FileInfo) (*checkedRoot, error) {
 }
 
 func openPinnedChild(parent *checkedRoot, name, display string) (*checkedRoot, error) {
+	defer keepDescriptorOwnersAlive(parent)
 	if parent == nil || parent.dir == nil || parent.root == nil {
 		return nil, fmt.Errorf("open logical root %s: parent root is unavailable", display)
 	}
@@ -123,6 +135,7 @@ func openCheckedChild(parent *checkedRoot, name, display string, want os.FileInf
 }
 
 func openOrCreatePinnedChild(parent *checkedRoot, name, display string, mode uint32) (*checkedRoot, error) {
+	defer keepDescriptorOwnersAlive(parent)
 	root, err := openPinnedChild(parent, name, display)
 	if err == nil {
 		return root, nil
@@ -174,11 +187,20 @@ func validLogicalEntry(name string) bool {
 		!filepath.IsAbs(name) && !strings.ContainsRune(name, filepath.Separator)
 }
 
+// validPublicLogicalEntry applies the stricter grammar for names that callers
+// can publish into a fu-managed namespace. Internal transaction artifacts use
+// the .fu- prefix, so user-visible names must never be allowed to collide with
+// it; low-level helpers still use validLogicalEntry for those artifacts.
+func validPublicLogicalEntry(name string) bool {
+	return validLogicalEntry(name) && !strings.HasPrefix(name, ".fu-")
+}
+
 func renameChecked(src *checkedRoot, srcName string, dst *checkedRoot, dstName string) error {
 	return renameCheckedExclusive(src, srcName, dst, dstName, nil)
 }
 
 func renameCheckedExclusive(src *checkedRoot, srcName string, dst *checkedRoot, dstName string, beforeRename func()) error {
+	defer keepDescriptorOwnersAlive(src, dst)
 	if src == nil || src.dir == nil || dst == nil || dst.dir == nil {
 		return errors.New("checked logical root is unavailable")
 	}

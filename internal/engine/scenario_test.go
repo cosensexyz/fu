@@ -9,8 +9,10 @@ import (
 	"github.com/cosensexyz/fu/internal/agent"
 )
 
-// Walks SPEC scenarios covered by plan 1: create (7), toggle (2), and
-// the store layer of mistake recovery (5).
+// Walks the SPEC scenarios this file covers: create (7), toggle (2), and the
+// store layer of mistake recovery (5). Scenarios 1 and 6 are exercised
+// functionally by add_test.go, adopt_test.go and adopt_whole_test.go rather
+// than here; folding them into this walkthrough is tracked in DESIGN §8.
 func TestScenarioWalkthrough(t *testing.T) {
 	s, _ := setupStore(t)
 	claudeDir, codexDir := t.TempDir(), t.TempDir()
@@ -20,7 +22,9 @@ func TestScenarioWalkthrough(t *testing.T) {
 	if _, err := NewSkill(s, agents, "writer"); err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(filepath.Join(s.SkillsDir(), "writer", "notes.md"), []byte("draft"), 0o644)
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "writer", "notes.md"), []byte("draft"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	// Scenario 2: temporarily disable for one agent only.
 	if _, err := SetAgentSwitch(s, agents, "writer", "codex", false); err != nil {
