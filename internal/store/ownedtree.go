@@ -1596,11 +1596,31 @@ func (s *Store) ValidateRecoveryPayloadOwned(name string, expected OwnedTree) er
 
 // ArchiveRecoveryPayloadOwned retires a validated transaction payload under a
 // deterministic machine-local archive name. It deliberately never unlinks the
-// payload: POSIX has no portable identity-conditioned unlink, so retaining the
-// validated object is the only way to guarantee that a replacement racing the
-// final namespace operation is not deleted.
+// payload, so a rolled-back new/add install keeps the quarantined content for
+// the user. That retention is a scope decision, not a limit of the primitives:
+// POSIX has indeed no portable identity-conditioned unlink, but safe deletion
+// does not need one, as ReclaimRecoveryPayloadOwned below does by retiring the
+// name and revalidating the moved object before it unlinks.
 func (s *Store) ArchiveRecoveryPayloadOwned(name string, expected OwnedTree) error {
 	return archiveRecoveryPayloadOwned(s, name, expected, ownedCleanupHooks{})
+}
+
+// ReclaimRecoveryPayloadOwned disposes of a transaction payload whose owning
+// transaction has already reached its terminal marker. It is the disposal
+// counterpart of ArchiveRecoveryPayloadOwned: the manifest binds every entry,
+// each leaf is retired to its deterministic sibling and revalidated before it
+// is unlinked, and an interrupted removal resumes when the same manifest is
+// replayed. An already absent payload is not an error -- the caller may be a
+// replay of a removal that already finished.
+func (s *Store) ReclaimRecoveryPayloadOwned(name string, expected OwnedTree) error {
+	defer keepDescriptorOwnersAlive(s)
+	if s.writeRoots == nil || s.writeRoots.recovery == nil || s.writeRoots.recovery.dir == nil {
+		return errors.New("store is not attached to a checked recovery-root session")
+	}
+	if !validPublicLogicalEntry(name) {
+		return fmt.Errorf("reclaim recovery payload requires a public single-component name outside the .fu- namespace: %q", name)
+	}
+	return RemoveOwnedTreeAt(s.writeRoots.recovery.dir, name, expected)
 }
 
 type ownedCleanupHooks struct {

@@ -94,9 +94,15 @@ func retireOwnedLeafAt(parent *os.File, name, prefix string, expected FileIdenti
 }
 
 // RemoveOwnedTreeAt removes exactly one previously manifested directory tree
-// relative to parent. Every leaf is first moved to an unpredictable sibling,
-// post-validated, and only then unlinked; directories are removed bottom-up.
-// A replacement or unknown entry is preserved and reported as a conflict.
+// relative to parent. Every leaf is first moved to a deterministic sibling
+// derived from the manifest (ownedCleanupRetiredName), post-validated against
+// that manifest, and only then unlinked; directories are removed bottom-up.
+// The retired name is deliberately deterministic rather than random: it is what
+// lets compareOwnedTreeCleanupState recognise an interrupted removal and resume
+// it. Safety therefore does not rest on an unguessable name -- it rests on the
+// all-or-nothing manifest preflight, the no-replace retirement rename, and the
+// post-move revalidation. A replacement or unknown entry is preserved and
+// reported as a conflict.
 func RemoveOwnedTreeAt(parent *os.File, name string, expected OwnedTree) error {
 	defer keepDescriptorOwnersAlive(parent)
 	if parent == nil {

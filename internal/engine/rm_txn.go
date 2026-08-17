@@ -27,16 +27,17 @@ func init() {
 // subprocess tests (round 8 finding C1). Production recovery always
 // supplies the zero value.
 type removeRecoveryHooks struct {
-	// beforeWALClear fires after the committed payload was archived and
-	// immediately before the WAL is cleared: the state a crash here leaves
-	// behind -- payload at the archive name, WAL still open -- is exactly
-	// what recovery must be idempotent over.
+	// beforeWALClear fires immediately before the WAL is cleared, once the
+	// committed rm has been fully validated: the state a crash here leaves
+	// behind -- payload still at its quarantine name, WAL still open -- is
+	// exactly what a resumed recovery attempt must complete from.
 	beforeWALClear func(*store.Store, TxnRecord) error
 }
 
 // recoverRemoveSkill drives an interrupted rm to a terminal state: completed
-// (the operation commit exists, validated, payload archived) or rolled back
-// (content returned to the skills root, config restored).
+// (the operation commit exists, validated, WAL cleared and the quarantined
+// payload reclaimed after it) or rolled back (content returned to the skills
+// root, config restored).
 func recoverRemoveSkill(st *store.Store, record TxnRecord) error {
 	return recoverRemoveSkillWithHooks(st, record, removeRecoveryHooks{})
 }
@@ -207,7 +208,7 @@ func rollBackUncommittedRemove(st *store.Store, storeRoot, skillsRoot, recoveryR
 }
 
 // finishCommittedRemove validates the operation commit and the final store
-// state, archives the quarantined payload, and clears the WAL. A committed
+// state, clears the WAL, and reclaims the quarantined payload. A committed
 // rm is its own end state -- no compensation commit exists for rm (plan D5).
 func finishCommittedRemove(st *store.Store, storeRoot, skillsRoot, recoveryRoot *os.Root, record TxnRecord, startHash, currentHash plumbing.Hash, expectedConfig []byte, h removeRecoveryHooks) error {
 	currentCommit, err := st.Repo.CommitObject(currentHash)
@@ -241,26 +242,57 @@ func finishCommittedRemove(st *store.Store, storeRoot, skillsRoot, recoveryRoot 
 	if skillPresent {
 		return fmt.Errorf("%w: committed rm transaction still has content at skills/%s", ErrTxnConflict, record.Name)
 	}
-	if record.Payload != nil {
-		// No pre-archive presence check: ArchiveRecoveryPayloadOwned is
-		// already idempotent over the [active, archive] position pair
-		// (round 8 finding C1). Recovery itself can die after the archive
-		// rename and before ClearTxn -- the payload then sits at the
-		// archive name, which is exactly the state this call validates and
-		// accepts. A payload absent from both names is refused by its
-		// internal check.
-		if err := st.ArchiveRecoveryPayloadOwned(rmPayloadName(record), *record.Payload); err != nil {
-			return committedRemoveRecoveryConflict(st, record, err)
-		}
-	}
 	if h.beforeWALClear != nil {
 		if err := h.beforeWALClear(st, record); err != nil {
 			return err
 		}
 	}
-	return ClearTxn(st, record)
+	if err := ClearTxn(st, record); err != nil {
+		return err
+	}
+	reclaimCommittedRemovePayload(st, record)
+	return nil
 }
 
-func committedRemoveRecoveryConflict(st *store.Store, record TxnRecord, err error) error {
-	return recoveryPayloadConflict(st, record, "archive committed rm payload", rmPayloadName(record), "the rm is already committed", err)
+// reclaimCommittedRemovePayload disposes of the quarantined content once the
+// removal is durably committed and the WAL is cleared. It runs strictly after
+// the terminal marker, so it is never part of a recovery precondition: a crash
+// here leaves the payload behind as an orphan nothing is waiting on. The
+// removed content itself stays recoverable from git history -- the payload is
+// the second copy, which is why disposing of it needs no tamper check of its
+// own.
+//
+// The error is deliberately dropped. The rm has already succeeded durably, so
+// a reclamation failure must not turn it into a reported failure; it leaves
+// the same orphan a crash here would. Collecting orphaned payloads belongs to
+// `fu gc`, which replays this exact manifest out of the completed journal
+// family before it prunes that family -- the last moment the manifest still
+// exists to prove the payload by (see pruneCompletedTransactionsLocked).
+//
+// gc guards that same replay with a pending-claims check and this does not,
+// which is deliberate rather than an oversight. A payload name identifies
+// content, never the transaction that owns it: rmPayloadName is derived from
+// the skill name and the starting HEAD alone, so two rm transactions of the
+// same skill at the same HEAD derive the same name, and every hop between the
+// skills root and the recovery directory is a rename, carrying device, inode
+// and content across. gc reads that name out of a *completed* family and can
+// therefore meet a pending family's live payload under it. Here the name comes
+// from the transaction being completed at this instant, and no other
+// transaction can be holding it: every write command drives pending
+// transactions to a terminal state before it assigns its own StartHead
+// (RecoverPendingReporting in run), so the pending set is provably empty at
+// that assignment, and this commit has already moved HEAD, so no later
+// transaction derives the same StartHead either. The name also embeds the full
+// forty-hex head rather than a prefix, so distinct heads cannot collide by
+// truncation.
+//
+// Anything that weakens one of those three -- the recovery barrier, HEAD's
+// monotonicity, or the name's width -- puts silent deletion of another
+// transaction's payload back on the table. That failure was real once already
+// on the gc side, and it presented as a store no write command could touch.
+func reclaimCommittedRemovePayload(st *store.Store, record TxnRecord) {
+	if record.Payload == nil {
+		return
+	}
+	_ = st.ReclaimRecoveryPayloadOwned(rmPayloadName(record), *record.Payload)
 }

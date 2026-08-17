@@ -304,12 +304,23 @@ func TestRemoveSkillRecoversAfterProcessInterruption(t *testing.T) {
 	}
 }
 
-// TestRemoveSkillRecoverySurvivesPostArchiveCrash pins round 8 finding C1:
-// recovery must be idempotent over the state it itself produced. If the
-// recovery process dies after archiving the rm payload but before clearing
-// the WAL, the payload sits at the .fu-archive-* name; the next write must
-// still recover, never deadlock on the pre-archive presence check.
-func TestRemoveSkillRecoverySurvivesPostArchiveCrash(t *testing.T) {
+// TestRemoveSkillRecoverySurvivesCrashBeforeWALClear pins recovery's
+// resumability across its own last durable boundary under the reclaim design,
+// whose invariant is that reclamation runs strictly after the transaction's
+// terminal marker and so is never part of a recovery precondition. Reclaiming
+// after ClearTxn leaves no archive-then-clear window for a crash to interrupt
+// -- finishCommittedRemove only validates before that point, with no durable
+// side effect of its own to be interrupted mid-way. If recovery
+// dies right before clearing the WAL, the payload is exactly where the
+// original rm left it, untouched; the next write must still recover: clear
+// the WAL and reclaim the payload in the same pass.
+//
+// This replaces the former TestRemoveSkillRecoverySurvivesPostArchiveCrash,
+// which pinned round 8 finding C1 (recovery idempotent over the archived-but-
+// not-yet-cleared state it itself produced). That state no longer exists:
+// there is nothing to archive, so nothing sits at a .fu-archive-* name
+// anymore.
+func TestRemoveSkillRecoverySurvivesCrashBeforeWALClear(t *testing.T) {
 	if os.Getenv("FU_TEST_CRASH_RM_RECOVERY_HELPER") == "1" {
 		home := os.Getenv("FU_TEST_CRASH_RM_RECOVERY_HOME")
 		s, err := store.Open(home)
@@ -332,8 +343,8 @@ func TestRemoveSkillRecoverySurvivesPostArchiveCrash(t *testing.T) {
 			panic(err)
 		}
 		checked := session.Store
-		// Now run the recovery itself and kill it right after the archive
-		// lands, before the WAL is cleared.
+		// Now run the recovery itself and kill it right before the WAL is
+		// cleared.
 		pending, err := PendingTxns(checked)
 		if err != nil {
 			panic(err)
@@ -352,7 +363,7 @@ func TestRemoveSkillRecoverySurvivesPostArchiveCrash(t *testing.T) {
 	if _, err := store.Init(home); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestRemoveSkillRecoverySurvivesPostArchiveCrash$")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRemoveSkillRecoverySurvivesCrashBeforeWALClear$")
 	cmd.Env = append([]string{}, os.Environ()...)
 	cmd.Env = append(cmd.Env,
 		"FU_TEST_CRASH_RM_RECOVERY_HELPER=1",
@@ -369,7 +380,7 @@ func TestRemoveSkillRecoverySurvivesPostArchiveCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := NewSkill(s, nil, "beta"); err != nil {
-		t.Fatalf("next write after post-archive recovery crash must recover: %v", err)
+		t.Fatalf("next write after the pre-clear recovery crash must recover: %v", err)
 	}
 	pending, err := PendingTxns(s)
 	if err != nil {
@@ -378,24 +389,35 @@ func TestRemoveSkillRecoverySurvivesPostArchiveCrash(t *testing.T) {
 	if len(pending) != 0 {
 		t.Fatalf("recovery must clear its WAL, got %+v", pending)
 	}
-	// The archived payload stays preserved under the deterministic archive
-	// name.
-	archives, err := os.ReadDir(s.RecoveryDir())
+	// The resumed recovery attempt both clears the WAL and reclaims the
+	// payload in the same pass: there is no more archive step to leave it
+	// under, and no crash-injection seam between ClearTxn and reclaim.
+	entries, err := os.ReadDir(s.RecoveryDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
-	for _, a := range archives {
-		if strings.HasPrefix(a.Name(), ".fu-archive-") {
-			found = true
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "removed-") {
+			t.Fatalf("recovered rm payload %q must be reclaimed once the resumed recovery clears the WAL", entry.Name())
 		}
-	}
-	if !found {
-		t.Fatalf("archived rm payload must remain preserved, recovery dir = %v", archives)
 	}
 }
 
-func TestCommittedRemoveMissingRecoveryPayloadNamesRemedy(t *testing.T) {
+// TestCommittedRemoveRecoversWithoutItsRecoveryPayload pins the flip side of
+// the retired round 8 finding C1 under the reclaim design, whose invariant is
+// that reclamation runs strictly after the transaction's terminal marker: the
+// payload's presence is no longer a recovery precondition, so an
+// already-missing payload -- reclaimed early, or removed by whatever
+// means, while a committed rm's WAL was still open -- must not block
+// recovery. The state the payload's absence describes is exactly the state
+// this operation is trying to reach.
+//
+// This replaces the former TestCommittedRemoveMissingRecoveryPayloadNamesRemedy,
+// which pinned the opposite behavior (a missing payload was a safe conflict
+// with a manual journal-family remedy) that finishCommittedRemove's own
+// "payload absent from both names is refused" check used to enforce. That
+// check is gone by design; recovery no longer reads the payload at all.
+func TestCommittedRemoveRecoversWithoutItsRecoveryPayload(t *testing.T) {
 	s, _ := setupStore(t)
 	if _, err := NewSkill(s, nil, "alpha"); err != nil {
 		t.Fatal(err)
@@ -414,42 +436,22 @@ func TestCommittedRemoveMissingRecoveryPayloadNamesRemedy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = NewSkill(s, nil, "beta")
-	if err == nil {
-		t.Fatal("missing committed-rm payload must remain a safe recovery conflict")
-	}
-	journalPattern := filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s-*.json", record.Op, record.TxnID))
-	completionPath := filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s.done", record.Op, record.TxnID))
-	prunePattern := filepath.Join(s.RecoveryDir(), fmt.Sprintf("txn-%s-%s-*.pruned", record.Op, record.TxnID))
-	for _, want := range []string{payloadPath, journalPattern, completionPath, prunePattern, "already committed", "move every transaction family file"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("recovery diagnostic %q lacks actionable detail %q", err, want)
-		}
-	}
-	for _, obsolete := range []string{"restore the recorded recovery payload", "remove every transaction journal revision"} {
-		if strings.Contains(err.Error(), obsolete) {
-			t.Fatalf("recovery diagnostic still carries obsolete remedy %q: %v", obsolete, err)
-		}
-	}
-	var family []string
-	for _, pattern := range []string{journalPattern, completionPath, prunePattern} {
-		matches, globErr := filepath.Glob(pattern)
-		if globErr != nil {
-			t.Fatal(globErr)
-		}
-		family = append(family, matches...)
-	}
-	if len(family) < 2 {
-		t.Fatalf("journal family = %v; want multiple immutable revisions", family)
-	}
-	moved := t.TempDir()
-	for _, artifact := range family {
-		if err := os.Rename(artifact, filepath.Join(moved, filepath.Base(artifact))); err != nil {
-			t.Fatal(err)
-		}
-	}
 	if _, err := NewSkill(s, nil, "beta"); err != nil {
-		t.Fatalf("following the complete journal-family remedy must unblock writes: %v", err)
+		t.Fatalf("committed-rm recovery must tolerate an already-missing payload: %v", err)
+	}
+	pending, err = PendingTxns(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("recovery must clear its WAL, got %+v", pending)
+	}
+	cfg, err := store.LoadConfig(s.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HasSkill("alpha") {
+		t.Fatal("the recovered rm must still have removed alpha")
 	}
 }
 
@@ -523,5 +525,35 @@ func TestRemoveSkillRollbackRefusesTamperedContent(t *testing.T) {
 	// The tampered content is preserved, not deleted or overwritten.
 	if got, err := os.ReadFile(filepath.Join(s.SkillsDir(), "alpha", "SKILL.md")); err != nil || string(got) != tampered {
 		t.Fatalf("tampered content must be preserved, got %q err %v", got, err)
+	}
+}
+
+func TestRemoveSkillReclaimsQuarantinedPayload(t *testing.T) {
+	s, _ := setupStore(t)
+	dir := t.TempDir()
+	agents := []agent.Agent{fakeAgent{"claude", dir}}
+	if _, err := NewSkill(s, agents, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RemoveSkill(s, agents, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(s.RecoveryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "removed-") {
+			t.Fatalf("rm payload %q must be reclaimed once the WAL is cleared", entry.Name())
+		}
+	}
+	// The content stays recoverable from history: reclamation disposes of the
+	// second copy, not the first.
+	log, err := s.Log(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(log) < 2 || log[0].Message != "rm: alpha" {
+		t.Fatalf("commit history wrong: %+v", log)
 	}
 }

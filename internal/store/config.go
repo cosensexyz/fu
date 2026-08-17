@@ -380,7 +380,9 @@ var ErrConfigChangedExternally = errors.New("fu.yaml changed outside the operati
 // uses. A uniquely named candidate is filled and durably recorded before it is
 // moved here, so an active entry left by a crash has identity-bound recovery
 // authority rather than being an unclassified file the next process must
-// reject forever. Completed entries are retained under configArchivePrefix.
+// reject forever. Completed entries are moved to a terminal archive under
+// configArchivePrefix, and reclaimed from there once the exchange's terminal
+// marker is durable.
 //
 // It is created exclusively for every exchange. Reusing even an empty regular
 // file would adopt an inode fu does not own: that file may be a hard link to a
@@ -391,9 +393,17 @@ var ErrConfigChangedExternally = errors.New("fu.yaml changed outside the operati
 // that its inode belongs to fu.
 const configSwapName = ".fu-config-swap"
 
-// Completed config-exchange objects are retained rather than unlinked or
-// truncated. POSIX has no portable identity-conditioned unlink, and ftruncate
-// would change every hard link and open descriptor referring to the inode.
+// configArchivePrefix names the terminal archive a completed exchange moves its
+// displaced or withdrawn object to. The rest of the name is that object's
+// device/inode, which is what later lets reclaimConfigExchangeResidue prove the
+// name still resolves to the same inode before removing it, once the exchange's
+// terminal marker is durable: POSIX has no portable identity-conditioned
+// unlink, so that proof is assembled from a no-replace rename to an
+// unpredictable sibling plus a re-stat of the moved object.
+//
+// The archived object is only ever unlinked, never truncated. Dropping one
+// pathname leaves every other hard link and open descriptor referring to the
+// inode intact, which ftruncate would not.
 const configArchivePrefix = ".fu-config-archive-"
 
 // SaveConfigExpecting installs cfg's bytes at fu.yaml only while the file
@@ -501,9 +511,17 @@ func configArchiveName(identity FileIdentity) string {
 }
 
 // archiveNamedConfigEntry moves a recorded candidate or active scratch name to
-// a no-replace terminal archive and proves the same inode arrived there. Fu
-// never mutates or deletes the object resolved by the terminal namespace
-// operation; if a writer wins a race, that object remains preserved.
+// a no-replace terminal archive and proves the same inode arrived there. If a
+// writer wins the race for the archive name, that writer's object is preserved
+// and this fails rather than replacing it.
+//
+// The archive is not permanent: reclaimConfigExchangeResidue unlinks the name
+// once the exchange's terminal marker is durable. What fu never does is mutate
+// or truncate the object, and it never unlinks a name it has not just re-proven
+// to resolve to the identity this function recorded -- the archive name states
+// that identity, so the removal is decided by the same evidence the archiving
+// was. An inode with hard links or open descriptors elsewhere loses a pathname
+// and nothing else.
 func archiveNamedConfigEntry(source *checkedRoot, sourceName string, archive *checkedRoot, expected FileIdentity) error {
 	defer keepDescriptorOwnersAlive(source, archive)
 	if !validLogicalEntry(sourceName) {

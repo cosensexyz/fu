@@ -783,6 +783,24 @@ func addPruneFamilyRemedy(st *store.Store, key txnKey, err error) error {
 	)
 }
 
+// addRecoveryPayloadRemedy points a failed payload reclamation at the payload
+// that failed, and deliberately prescribes nothing about the journal family.
+// The family is not damaged -- only the object under the recovery directory
+// is -- and its revisions carry the one manifest this payload can ever be
+// verified and deleted by. addPruneFamilyRemedy's advice, "move the complete
+// transaction family out of the recovery directory", would destroy that
+// manifest and strand the payload for good: precisely the outcome the caller
+// skips the family to prevent.
+func addRecoveryPayloadRemedy(st *store.Store, payload string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w; only this quarantined copy failed its check, so the transaction journal was left intact and the next `fu gc` retries it: inspect %s and restore it to its recorded content, or move that directory out of %s to abandon the copy -- the removed content itself remains in the store's git history; leave this transaction's txn-* records where they are, they hold the only manifest that can verify and delete this payload",
+		err, filepath.Join(st.RecoveryDir(), payload), st.RecoveryDir(),
+	)
+}
+
 func addJournalScanRemedy(st *store.Store, err error) error {
 	if err == nil {
 		return nil

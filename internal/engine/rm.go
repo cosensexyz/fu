@@ -19,9 +19,10 @@ type RemoveOutcome struct {
 	Operation OperationOutcome
 }
 
-// RemoveSkill unregisters a skill and removes its store entity, leaving the
-// removed content preserved in the recovery archive and the removal itself
-// in git history (SPEC §5.1 rm). Agent links are reclaimed by the pipeline's
+// RemoveSkill unregisters a skill and removes its store entity, recording the
+// removal in git history (SPEC §5.1 rm): the removed content stays recoverable
+// from that history, and the copy quarantined for recovery is reclaimed once
+// the transaction completes. Agent links are reclaimed by the pipeline's
 // trailing reconcile: the name leaves the desired set, so Diff's leftover
 // removal deletes the links.
 func RemoveSkill(st *store.Store, agents []agent.Agent, name string) (RemoveOutcome, error) {
@@ -63,12 +64,13 @@ func removeSkill(st *store.Store, agents []agent.Agent, name string, h hooks) (R
 				return err
 			}
 			// Repeat the preflight check at mutation time so a replacement that
-			// races the WAL boundary is still refused before it can be archived.
+			// races the WAL boundary is still refused before it can be
+			// quarantined.
 			if err := checkRemoveStoreEntry(st, name); err != nil {
 				return err
 			}
 			// Snapshot the live content first so a crash at any later point
-			// leaves recovery with the exact manifest to restore or archive.
+			// leaves recovery with the exact manifest to restore or reclaim.
 			payload, err := st.SnapshotSkillPayload(name)
 			switch {
 			case err == nil:
@@ -101,6 +103,23 @@ func removeSkill(st *store.Store, agents []agent.Agent, name string, h hooks) (R
 			}
 			cfg.RemoveSkill(name)
 			return nil
+		},
+		// The pipeline clears an operation's WAL itself once the commit lands,
+		// so a plain uncrashed rm never reaches finishCommittedRemove's own
+		// reclaim. This runs the same disposal at the same point of the same
+		// ordering -- strictly after ClearTxn, never before it, since
+		// reclaiming on an open WAL would destroy the payload
+		// rollBackUncommittedRemove needs to restore.
+		afterTxnCleared: func(st *store.Store) {
+			// h.beforeReclaim is a test-only crash seam (production always
+			// passes the zero hooks value, so this is a no-op there): it lets a
+			// test terminate the process at the exact entry of this callback,
+			// leaving the state `fu gc` must independently reclaim -- committed,
+			// WAL cleared, payload still at its quarantine name.
+			if err := h.fire(h.beforeReclaim); err != nil {
+				return
+			}
+			reclaimCommittedRemovePayload(st, *txn)
 		},
 	}, h)
 	return RemoveOutcome{Name: name, Operation: operation}, err

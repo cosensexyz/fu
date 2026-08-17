@@ -2,8 +2,8 @@ package store
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,27 +41,46 @@ func pendingActiveConfigExchange(t *testing.T) (*Store, configExchangeRecord, []
 	return checked, record, raw
 }
 
-func configExchangeCompletionOutcome(t *testing.T, checked *Store, record configExchangeRecord) string {
+// configExchangeResidue lists every recovery/ entry that belongs to a config
+// exchange's disposable bookkeeping -- a record, a terminal marker, or an
+// archived inode -- using the same prefixes reclaimConfigExchangeResidue
+// recognizes. Once an exchange completes durably, whether on the plain
+// install path or through recovery, none of these may remain.
+func configExchangeResidue(t *testing.T, dir string) []string {
 	t.Helper()
-	done, err := configExchangeDoneName(record.Candidate)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	doneRaw, err := os.ReadFile(filepath.Join(checked.RecoveryDir(), done))
-	if err != nil {
-		t.Fatal(err)
+	var found []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, configExchangeRecordPrefix) || strings.HasPrefix(name, configArchivePrefix) {
+			found = append(found, name)
+		}
 	}
-	var completion configExchangeCompletion
-	if err := json.Unmarshal(doneRaw, &completion); err != nil {
-		t.Fatal(err)
-	}
-	return completion.Outcome
+	return found
 }
 
 func TestConfigExchangeActiveStagedConvergesAfterMismatchedPreviousIsRestored(t *testing.T) {
 	checked, record, raw := pendingActiveConfigExchange(t)
+	// Truncated in place, so fu.yaml keeps the recorded previous identity and
+	// only its bytes stop matching the recorded expectation.
 	if err := os.WriteFile(checked.ConfigPath(), []byte("third-party config\n"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	current, err := inspectConfigObject(checked.writeRoots.store, "fu.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The outcome label this arm records is chosen before anything is written,
+	// and the terminal marker carrying it is reclaimed as soon as it is durable
+	// (reclaimConfigExchangeResidue), so it is no longer readable back off disk.
+	// Asserting the decision itself keeps this arm's two readings distinguished:
+	// changed bytes under the recorded previous inode is a precondition
+	// mismatch, not a withdrawal of an exchange that never took effect.
+	if got := configExchangeWithdrawalOutcome(current, record); got != "withdrawn-after-precondition-mismatch" {
+		t.Fatalf("withdrawal outcome = %q, want mismatch withdrawal", got)
 	}
 
 	if err := recoverConfigExchange(checked.writeRoots.store, checked.writeRoots.staging, checked.writeRoots.recovery, record, raw); err != nil {
@@ -70,8 +89,8 @@ func TestConfigExchangeActiveStagedConvergesAfterMismatchedPreviousIsRestored(t 
 	if _, err := os.Lstat(filepath.Join(checked.StagingDir(), configSwapName)); !os.IsNotExist(err) {
 		t.Fatalf("converged recovery must archive the staged active object: %v", err)
 	}
-	if got := configExchangeCompletionOutcome(t, checked, record); got != "withdrawn-after-precondition-mismatch" {
-		t.Fatalf("completion outcome = %q, want mismatch withdrawal", got)
+	if residue := configExchangeResidue(t, checked.RecoveryDir()); len(residue) != 0 {
+		t.Fatalf("a recovered exchange must leave no residue once its terminal marker is durable, found %v", residue)
 	}
 }
 
@@ -101,13 +120,101 @@ func TestConfigExchangeActiveStagedRejectsDifferentCurrentIdentity(t *testing.T)
 	}
 }
 
-func TestConfigExchangeActiveStagedRecordsTerminalState(t *testing.T) {
+// The sibling above reaches this same arm with fu.yaml's bytes changed under
+// the recorded previous inode. Here they are untouched, which is the arm's
+// other reading: the exchange never took effect at all, so the withdrawal is
+// not repairing a precondition mismatch and is labelled differently.
+func TestConfigExchangeActiveStagedWithdrawsWhenPreviousIsStillCurrent(t *testing.T) {
 	checked, record, raw := pendingActiveConfigExchange(t)
+	current, err := inspectConfigObject(checked.writeRoots.store, "fu.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := configExchangeWithdrawalOutcome(current, record); got != "withdrawn-with-previous-current" {
+		t.Fatalf("withdrawal outcome = %q, want an untouched-previous label", got)
+	}
+
 	if err := recoverConfigExchange(checked.writeRoots.store, checked.writeRoots.staging, checked.writeRoots.recovery, record, raw); err != nil {
 		t.Fatal(err)
 	}
-	if got := configExchangeCompletionOutcome(t, checked, record); got != "withdrawn-with-previous-current" {
-		t.Fatalf("completion outcome = %q, want a terminal-state label", got)
+	if _, err := os.Lstat(filepath.Join(checked.StagingDir(), configSwapName)); !os.IsNotExist(err) {
+		t.Fatalf("converged recovery must archive the staged active object: %v", err)
+	}
+	if residue := configExchangeResidue(t, checked.RecoveryDir()); len(residue) != 0 {
+		t.Fatalf("a recovered exchange must leave no residue once its terminal marker is durable, found %v", residue)
+	}
+}
+
+// An archive name is derived from nothing but a device/inode pair, so it names
+// a slot the recorded object may or may not occupy: an exchange creates only
+// one of the two names its record spans, and an inode number the filesystem has
+// since reused regenerates the same name for an unrelated object. Reclaiming
+// those names is therefore only safe against the identity the record already
+// binds -- the one archiveNamedConfigEntry proved arrived there. Reading the
+// name's current identity instead would prove nothing and delete whatever it
+// found.
+func TestConfigExchangeReclaimPreservesAnUnrecordedArchiveName(t *testing.T) {
+	checked, record, raw := pendingActiveConfigExchange(t)
+	// This arm archives the staged object, never the previous one, so the
+	// previous object's archive name is free for an unrelated occupant.
+	foreign := filepath.Join(checked.RecoveryDir(), configArchiveName(record.Previous))
+	foreignBytes := []byte("an object the record does not describe\n")
+	if err := os.WriteFile(foreign, foreignBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := recoverConfigExchange(checked.writeRoots.store, checked.writeRoots.staging, checked.writeRoots.recovery, record, raw); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(foreign)
+	if err != nil {
+		t.Fatalf("reclaim must preserve an archive name holding an object the record does not bind: %v", err)
+	}
+	if !bytes.Equal(got, foreignBytes) {
+		t.Fatalf("preserved archive name changed: got %q want %q", got, foreignBytes)
+	}
+	// The one archive this exchange did record is still reclaimed.
+	staged := filepath.Join(checked.RecoveryDir(), configArchiveName(record.Staged))
+	if _, err := os.Lstat(staged); !os.IsNotExist(err) {
+		t.Fatalf("the recorded archive must still be reclaimed: %v", err)
+	}
+}
+
+// A record whose terminal marker is present is finished, and the enumeration
+// must skip it on that one fstatat alone -- without reading the marker, parsing
+// it, or comparing digests. Every completed exchange's safety rests on this
+// branch, and reclamation now removes the record itself, so no other test can
+// still reach it: the exchange that would have exercised it deletes its own
+// evidence first. The pairing is hand-placed here instead, exactly as a crash
+// between the durable marker write and its reclamation leaves it.
+//
+// The marker's bytes are deliberately not a valid completion. Should the scan
+// ever regress to verifying every historical record it enumerates, it would
+// report an error here rather than silently skipping, which is the cost that
+// branch exists to avoid.
+func TestPendingConfigExchangeRecordsSkipARecordWithATerminalMarker(t *testing.T) {
+	checked, record, _ := pendingActiveConfigExchange(t)
+	pending, err := readPendingConfigExchangeRecords(checked.writeRoots.recovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("a record with no terminal marker is pending work, got %d", len(pending))
+	}
+
+	doneName, err := configExchangeDoneName(record.Candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checked.RecoveryDir(), doneName), []byte("not a completion"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = readPendingConfigExchangeRecords(checked.writeRoots.recovery)
+	if err != nil {
+		t.Fatalf("a marked record must be skipped without its marker being read: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("a record beside its terminal marker is finished, got %d pending", len(pending))
 	}
 }
 
@@ -240,8 +347,15 @@ func TestConfigExchangeRecoveryConvergesFromEveryCrashPoint(t *testing.T) {
 			defer session.Close()
 			checked := session.Store
 
-			// Recovery must converge, and must be idempotent: running it twice
-			// exercises the already-completed arms as well.
+			// Recovery must converge, and repeating it must stay convergent.
+			// The second call no longer re-enters an already-completed arm the
+			// way it did before reclamation: the first call retires each record
+			// it finishes, so the second enumerates nothing at all. What it
+			// still proves is that a reclaimed exchange leaves behind no state a
+			// later recovery can trip over. The skip-a-marked-record branch it
+			// used to exercise on the way through is now pinned directly by
+			// TestPendingConfigExchangeRecordsSkipARecordWithATerminalMarker,
+			// which is the only remaining coverage of it.
 			for range 2 {
 				if err := checked.RecoverConfigExchanges(); err != nil {
 					t.Fatalf("recovery after a crash at %s must converge: %v", stage, err)
@@ -264,5 +378,312 @@ func TestConfigExchangeRecoveryConvergesFromEveryCrashPoint(t *testing.T) {
 				t.Errorf("an active exchange entry survived recovery at %s: %v", stage, err)
 			}
 		})
+	}
+}
+
+// TestConfigExchangeLeavesNoResidueAfterRepeatedSaves guards the reclamation
+// this change adds: every completed exchange must leave neither its record,
+// its terminal marker, nor its archived inode behind in recovery/. Before
+// this change, each of the 8 saves below left 3 files (a record, a ".done"
+// marker, and one archived config), so recovery/ grew without bound across
+// ordinary config writes -- SPEC's own measurement found recovery/ larger
+// than store/ itself after 17 write commands.
+//
+// SaveConfigExpecting (not Config.Save, which writes fu.yaml directly via
+// os.OpenRoot and never touches the exchange journal at all) is what drives
+// a real exchange here, mirroring how every write command's pipeline installs
+// its own config mutation (pipeline.go's checked.SaveConfigExpecting call).
+func TestConfigExchangeLeavesNoResidueAfterRepeatedSaves(t *testing.T) {
+	s := checkedWriteSession(t)
+	for i := range 8 {
+		before, err := os.ReadFile(s.ConfigPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(s.ConfigPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.AddSkill(fmt.Sprintf("skill-%d", i), fmt.Sprintf("sha256:%064d", i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SaveConfigExpecting(cfg, before); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if residue := configExchangeResidue(t, s.RecoveryDir()); len(residue) != 0 {
+		t.Fatalf("completed config exchanges must leave no residue, found %d: %v", len(residue), residue)
+	}
+	// configExchangeResidue only knows the two config-exchange prefixes, so it
+	// cannot see a name reclamation retired but never unlinked. Nothing else in
+	// this test writes to recovery/, so requiring the whole directory to hold no
+	// fu-private entry at all closes that gap for free.
+	entries, err := os.ReadDir(s.RecoveryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stranded []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".fu-") {
+			stranded = append(stranded, entry.Name())
+		}
+	}
+	if len(stranded) != 0 {
+		t.Fatalf("reclamation must strand no fu-private entry in recovery/, found %v", stranded)
+	}
+}
+
+// Inline reclamation disposes of a completed exchange's bookkeeping, but it is
+// a sequence of namespace operations a crash can cut anywhere, and it retires
+// the record first -- so every state an interruption leaves behind holds a bare
+// marker or a bare archive with no record left to derive either from. gc has to
+// collect those by prefix, which makes the two rules below the whole of its
+// safety over the record family: a record with no marker is recovery's
+// authority over an unfinished exchange, and a marker whose record is gone is
+// finished by construction.
+func TestReclaimCompletedConfigExchangesLeavesPendingRecordsAlone(t *testing.T) {
+	s := checkedWriteSession(t)
+	// A record without its marker is pending recovery authority and must survive.
+	if _, err := writeConfigExchangeRecord(s.writeRoots.recovery, configExchangeRecord{
+		Version:      configExchangeRecordVersion,
+		Candidate:    configCandidatePrefix + strings.Repeat("ab", 8),
+		Previous:     FileIdentity{Device: 1, Inode: 2},
+		Staged:       FileIdentity{Device: 1, Inode: 3},
+		ExpectDigest: "sha256:" + strings.Repeat("ab", 32),
+		DataDigest:   "sha256:" + strings.Repeat("cd", 32),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending := filepath.Join(s.RecoveryDir(), configExchangeRecordPrefix+strings.Repeat("ab", 8)+".json")
+	// A marker whose record a crash already removed is collectable.
+	stranded := filepath.Join(s.RecoveryDir(), configExchangeRecordPrefix+strings.Repeat("cd", 8)+".done")
+	if err := os.WriteFile(stranded, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	collected, err := s.ReclaimCompletedConfigExchanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 1 {
+		t.Fatalf("collected %d entries, want only the stranded marker", collected)
+	}
+	if _, err := os.Lstat(pending); err != nil {
+		t.Fatalf("a record without its marker must be preserved, err=%v", err)
+	}
+	if _, err := os.Lstat(stranded); !os.IsNotExist(err) {
+		t.Fatalf("a stranded marker must be collected, err=%v", err)
+	}
+}
+
+// An archive's name states the device and inode of the object it must hold, so
+// the sweep can prove that much before unlinking it -- but proving what an
+// object is does not prove whose it is. Recovery archives the object and only
+// then writes the terminal marker, so a crash in between leaves an archive
+// whose record is still pending, and that archive is the only remaining copy
+// of the object recovery is about to converge on. Collecting it because the
+// identity matched would wedge the exchange in a conflict no later run can
+// resolve.
+func TestReclaimCompletedConfigExchangesKeepsAnArchiveWhileARecordIsPending(t *testing.T) {
+	checked, record, _ := pendingActiveConfigExchange(t)
+	if err := archiveNamedConfigEntry(checked.writeRoots.staging, configSwapName, checked.writeRoots.recovery, record.Staged); err != nil {
+		t.Fatal(err)
+	}
+	archived := filepath.Join(checked.RecoveryDir(), configArchiveName(record.Staged))
+
+	collected, err := checked.ReclaimCompletedConfigExchanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 0 {
+		t.Fatalf("collected %d entries; an unfinished exchange's archive is not the sweep's to collect", collected)
+	}
+	if _, err := os.Lstat(archived); err != nil {
+		t.Fatalf("an archive an unfinished exchange may still need must survive: %v", err)
+	}
+	// Converging on that archive is what the claim protects.
+	if err := checked.RecoverConfigExchanges(); err != nil {
+		t.Fatalf("recovery after the sweep must still converge: %v", err)
+	}
+	if residue := configExchangeResidue(t, checked.RecoveryDir()); len(residue) != 0 {
+		t.Fatalf("the recovered exchange must leave no residue, found %v", residue)
+	}
+}
+
+// The same archive once nothing is pending. Inline reclamation retires the
+// record first, so this is precisely what a crash one step later leaves: an
+// archive with nothing on disk to derive it from but its own name.
+//
+// This is also the sweep's one risky pass -- the only loop that walks names by
+// prefix with no record behind them -- so the rule that it judges nothing
+// outside the two prefixes it owns has to be asserted here, where that loop
+// actually runs. A retirement rename parks whatever it found under
+// .fu-retired-entry-<random>, so an object fu does not own can sit there with
+// nothing on disk tying the name back to fu, and it must survive the pass that
+// is walking right past it.
+func TestReclaimCompletedConfigExchangesCollectsAnArchiveNothingCanClaim(t *testing.T) {
+	checked, record, _ := pendingActiveConfigExchange(t)
+	if err := archiveNamedConfigEntry(checked.writeRoots.staging, configSwapName, checked.writeRoots.recovery, record.Staged); err != nil {
+		t.Fatal(err)
+	}
+	recordName, err := configExchangeRecordName(record.Candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(checked.RecoveryDir(), recordName)); err != nil {
+		t.Fatal(err)
+	}
+	archived := filepath.Join(checked.RecoveryDir(), configArchiveName(record.Staged))
+	// An object parked under a retirement name by an interrupted removal. fu may
+	// not own it, and no record anywhere names it.
+	foreign := filepath.Join(checked.RecoveryDir(), ".fu-retired-entry-"+strings.Repeat("ef", 16))
+	foreignBytes := []byte("an object fu does not own\n")
+	if err := os.WriteFile(foreign, foreignBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	collected, err := checked.ReclaimCompletedConfigExchanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 1 {
+		t.Fatalf("collected %d entries, want the one unclaimable archive", collected)
+	}
+	if _, err := os.Lstat(archived); !os.IsNotExist(err) {
+		t.Fatalf("an archive no unfinished exchange can claim must be collected, err=%v", err)
+	}
+	got, err := os.ReadFile(foreign)
+	if err != nil {
+		t.Fatalf("a retired entry the sweep cannot attribute to fu must be preserved, err=%v", err)
+	}
+	if !bytes.Equal(got, foreignBytes) {
+		t.Fatalf("preserved retired entry changed: got %q want %q", got, foreignBytes)
+	}
+}
+
+// Collecting archives by prefix means meeting names with no record behind them,
+// and a name is not evidence: an inode number the filesystem has reused
+// regenerates a name an unrelated object now occupies. The mismatch between what
+// the name states and what it resolves to is the sweep's only reading of "not
+// mine", and it has to be enough: the object survives byte for byte, as the same
+// inode, and is not counted as collected.
+func TestReclaimCompletedConfigExchangesPreservesAnArchiveNameItDoesNotDescribe(t *testing.T) {
+	s := checkedWriteSession(t)
+	foreign := filepath.Join(s.RecoveryDir(), configArchiveName(FileIdentity{Device: 1, Inode: 2}))
+	foreignBytes := []byte("an object the name does not describe\n")
+	if err := os.WriteFile(foreign, foreignBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	collected, err := s.ReclaimCompletedConfigExchanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 0 {
+		t.Fatalf("collected %d entries; a name stating an identity it does not hold is not the sweep's", collected)
+	}
+	got, err := os.ReadFile(foreign)
+	if err != nil {
+		t.Fatalf("an archive name holding an object it does not describe must be preserved: %v", err)
+	}
+	if !bytes.Equal(got, foreignBytes) {
+		t.Fatalf("preserved archive name changed: got %q want %q", got, foreignBytes)
+	}
+	after, err := os.Lstat(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("the preserved object must be the same inode, not a replacement")
+	}
+}
+
+// The state the sweep exists for. Inline reclamation begins the instant the
+// terminal marker is durable, so the first thing a crash can cut is the step
+// that retires the record -- leaving a record beside its own marker.
+// readPendingConfigExchangeRecords skips that pair forever, on the marker's
+// existence alone, so no later write command will ever revisit it and nothing
+// but this sweep collects it.
+//
+// Both names go, and in that order: the record first, then the marker once the
+// record is gone. TestReclaimCompletedConfigExchangesKeepsAMarkerWhoseRecordSurvives
+// pins the other direction, where a record that cannot be collected keeps its
+// marker pinned beside it.
+func TestReclaimCompletedConfigExchangesCollectsARecordBesideItsMarker(t *testing.T) {
+	s := checkedWriteSession(t)
+	record := configExchangeRecord{
+		Version:      configExchangeRecordVersion,
+		Candidate:    configCandidatePrefix + strings.Repeat("ab", 8),
+		Previous:     FileIdentity{Device: 1, Inode: 2},
+		Staged:       FileIdentity{Device: 1, Inode: 3},
+		ExpectDigest: "sha256:" + strings.Repeat("ab", 32),
+		DataDigest:   "sha256:" + strings.Repeat("cd", 32),
+	}
+	if _, err := writeConfigExchangeRecord(s.writeRoots.recovery, record); err != nil {
+		t.Fatal(err)
+	}
+	recordName, err := configExchangeRecordName(record.Candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doneName, err := configExchangeDoneName(record.Candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The marker's bytes are deliberately not a valid completion: the sweep
+	// finishes this exchange on the same evidence the pending scan finishes it
+	// on, which is the marker's existence and nothing it contains.
+	if err := os.WriteFile(filepath.Join(s.RecoveryDir(), doneName), []byte("not a completion"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	collected, err := s.ReclaimCompletedConfigExchanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 2 {
+		t.Fatalf("collected %d entries, want the record and its marker both counted", collected)
+	}
+	if _, err := os.Lstat(filepath.Join(s.RecoveryDir(), recordName)); !os.IsNotExist(err) {
+		t.Fatalf("a record whose marker is present is finished and must be collected, err=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.RecoveryDir(), doneName)); !os.IsNotExist(err) {
+		t.Fatalf("a marker must be collected once its record is gone, err=%v", err)
+	}
+}
+
+// The record goes first and the marker only once the record is gone, the same
+// order inline reclamation is built on: removing a marker whose record survives
+// turns a finished exchange back into pending work, and the next write command
+// would replay it against a store that has already moved on. The record here
+// cannot be collected at all -- it is a directory, which fu never writes and
+// the identity-bound removal refuses to touch -- so the marker beside it has to
+// stay too.
+func TestReclaimCompletedConfigExchangesKeepsAMarkerWhoseRecordSurvives(t *testing.T) {
+	s := checkedWriteSession(t)
+	base := filepath.Join(s.RecoveryDir(), configExchangeRecordPrefix+strings.Repeat("ab", 8))
+	if err := os.Mkdir(base+".json", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(base+".done", []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	collected, err := s.ReclaimCompletedConfigExchanges()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if collected != 0 {
+		t.Fatalf("collected %d entries; neither name is the sweep's to collect", collected)
+	}
+	if _, err := os.Lstat(base + ".json"); err != nil {
+		t.Fatalf("a record the sweep cannot prove is fu's must be preserved, err=%v", err)
+	}
+	if _, err := os.Lstat(base + ".done"); err != nil {
+		t.Fatalf("a marker whose record survives must survive with it, err=%v", err)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -147,6 +148,30 @@ func openOrCreatePinnedChild(parent *checkedRoot, name, display string, mode uin
 		return nil, fmt.Errorf("create logical root %s relative to its pinned parent: %w", display, err)
 	}
 	return openPinnedChild(parent, name, display)
+}
+
+// readCheckedRootNames lists one pinned logical root in sorted order. The
+// enumeration reopens the held descriptor rather than the pathname, so no
+// replacement of the directory's logical name can redirect what is listed.
+func readCheckedRootNames(root *checkedRoot) ([]string, error) {
+	defer keepDescriptorOwnersAlive(root)
+	if root == nil || root.dir == nil {
+		return nil, errors.New("list logical root: root is unavailable")
+	}
+	dir, err := reopenDirNoFollow(int(root.dir.Fd()), ".", root.display, false, 0o755)
+	if err != nil {
+		return nil, err
+	}
+	names, readErr := dir.Readdirnames(-1)
+	closeErr := dir.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 func (r *checkedRoot) close() error {

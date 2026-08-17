@@ -159,7 +159,7 @@ so a skill is never out of date in one agent and current in another.
 | `fu add [--all] [--ref <ref>] <source>` | Install from a git URL (including SCP forms) or local directory; `--ref` explicitly selects a git branch or tag. A source holding several skills prompts for a comma-separated selection (or `all`); `--all` installs every valid skill without prompting. Submitting an empty selection is an intentional successful cancellation (nothing is installed); input ending before any choice is an error. |
 | `fu adopt [--agent <a>]` | Take existing skill entries into the store, switching them to fu links; an explicitly empty agent value is rejected. |
 | `fu rm <name>` | Unregister a skill and remove it from every agent. |
-| `fu gc` | Safely prune completed transaction journal revisions and markers; recovery payload archives are never deleted. |
+| `fu gc` | Safely prune completed transaction journal revisions and markers, and reclaim the bookkeeping a finished `rm` or `fu.yaml` rewrite no longer needs; the originals an `adopt` replaced are never deleted. |
 | `fu list` | Show every skill and the full switch matrix. |
 | `fu show <name>` | Show one skill's frontmatter, digest and per-agent state. |
 | `fu enable <name> [--agent <a>]` | Turn a skill on, globally or for one agent. |
@@ -185,17 +185,42 @@ wrongly (unknown command, missing argument, bad flag).
 Only `store/` is a git repository, and only `store/` is meant to be synced. The
 other three are per-machine bookkeeping.
 
-`recovery/` holds more than the write-ahead journal. `fu gc` removes only
-completed transaction revision families, using a crash-resumable prune record
-before it deletes the first journal file. Every original `adopt` replaced and
-every skill `rm` removed is archived there first, and kept — `fu gc` never
-deletes those payloads. POSIX offers no portable way to unlink a file
-conditional on its identity, and deleting an archive by name could remove
-something that arrived later. So if an adopt took in a directory you wanted
-back, or an `rm` removed more than you meant, the content is still on disk
-under `recovery/`. Reclaiming archived-payload space is manual today; a `fu
-status` that reports those payloads and a separate collector for provably owned
-orphans are designed but not built.
+`recovery/` holds more than the write-ahead journal. `fu gc` prunes completed
+transaction revision families, using a crash-resumable prune record before it
+deletes the first journal file. It also reclaims two things a finished
+operation no longer needs: the copy an `rm` set aside before it removed a
+skill, and the records a `fu.yaml` rewrite wrote to make the swap recoverable.
+Each is normally reclaimed by the command that created it, the moment that
+command's transaction is durably complete, so `fu gc` is there for the ones a
+crash stranded. It only ever deletes a payload it can still check against the
+manifest in that payload's own journal, and never one an unfinished
+transaction may still need. The removed skill itself stays recoverable from
+the store's git history regardless.
+
+What `fu gc` still never deletes includes every original an `adopt` replaced.
+So if an adopt took in a directory you wanted back, the content is still on
+disk under `recovery/`, and reclaiming that space is manual. A `fu status`
+that reports those payloads, and a collector for them, are designed but not
+built.
+
+Residue from a fu older than this is not collected either: an earlier `fu gc`
+pruned the journals that described it, so no manifest is left to verify a
+deletion against, and fu will not delete by name what it cannot prove. That
+residue is the `removed-<skill>-<commit>` directories — the copies old `rm`
+runs set aside — and they are the only entries under `recovery/` you may
+remove by hand to reclaim space. When a command prints a remedy of its own,
+follow that message instead: it names the exact files it found damaged and
+what to do with them, which is sometimes to move a whole transaction family
+aside. The rest sit there just as idle and must be left alone:
+`adopt-archive-*` holds the originals an adopt replaced, `rollback-*` and
+`.fu-archive-*` hold what a `new` or `add` rolled back, and the
+`adopt-link-*.json` records described below are the authority a restore would
+read. Delete an `adopt-archive-*` and a future restore has lost the directory
+it would put back, while those records preserve only the symlink side of the
+same adopt. For the `removed-*` directories themselves the timing still
+matters: run any write command, which settles an interrupted transaction, and
+then `fu gc`; whichever ones survive that, with no command reporting a pending
+or conflicting transaction, belong to no journal fu can still act on.
 
 The same directory also contains content-addressed `adopt-link-*.json` records.
 They preserve the exact identity, mode, path, and raw target of symlinks removed

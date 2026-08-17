@@ -1578,13 +1578,24 @@ func TestConfigExchangeRestoresAnExternalConfigInstalledBeforeTheSwap(t *testing
 }
 
 // A completed exchange moves the displaced inode to a no-replace terminal
-// archive. It must not clear that inode: external hard links and open file
-// descriptors can still refer to the same object after its pathname moves.
+// archive before reclaiming it once its terminal marker is durable (the
+// config-exchange reclaim added alongside this test). Archiving must still
+// never clear that inode: external hard links and open file descriptors can
+// still refer to the same object after its pathname moves, and after the
+// archive name itself is unlinked in turn. A hard link established on the
+// previous fu.yaml before the install -- the same technique
+// TestConfigExchangePreservesHardLinkToPreviousConfig uses -- lets this test
+// check the content survived intact even though the archive path itself is
+// gone by the time InstallConfigExpecting returns.
 func TestConfigExchangeArchivesItsDisplacedConfigIntact(t *testing.T) {
 	checked := checkedWriteSession(t)
 	storeRoot := mustStoreRoot(t, checked)
 	before, err := ReadConfigFileRoot(storeRoot, "fu.yaml")
 	if err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(t.TempDir(), "fu-yaml-backup")
+	if err := os.Link(checked.ConfigPath(), backup); err != nil {
 		t.Fatal(err)
 	}
 	if err := checked.InstallConfigExpecting(before, append(before, []byte("\n# fu\n")...)); err != nil {
@@ -1594,16 +1605,15 @@ func TestConfigExchangeArchivesItsDisplacedConfigIntact(t *testing.T) {
 	if _, err := os.Lstat(scratch); !os.IsNotExist(err) {
 		t.Fatalf("a completed exchange must move the active scratch name to recovery: %v", err)
 	}
-	archives := configArchiveArtifacts(t, checked.RecoveryDir())
-	if len(archives) != 1 {
-		t.Fatalf("a completed exchange must retain one config archive, got %v", archives)
+	if archives := configArchiveArtifacts(t, checked.RecoveryDir()); len(archives) != 0 {
+		t.Fatalf("a completed exchange must reclaim its archive once the terminal marker is durable, found %v", archives)
 	}
-	archived, err := os.ReadFile(filepath.Join(checked.RecoveryDir(), archives[0]))
+	archived, err := os.ReadFile(backup)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(archived, before) {
-		t.Fatalf("archived displaced config changed: got %q want %q", archived, before)
+		t.Fatalf("archived displaced config changed before it was reclaimed: got %q want %q", archived, before)
 	}
 }
 

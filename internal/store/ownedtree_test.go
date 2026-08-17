@@ -114,6 +114,39 @@ func TestArchiveRecoveryPayloadOwnedRejectsUnrecognizedRename(t *testing.T) {
 	}
 }
 
+func TestReclaimRecoveryPayloadOwnedRejectsUnattachedSession(t *testing.T) {
+	checked, manifest, payload := ownedRecoveryFixture(t, true)
+	// Reclamation deletes content, so it must never run through anything but
+	// the session's pinned recovery descriptor: an unattached store would have
+	// to re-resolve $FU_HOME/recovery by pathname.
+	unattached, err := Open(checked.Home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = unattached.ReclaimRecoveryPayloadOwned(payload, manifest)
+	if err == nil || !strings.Contains(err.Error(), "not attached to a checked recovery-root session") {
+		t.Fatalf("reclaim outside a checked write session must be refused, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(checked.RecoveryDir(), payload)); err != nil {
+		t.Fatalf("refused reclaim must leave the payload untouched: %v", err)
+	}
+}
+
+func TestReclaimRecoveryPayloadOwnedRejectsReservedName(t *testing.T) {
+	checked, manifest, payload := ownedRecoveryFixture(t, true)
+	// The .fu- namespace holds fu's own retirement names, including the
+	// archive name this payload would be retired under. Reclamation takes
+	// public payload names only, so no caller can aim it at that machinery.
+	reserved := ownedArchiveName(payload, manifest)
+	err := checked.ReclaimRecoveryPayloadOwned(reserved, manifest)
+	if err == nil || !strings.Contains(err.Error(), "public single-component name") {
+		t.Fatalf("reserved payload name %q must be refused, got %v", reserved, err)
+	}
+	if _, err := os.Stat(filepath.Join(checked.RecoveryDir(), payload)); err != nil {
+		t.Fatalf("refused reclaim must leave the payload untouched: %v", err)
+	}
+}
+
 func TestOwnedTreeCleanupPreservesEntryReplacedAtRemovalBoundary(t *testing.T) {
 	checked, manifest, payload := ownedRecoveryFixture(t, true)
 	foreignBytes := []byte("foreign replacement")

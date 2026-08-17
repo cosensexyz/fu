@@ -12,7 +12,9 @@ import (
 	"github.com/cosensexyz/fu/internal/store"
 )
 
-// PruneOutcome reports the completed journal history removed by one gc run.
+// PruneOutcome reports what one gc run removed from the recovery directory:
+// completed transaction families, and the total files taken with them --
+// journal entries plus the config exchange bookkeeping swept alongside them.
 type PruneOutcome struct {
 	Transactions int
 	Files        int
@@ -205,6 +207,61 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 	if len(journal.problems) != 0 {
 		problems = append(problems, addJournalScanRemedy(st, errors.Join(journal.problems...)))
 	}
+	// Config exchange bookkeeping is not described by any transaction journal,
+	// so it is swept once per run rather than per family, and a failure here
+	// must not stop journal pruning: the two share only the directory they live
+	// in.
+	configFiles, configErr := st.ReclaimCompletedConfigExchanges()
+	outcome.Files += configFiles
+	if configErr != nil {
+		problems = append(problems, configErr)
+	}
+	// Every recovery payload name a pending transaction claims, computed once
+	// for the whole run and before any deletion. A payload name identifies
+	// content, never the transaction that owns it: two rm transactions of the
+	// same skill at the same HEAD derive the same name, and each hop between
+	// the skills root and the recovery directory is a rename, so device, inode
+	// and content are carried across all of them. A completed family's
+	// manifest can therefore match a pending family's live payload exactly,
+	// and matching it is not owning it.
+	//
+	// Reading the pending records is not recovering them: `fu gc` still never
+	// drives another command's transaction to a terminal state, which is why
+	// PruneRecovery deliberately runs without RecoverPending.
+	claimed, claimErr := pendingRecoveryPayloadClaims(st)
+	if claimErr != nil && len(journal.problems) == 0 && len(journal.invalid) == 0 {
+		// When the scan above found anything wrong, this is that same failure
+		// said twice: the claims read rescans the same directory under the
+		// same lock, and scanTxnJournal rejects a malformed name before it
+		// validates a single family and rejects an invalid family as it goes,
+		// so claimErr repeats what the loop below already reports per family.
+		// Wrapping it again printed the identical multi-line remedy a second
+		// time for one broken name.
+		//
+		// Both halves of that scan have to be consulted, not just the first.
+		// A family that is itself invalid -- two prune records for one
+		// transaction, say -- lands in journal.invalid while journal.problems
+		// stays empty, and it fails the claims read just the same, so testing
+		// only problems still let one damaged family be reported twice.
+		//
+		// A clean scan with a failing claims read is the opposite case: it
+		// reports something no per-family error can, because the failure is
+		// in a *pending* family's chain and the prune loop only visits
+		// completed ones. Suppressing on invalid does give up one narrow
+		// case -- a pending family broken independently of an invalid
+		// completed one, whose error scanTxnJournal happens to return first.
+		// That is a diagnostic delay, not a loss: the next write command
+		// recovers pending transactions before doing anything else and fails
+		// loudly on exactly that chain.
+		problems = append(problems, addJournalScanRemedy(st, claimErr))
+	}
+	// Everything already accumulated is owed to the caller even when a write
+	// below stops the run outright: the config exchange sweep's failure and
+	// every family problem named so far are unrelated to whatever stopped it,
+	// and nothing else reports them.
+	abort := func(err error) (PruneOutcome, error) {
+		return outcome, errors.Join(errors.Join(problems...), err)
+	}
 	for _, key := range ordered {
 		if familyProblems := journal.invalid[key]; len(familyProblems) != 0 {
 			problems = append(problems, addPruneFamilyRemedy(st, key, errors.Join(familyProblems...)))
@@ -213,6 +270,14 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 		pruneName := journal.pruned[key]
 		var record txnPrune
 		if pruneName != "" {
+			// A resumed prune reclaims nothing, and needs to reclaim nothing:
+			// the prune record is written strictly after this family's payload
+			// has been settled below -- either reclaimed, or shown to be some
+			// pending transaction's -- so a record on disk is proof that step
+			// already ran to a conclusion. (The weaker argument, that the
+			// revisions carrying the manifest may already be gone, explains
+			// only why a resumed prune *could not* reclaim, not why it *need
+			// not*.)
 			record, err = validatePrunedTxn(st, key, pruneName, journal)
 			if err != nil {
 				problems = append(problems, addPruneFamilyRemedy(st, key, err))
@@ -235,6 +300,62 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 					fmt.Errorf("transaction completion %s does not match its validated revision chain", txnDisplayPath(st, completionName))))
 				continue
 			}
+			// Reclaim before the journal goes: the payload's manifest lives in
+			// the revision files this prune is about to delete. Reclaiming
+			// after them would leave content that can never be verified again,
+			// so a failure here skips the family entirely and the next gc run
+			// retries with the manifest still in place.
+			if latest.Op == "rm" && latest.Payload != nil {
+				payload := rmPayloadName(latest)
+				switch {
+				case claimErr != nil:
+					// The pending set could not be read, so no name under the
+					// recovery directory can be shown to be unclaimed. Pruning
+					// a family whose payload is still there would delete the
+					// manifest that payload might still need, so that family
+					// waits for a run that can read the pending set. The scan
+					// failure itself is already among the problems.
+					//
+					// A family whose payload is already gone waits for
+					// nothing, though: there is no object left for any
+					// transaction to claim, so ownership cannot be in
+					// question and the manifest has nothing left to prove.
+					// Checking that first keeps one malformed journal filename
+					// from pinning every rm family ever settled -- which is
+					// most of them, since the inline reclaim collects the
+					// payload the moment its transaction completes.
+					settled, presentErr := recoveryPayloadAbsent(st, payload)
+					if presentErr != nil {
+						problems = append(problems, addRecoveryPayloadRemedy(st, payload, presentErr))
+						continue
+					}
+					if !settled {
+						continue
+					}
+				case claimed[payload]:
+					// Not this family's to collect, and this family has nothing
+					// left to collect anywhere -- so pruning it, judged on its
+					// own merits, is still right.
+					//
+					// Only a rolled-back rm reaches this branch. Its rollback
+					// moved the content back under the skills root before it
+					// wrote its terminal marker, so it owns nothing in the
+					// recovery directory. A committed rm cannot be here: its
+					// commit moved HEAD, so no later transaction derives the
+					// same StartHead, and no earlier one can still be pending,
+					// because every write command recovers pending transactions
+					// before it starts.
+					//
+					// Nothing is stranded either. The object at this name stays
+					// provable from the claiming transaction's own manifest,
+					// and gc never prunes a pending family.
+				default:
+					if err := st.ReclaimRecoveryPayloadOwned(payload, *latest.Payload); err != nil {
+						problems = append(problems, addRecoveryPayloadRemedy(st, payload, err))
+						continue
+					}
+				}
+			}
 			revisions := append([]txnRevision(nil), journal.revisions[key]...)
 			sort.Slice(revisions, func(i, j int) bool { return revisions[i].sequence < revisions[j].sequence })
 			record = txnPrune{Op: key.op, TxnID: key.id, CompletionName: completionName, Completion: completion}
@@ -243,15 +364,15 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 			}
 			raw, err := marshalTxnPayload(fmt.Sprintf("transaction prune record %q", key.op), record)
 			if err != nil {
-				return outcome, err
+				return abort(err)
 			}
 			pruneName = txnPruneName(record, raw)
 			if err := writeTxnFileNoReplace(st, pruneName, raw); err != nil {
-				return outcome, fmt.Errorf("record transaction prune at %s: %w", txnDisplayPath(st, pruneName), err)
+				return abort(fmt.Errorf("record transaction prune at %s: %w", txnDisplayPath(st, pruneName), err))
 			}
 			if hooks.afterMarker != nil {
 				if err := hooks.afterMarker(); err != nil {
-					return outcome, err
+					return abort(err)
 				}
 			}
 		}
@@ -259,24 +380,61 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 		for _, name := range append(append([]string(nil), record.Revisions...), record.CompletionName) {
 			removed, err := removeTxnJournalFile(st, name)
 			if err != nil {
-				return outcome, err
+				return abort(err)
 			}
 			if removed {
 				outcome.Files++
 				if hooks.afterRemove != nil {
 					if err := hooks.afterRemove(name); err != nil {
-						return outcome, err
+						return abort(err)
 					}
 				}
 			}
 		}
 		_, err = removeTxnJournalFile(st, pruneName)
 		if err != nil {
-			return outcome, err
+			return abort(err)
 		}
 		outcome.Transactions++
 	}
 	return outcome, errors.Join(problems...)
+}
+
+// pendingRecoveryPayloadClaims collects the recovery payload name every
+// pending transaction claims. The name is derived from all pending records,
+// not just the rm ones: rmPayloadName is a pure function of the skill name and
+// the start HEAD, so any pending transaction whose derivation lands on a name
+// is one gc cannot prove does not own the object sitting there. The two
+// mistakes are not symmetric -- collecting a name too many only skips a
+// deletion, collecting one too few deletes content another transaction is
+// still counting on.
+func pendingRecoveryPayloadClaims(st *store.Store) (map[string]bool, error) {
+	pending, err := PendingTxns(st)
+	if err != nil {
+		return nil, err
+	}
+	claims := make(map[string]bool, len(pending))
+	for _, record := range pending {
+		claims[rmPayloadName(record)] = true
+	}
+	return claims, nil
+}
+
+// recoveryPayloadAbsent reports whether a transaction payload name holds
+// nothing under the recovery directory. It answers the one ownership question
+// that does not need the pending set: a name holding no object cannot be
+// claimed by any transaction, so the family that named it has nothing left to
+// settle and may be pruned even while ownership is otherwise unknowable.
+func recoveryPayloadAbsent(st *store.Store, name string) (bool, error) {
+	root, err := st.RecoveryRoot()
+	if err != nil {
+		return false, err
+	}
+	present, err := txnPathPresent(root, name)
+	if err != nil {
+		return false, err
+	}
+	return !present, nil
 }
 
 func removeTxnJournalFile(st *store.Store, name string) (bool, error) {

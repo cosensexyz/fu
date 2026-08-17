@@ -59,7 +59,16 @@ type Op struct {
 	PostCommit func(st *store.Store) error
 	// Cleanup removes staging content for a non-transaction observed rollback.
 	Cleanup func(st *store.Store) error
-	outcome *OperationOutcome
+	// afterTxnCleared runs inside the same critical section immediately after
+	// the transaction's terminal marker is durable, for operations that own
+	// disposal work which must never become a recovery precondition. It takes
+	// no error return by construction: the operation has already succeeded
+	// durably by the time it runs, so nothing it does may change the command's
+	// result. Only transaction operations have a terminal marker, so it is
+	// ignored when Txn is nil. rm sets it to reclaim its quarantined payload;
+	// every other operation leaves it nil.
+	afterTxnCleared func(st *store.Store)
+	outcome         *OperationOutcome
 }
 
 // OperationOutcome reports how far one mutation reached after its durable
@@ -192,6 +201,7 @@ type hooks struct {
 	afterCopy                   func() error       // add: copy verified, manifest not yet recorded
 	afterSnapshot               func() error       // rm: content snapshotted, not yet quarantined
 	afterQuarantine             func() error       // rm: content quarantined, config not yet touched
+	beforeReclaim               func() error       // rm: WAL cleared, quarantined payload not yet reclaimed
 	afterAdoptSwitch            func() error       // adopt: first agent switched, rest pending
 	beforeAdoptRetire           func() error       // adopt: original approved, retirement not yet attempted
 	afterAdoptRetire            func() error       // adopt: original retired, exact archive not yet copied
@@ -429,6 +439,16 @@ func run(st *store.Store, agents []agent.Agent, op Op, h hooks) (res Result, err
 		if op.Txn != nil {
 			if err := ClearTxn(checked, *op.Txn); err != nil {
 				return fmt.Errorf("clear completed transaction: %w", err)
+			}
+			// Strictly after the terminal marker, and still under the write
+			// lock this command already holds. Running it here rather than
+			// after run() returns is what keeps the ordering honest without a
+			// second locked session: the command never releases fu.lock only
+			// to block re-acquiring it -- which, after an rm that has already
+			// succeeded durably, would have looked to the user like a hang on
+			// a finished removal.
+			if op.afterTxnCleared != nil {
+				op.afterTxnCleared(checked)
 			}
 		}
 		if op.outcome != nil {
