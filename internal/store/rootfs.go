@@ -105,6 +105,24 @@ func (f *rootFilesystem) resolve(name string) (*checkedRoot, string, string, err
 	return selectedRoot, selectedPath, virtual, nil
 }
 
+// isLogicalRoot reports whether name denotes a pinned logical root itself
+// rather than an ordinary path inside one -- the primary root, or any name
+// Mount installed.
+//
+// The distinction matters to any caller that would remove a directory. Every
+// operation on such a name resolves to "." inside the root it selects, so a
+// Remove reads as "delete this directory" and would mean "delete the mounted
+// root's own current directory". pruneEmptiedParents (worktree_apply.go) is
+// the caller: it walks upward removing the directories a deletion emptied and
+// has to know where the tree it is cleaning actually ends.
+//
+// An unresolvable name answers true. It is not a root, but it is not something
+// to remove either, and the only caller wants a stop condition.
+func (f *rootFilesystem) isLogicalRoot(name string) bool {
+	_, selected, _, err := f.resolve(name)
+	return err != nil || selected == "."
+}
+
 func (f *rootFilesystem) Create(name string) (billy.File, error) {
 	return f.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o666)
 }

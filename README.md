@@ -26,15 +26,22 @@ move, and every change is a commit.
 
 ## Status
 
-**Ten commands ship today:** `init`, `new`, `list`, `show`, `enable`, `disable`,
-`add`, `adopt`, `rm`, `gc`.
+**Thirteen commands ship today:** `init`, `new`, `list`, `show`, `status`,
+`restore`, `revert`, `enable`, `disable`, `add`, `adopt`, `rm`, `gc`.
 
 `add` installs a skill from a git URL or a local directory and records the
 locked source; `adopt` takes skills that already live in an agent's directory
 into the store, switching them to fu links; `rm` unregisters a skill and
-removes it from every agent; `gc` safely prunes completed transaction journals.
+removes it from every agent; `gc` safely prunes completed transaction
+journals; `status` reports drift between `fu.yaml` and disk without changing
+the store; `restore` rebuilds agent links from `fu.yaml` and reports any
+uncommitted store worktree content without discarding it; `--hard` discards
+the part of that content which is tracked, and never touches untracked files;
+`revert` rolls the store back a given number of operations,
+converging the store's worktree to an earlier commit's tree and republishing
+that as a new commit.
 Still designed but not built: `update`, `outdated`,
-`clone`, `push`, `pull`, `log`, `revert`, `restore`, `commit`, `status`,
+`clone`, `push`, `pull`, `log`, `commit`,
 `remote`, `agent`. See [Roadmap](#roadmap).
 
 **macOS and Linux.** fu relies on POSIX directory-relative syscalls and does not
@@ -57,7 +64,14 @@ To build from source instead:
 git clone https://github.com/cosensexyz/fu.git
 cd fu
 make build          # produces bin/fu
+make test           # not `go test ./...` — see below
 ```
+
+Use `make test` rather than `go test ./...`. The `internal/engine` suite runs
+for several minutes on its own, and Go's default per-package timeout is 600
+seconds, so a bare `go test ./...` on a loaded machine fails with a panic dump
+that looks like a real breakage and is not one. `make test` sets
+`-timeout 30m` (and `-count=1`).
 
 ## Quick start
 
@@ -114,6 +128,41 @@ The override on `codex` is still there, which is why it still carries a `*`
 even though it now agrees with the global switch. See
 [Behaviour worth knowing](#behaviour-worth-knowing).
 
+When something looks wrong, `fu status` says what differs between `fu.yaml`
+and disk. It changes nothing, and finding a difference is not a failure:
+
+```sh
+$ fu status
+store
+  uncommitted  skills/pdf-tools/SKILL.md
+agents
+  missing link   claude/pdf-tools
+  unmanaged      codex/scratch-notes
+recovery
+  1 waiting on an unfinished write (run `fu restore`, then `fu gc`)
+```
+
+`fu restore` repairs the link layer and reports the store worktree rather
+than touching it:
+
+```sh
+$ fu restore
+restored agent links
+the store worktree was left alone; these changes are not committed:
+  skills/pdf-tools/SKILL.md
+record them with a write command, which commits pending hand edits first, or discard them with `fu restore --hard`
+```
+
+`fu revert` undoes operations. A pending hand edit is committed first, so
+nothing you wrote is lost:
+
+```sh
+$ fu revert 1
+changed 1 path(s) in the store worktree:
+  skills/pdf-tools/SKILL.md
+reverted 1 operation(s)
+```
+
 ## How it works
 
 One copy in the store, projected outward by symlink:
@@ -162,13 +211,18 @@ so a skill is never out of date in one agent and current in another.
 | `fu gc` | Safely prune completed transaction journal revisions and markers, and reclaim the bookkeeping a finished `rm` or `fu.yaml` rewrite no longer needs; the originals an `adopt` replaced are never deleted. |
 | `fu list` | Show every skill and the full switch matrix. |
 | `fu show <name>` | Show one skill's frontmatter, digest and per-agent state. |
+| `fu status` | Report how `fu.yaml`'s expectations and what's on disk differ, plus the store worktree's state, any unfinished transaction, and what `recovery/` and `staging/` are holding; read-only, and finding a difference is not a failure — it exits 0 with the report. Failing to read the store at all is still an error. Read-only means it writes no store content, takes no lock and creates no agent directory; opening `$FU_HOME` does recreate `staging/` and `recovery/` if they have gone missing, which every command does alike. |
+| `fu restore [--hard]` | Rebuild agent links from `fu.yaml`; an uncommitted store worktree is reported and never touched. `--hard` also resets the tracked part of it back to the last commit — those edits are then gone for good, in neither git history nor `recovery/`. Untracked files are outside its reach and are reported either way — but note that a `.gitignore`d file is only untracked until fu first records it: sweeps commit ignored content deliberately, and once committed such a file is tracked and `--hard` resets it like any other. |
+| `fu revert <n>` | Roll the store back `n` operations: any pending hand edit is committed first, then the store worktree converges to the tree from `n` operations ago and that becomes a new commit. |
 | `fu enable <name> [--agent <a>]` | Turn a skill on, globally or for one agent. |
 | `fu disable <name> [--agent <a>]` | Turn a skill off, globally or for one agent. |
 
 `--agent` takes `claude` or `codex`.
 
 Exit codes: `0` success, `1` the operation failed, `2` you used the command
-wrongly (unknown command, missing argument, bad flag).
+wrongly — the wrong number of arguments, an unknown flag, a malformed flag
+value (`--agent ""`, an empty `--ref`), or a malformed positional argument
+(`fu revert abc`, `fu revert 0`).
 
 ## Where things live
 
@@ -199,37 +253,61 @@ the store's git history regardless.
 
 What `fu gc` still never deletes includes every original an `adopt` replaced.
 So if an adopt took in a directory you wanted back, the content is still on
-disk under `recovery/`, and reclaiming that space is manual. A `fu status`
-that reports those payloads, and a collector for them, are designed but not
-built.
+disk under `recovery/`, and nothing will ever reclaim that space — not fu, and
+not you either: the paragraph below explains why these particular entries must
+be left alone. `fu status`
+counts these payloads, kept apart from the ones `fu gc` collects, so there is
+a report for them but still no collector.
 
 Residue from a fu older than this is not collected either: an earlier `fu gc`
 pruned the journals that described it, so no manifest is left to verify a
 deletion against, and fu will not delete by name what it cannot prove. That
 residue is the `removed-<skill>-<commit>` directories — the copies old `rm`
-runs set aside — and they are the only entries under `recovery/` you may
-remove by hand to reclaim space. When a command prints a remedy of its own,
+runs set aside — together with any `.fu-retired-dir-*` left beside them, which
+is the half-removed form of the same thing. Those are the only entries under
+`recovery/` you may remove by hand to reclaim space. When a command prints a remedy of its own,
 follow that message instead: it names the exact files it found damaged and
 what to do with them, which is sometimes to move a whole transaction family
 aside. The rest sit there just as idle and must be left alone:
-`adopt-archive-*` holds the originals an adopt replaced, `rollback-*` and
-`.fu-archive-*` hold what a `new` or `add` rolled back, and the
-`adopt-link-*.json` records described below are the authority a restore would
-read. Delete an `adopt-archive-*` and a future restore has lost the directory
-it would put back, while those records preserve only the symlink side of the
-same adopt. For the `removed-*` directories themselves the timing still
-matters: run any write command, which settles an interrupted transaction, and
-then `fu gc`; whichever ones survive that, with no command reporting a pending
-or conflicting transaction, belong to no journal fu can still act on.
+`adopt-archive-*` holds the originals an adopt replaced, `.fu-archive-*` holds
+what a `new`, `add`, or `adopt` rolled back, and the `adopt-link-*.json`
+records described below are the authority that automatically restoring an
+archived directory or symlink would need. Delete an `adopt-archive-*` and that
+operation has lost the directory it would put back, while those records
+preserve only the symlink side of the same adopt. For the `removed-*`
+directories themselves the timing still matters: run any write command, which
+settles an interrupted transaction, and then `fu gc`; whichever ones survive
+that, with no command reporting a pending or conflicting transaction, belong to
+no journal fu can still act on.
+
+`staging/` is the other machine-local directory `fu status` accounts for, and
+it works differently: `fu gc` never looks at it at all. Every cleanup path
+there is an in-process one, so a process killed mid-write can strand a name
+that no later run will ever enumerate and collect. `fu status` reports what it
+finds in three groups — entries a recovery pass settles (run any write command,
+or `fu restore`), entries nothing collects yet, and entries fu holds no pending
+record for. Only the last has a remedy, and it is not fu's to perform: those
+names belong to whoever put them there, and they are what makes `fu new` or
+`fu add` refuse to reuse a name.
+
+`rollback-*` does not sit idle with the rest of that list: `new`, `add`, and
+`adopt` all produce it (`adopt` only in its `-uncommitted` form), and
+`fu status` reports it one of two ways instead of lumping it in. One still
+claimed by a pending transaction shows up under unfinished transactions, the
+same as any other pending operation, and is settled the same way: run any
+write command, which finishes or rolls the transaction back and moves the
+payload on to `.fu-archive-`. One whose owning transaction's journal is
+already gone has nothing left to settle it, so `fu status` counts it among
+what no command collects yet.
 
 The same directory also contains content-addressed `adopt-link-*.json` records.
 They preserve the exact identity, mode, path, and raw target of symlinks removed
 during adopt, and recovery validates them before it may unlink a retired link.
 A crash before the corresponding journal revision can leave an orphan record;
 `fu gc` intentionally retains it because current code cannot prove it is safe
-to collect. Do not delete these records by hand. They contain enough authority
-for a future restore operation, but this release does not ship a command that
-automatically restores an archived directory or symlink.
+to collect. Do not delete these records by hand. They contain enough
+authority to automatically restore an archived directory or symlink, but
+this release does not ship a command that does so.
 
 Agent-link retirement has one smaller crash residue outside `recovery/`.
 Reconcile first renames an approved fu-owned link to an unpredictable
@@ -237,8 +315,9 @@ Reconcile first renames an approved fu-owned link to an unpredictable
 unlinks it. A process crash between the rename and unlink can leave that link
 behind after the live name is recreated. It does not contain user data and
 does not block later commands, but this release deliberately does not collect
-an unjournalled name automatically. The planned `fu status` will report these
-orphan links alongside retained recovery payloads.
+an unjournalled name automatically. `fu status` reports it the same way it
+reports any other unmanaged entry, under whichever agent it is sitting in;
+it is not part of the `recovery/` inventory described above.
 
 ## Behaviour worth knowing
 
@@ -256,14 +335,44 @@ The override disappears when you write it to match the global value yourself.
 **Hand-editing the store is expected.** Edit `~/.fu/store/skills/<name>/`
 directly whenever you like. The next fu *write* command notices and commits it
 as an `external: manual modifications` commit before doing its own work, so
-nothing you wrote is silently swallowed into an unrelated change. Read-only
-commands (`list`, `show`) take no lock and do not sweep, so an edit stays
-uncommitted until you next run a write command.
+nothing you wrote is silently swallowed into an unrelated change. That sweep
+is deliberately indiscriminate: it records untracked files, and `.gitignore`d
+ones too, so nothing you left in the store can be lost by a later fu operation
+that knew nothing about it. Read-only commands (`list`, `show`, `status`) take
+no lock and do not sweep, so an edit stays uncommitted until you next run a
+write command.
+
+**`fu restore --hard` discards instead of reporting.** Left at its default,
+`restore` only reports an uncommitted change in the store's own worktree, the
+same way `list`, `show`, and `status` never touch anything. Add `--hard` and
+it resets every tracked path back to the last commit, the way
+`git reset --hard` does: content in a file fu does not track is left exactly
+as it is, and none of it is archived first, because none of it is ever touched.
+The path set is `union(index, HEAD)` and nothing else — being `.gitignore`d
+does not keep a file out of it. That is where fu departs from git, which never
+tracks an ignored file: fu's sweep commits ignored content on purpose, so once
+a write command has recorded one, `--hard` will discard an uncommitted edit to
+it just as it would to any tracked file.
+
+**`fu revert` does not refuse a dirty worktree, the way `git revert` does.**
+git refuses when local changes could conflict with the change it is
+reverting. fu's revert cannot conflict with anything, because it converges
+the worktree straight to a past commit's tree instead of applying a patch —
+so instead of refusing, it commits any pending hand edit to its own
+`external: manual modifications` commit first, the same rule every write
+command already follows, and then proceeds. That edit is not lost — it is
+its own commit in the store's git history (`fu log` is not built yet, but
+`git -C ~/.fu/store log` shows it) — but it does not reappear in the
+worktree after the revert; only the reverted operation's target content
+does.
 
 **fu will not touch what it did not create.** If something already occupies the
 path where a symlink would go — a real directory, or a link you made yourself —
 fu reports it and leaves it alone rather than replacing it. The same applies in
-reverse: it only removes links whose target it can prove it wrote.
+reverse: it only removes links spelled the way fu spells its own. That is a
+test of the link's shape, not proof of who wrote it: a symlink you created by
+hand whose target happens to match exactly what fu would have written is
+indistinguishable from fu's own, and is treated as fu's.
 
 **Durable mutations recover on their own.** Write commands enter recovery before
 ordinary work. If a command is killed part-way, the next write command finishes
@@ -286,8 +395,8 @@ Designed in [DESIGN.md](DESIGN.md), not yet built:
 |---|---|
 | `update`, `outdated` | Track upstream versions and upgrade against a recorded commit. |
 | `clone`, `push`, `pull` | Move the store between machines. |
-| `log`, `revert`, `restore` | Browse history, undo a committed change, repair an uncommitted one. |
-| `commit`, `status` | Record edits deliberately, inspect pending state. |
+| `log` | Browse history; `git -C ~/.fu/store log` works today. |
+| `commit` | Record edits deliberately. |
 | `remote`, `agent` | Configure the store's remote, and inspect or configure agent adapters. |
 
 [SPEC.md](SPEC.md) states the product in full; [DESIGN.md](DESIGN.md) is the

@@ -214,7 +214,12 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 	configFiles, configErr := st.ReclaimCompletedConfigExchanges()
 	outcome.Files += configFiles
 	if configErr != nil {
-		problems = append(problems, configErr)
+		// Named the way every other problem in this function is. The only way
+		// this call fails is listing the recovery directory, and the bare
+		// "list logical root: ..." it produced matched neither `fu gc` nor the
+		// config exchange scan it came from, leaving the one unwrapped error
+		// in the whole run.
+		problems = append(problems, fmt.Errorf("reclaim config exchange bookkeeping under %s: %w", st.RecoveryDir(), configErr))
 	}
 	// Every recovery payload name a pending transaction claims, computed once
 	// for the whole run and before any deletion. A payload name identifies
@@ -324,7 +329,16 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 					// from pinning every rm family ever settled -- which is
 					// most of them, since the inline reclaim collects the
 					// payload the moment its transaction completes.
-					settled, presentErr := recoveryPayloadAbsent(st, payload)
+					// "Gone" has to mean gone from both names disposal uses,
+					// which is why the question is the store's to answer rather
+					// than a stat of the payload name here. Disposal empties the
+					// tree, renames the root to a sibling derived from this very
+					// manifest, and only then unlinks it, so a crash between the
+					// last two frees the payload name while the emptied root
+					// remains -- and pruning on the strength of that free name
+					// destroys the only manifest the root could ever be resumed
+					// or collected by.
+					settled, presentErr := st.RecoveryPayloadSettled(payload, *latest.Payload)
 					if presentErr != nil {
 						problems = append(problems, addRecoveryPayloadRemedy(st, payload, presentErr))
 						continue
@@ -408,33 +422,18 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 // mistakes are not symmetric -- collecting a name too many only skips a
 // deletion, collecting one too few deletes content another transaction is
 // still counting on.
+//
+// The derivation itself is pendingPayloadClaims (status.go), shared with the
+// read-only inventory so the two can never disagree about what a pending
+// transaction claims. It also derives the two install compensation names,
+// which this caller never looks up -- an over-claim on a distinct prefix,
+// which by the asymmetry above is the harmless direction.
 func pendingRecoveryPayloadClaims(st *store.Store) (map[string]bool, error) {
 	pending, err := PendingTxns(st)
 	if err != nil {
 		return nil, err
 	}
-	claims := make(map[string]bool, len(pending))
-	for _, record := range pending {
-		claims[rmPayloadName(record)] = true
-	}
-	return claims, nil
-}
-
-// recoveryPayloadAbsent reports whether a transaction payload name holds
-// nothing under the recovery directory. It answers the one ownership question
-// that does not need the pending set: a name holding no object cannot be
-// claimed by any transaction, so the family that named it has nothing left to
-// settle and may be pruned even while ownership is otherwise unknowable.
-func recoveryPayloadAbsent(st *store.Store, name string) (bool, error) {
-	root, err := st.RecoveryRoot()
-	if err != nil {
-		return false, err
-	}
-	present, err := txnPathPresent(root, name)
-	if err != nil {
-		return false, err
-	}
-	return !present, nil
+	return pendingPayloadClaims(pending), nil
 }
 
 func removeTxnJournalFile(st *store.Store, name string) (bool, error) {

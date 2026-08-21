@@ -8,6 +8,19 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// lockAcquiredHook observes each successful fu.lock acquisition. It is nil in
+// production and set only by tests that assert a command takes the lock for a
+// particular stage of its work.
+//
+// A hook rather than a contention test, because contention cannot isolate the
+// acquisition that matters. Restore takes the lock twice -- once inside
+// Reconcile for the link layer, once for the destructive half added in the
+// previous review round -- so holding the lock in the foreground blocks the
+// first acquisition and proves nothing about the second. Removing the second
+// one entirely left every test in engine, cli and store green, which is
+// exactly what this closes.
+var lockAcquiredHook func(displayPath string)
+
 // withLock serializes write commands across fu processes; read commands
 // never take the lock (DESIGN §6).
 func withLock(root *os.Root, lockName, displayPath string, fn func() error) error {
@@ -40,5 +53,8 @@ func withLock(root *os.Root, lockName, displayPath string, fn func() error) erro
 		return fmt.Errorf("acquire lock %s: %w", displayPath, err)
 	}
 	defer unix.Flock(int(file.Fd()), unix.LOCK_UN)
+	if lockAcquiredHook != nil {
+		lockAcquiredHook(displayPath)
+	}
 	return fn()
 }

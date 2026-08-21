@@ -643,8 +643,30 @@ func validateTxnChain(st *store.Store, key txnKey, revisions []txnRevision) (Txn
 // through a crash-resumable, content-addressed prune record. Pending chains
 // are never pruned.
 func PendingTxns(st *store.Store) ([]TxnRecord, error) {
-	journal, err := scanTxnJournal(st)
+	journal, err := scanTxnJournalReport(st)
 	if err != nil {
+		return nil, err
+	}
+	return pendingTxnsFromJournal(st, journal)
+}
+
+// pendingTxnsFromJournal is PendingTxns over a journal the caller already
+// scanned, including the problems-and-invalid-families check scanTxnJournal
+// performs before handing one over.
+//
+// It exists for Status, which needs both this and the collectable derivation
+// over the same recovery directory. Each used to scan it independently, so a
+// damaged store paid for the walk twice and, when the walk failed, saw the same
+// root cause reported twice under two wrappers naming the same directory
+// (review round 27 finding 2). Everything else keeps calling PendingTxns above
+// and is unaffected.
+func pendingTxnsFromJournal(st *store.Store, journal txnJournal) ([]TxnRecord, error) {
+	var problems []error
+	problems = append(problems, journal.problems...)
+	for _, family := range journal.invalid {
+		problems = append(problems, family...)
+	}
+	if err := errors.Join(problems...); err != nil {
 		return nil, err
 	}
 	keys := make(map[txnKey]struct{}, len(journal.revisions)+len(journal.completed)+len(journal.pruned))
@@ -809,6 +831,30 @@ func addJournalScanRemedy(st *store.Store, err error) error {
 		err, st.RecoveryDir())
 }
 
+// addConfigExchangeRemedy names the directory a damaged exchange record sits in
+// and what to do with it.
+//
+// Every other recovery-directory failure in this package carries a remedy --
+// addJournalScanRemedy, addRecoveryConflictRemedy, addRecoveryPayloadRemedy --
+// and this one did not, which mattered more here than the omission suggests:
+// this is the first step of every write command and of `fu restore`, so a
+// single malformed name wedges all of them, and the bare error named the file
+// without its directory and without a way out. The pending scan reads a looser
+// grammar than the collector does (prefix plus ".json", hex unchecked), so it
+// can take authority over a name `fu gc` would never touch and no command can
+// clear.
+//
+// Moving the file is safe in the way the journal remedy is not: an exchange
+// record fu cannot parse is one it can make no use of, and fu.yaml itself is
+// untouched by this -- the record describes a swap, it is not the config.
+func addConfigExchangeRemedy(st *store.Store, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w; move the exact file named above out of %s to clear it -- fu cannot read it, so nothing can act on it, and fu.yaml itself is not affected",
+		err, st.RecoveryDir())
+}
+
 var (
 	// recoverHandlersMu guards recoverHandlers. Registration normally
 	// happens during init, before any command runs, but the lock keeps
@@ -852,7 +898,7 @@ func RecoverPending(st *store.Store) error {
 // user-facing findings produced while safely isolating a transaction target.
 func RecoverPendingReporting(st *store.Store) (res Result, retErr error) {
 	if err := st.RecoverConfigExchanges(); err != nil {
-		return res, fmt.Errorf("recover pending config exchanges: %w", err)
+		return res, fmt.Errorf("recover pending config exchanges: %w", addConfigExchangeRemedy(st, err))
 	}
 	pend, err := PendingTxns(st)
 	if err != nil {

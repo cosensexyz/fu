@@ -34,9 +34,10 @@ import (
 // did exactly what it could safely do and said so. Only Failed --
 // something Diff never anticipated and Reconcile could not safely
 // categorize -- is treated as this build's own failure. Foreign is
-// different again: it is not printed at all (reserved for a future `fu
-// status`), so it cannot contradict anything a write command tells the
-// user, and does not belong in the "reported prominently" list above.
+// different again: it is not printed at all -- not by printResult, and not
+// by `fu status`, which runs its own Diff rather than consuming this field --
+// so it cannot contradict anything a write command tells the user, and does
+// not belong in the "reported prominently" list above.
 var ErrOperationFailed = errors.New("one or more agent operations failed")
 
 // Desired computes the desired link set for one agent from config
@@ -250,7 +251,7 @@ func configInvalidNames(cfg *store.Config, agents []agent.Agent) []Action {
 type Result struct {
 	Warnings        []string // durable recovery/isolation notices that do not fit reconcile action categories
 	Conflicts       []Action
-	Foreign         []Action       // name fu.yaml has no opinion on at all; informational inventory reserved for a future `fu status`, never printed by printResult
+	Foreign         []Action       // name fu.yaml has no opinion on at all; informational inventory, never printed by printResult and not consumed by `fu status` either (that command recomputes Diff)
 	DisabledForeign []Action       // fu.yaml-known skill, disabled, blocked by unmanaged content at its own path; actionable, printed by printResult
 	Missing         []Action       // desired CreateLink whose store-side target no longer exists
 	Reserved        []Action       // desired skill name collides with an agent's reserved entry
@@ -261,7 +262,8 @@ type Result struct {
 
 // Empty reports that a reconcile pass produced no finding a caller could act
 // on or display. Foreign is excluded on the same grounds as UserReports: it is
-// inventory for a future `fu status`, not a finding about this run.
+// inventory, not a finding about this run. `fu status` reports the same state
+// from its own Diff pass, so nothing consumes this field.
 func (r Result) Empty() bool {
 	return len(r.Warnings) == 0 && len(r.Conflicts) == 0 && len(r.DisabledForeign) == 0 && len(r.Missing) == 0 &&
 		len(r.Reserved) == 0 && len(r.Invalid) == 0 && len(r.Skipped) == 0 && len(r.Failed) == 0

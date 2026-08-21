@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/format/index"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage"
 )
 
@@ -48,17 +47,150 @@ func TestGoGitV519HardResetDeletesUntrackedAndIgnoredFiles(t *testing.T) {
 	}
 }
 
+// TestRevertWritesTheBranchReferenceExactlyOnce pins precondition 2. The old
+// implementation built a commit, compare-and-swapped the reference, and then
+// let Worktree.Reset write it again unconditionally -- which silently undid
+// any concurrent write that had landed in between. Ordering the worktree
+// update before the commit removes the second writer entirely.
+//
+// applyFixture's fixture holds no untracked file for Worktree.Reset to
+// mishandle and no concurrent writer for a lost second write to erase, so the
+// end-state assertions below (worktree content, parent count, clean store)
+// pass identically whether Revert writes the branch reference once or twice --
+// they were confirmed, by actually running this test against the pre-Task-7
+// two-writer Revert, to be green on both implementations. branchWriteCounter
+// below is what tells the two apart: it counts writes to the branch reference
+// itself, which the old implementation performs twice (its own
+// CheckAndSetReference, then Worktree.Reset's unconditional SetReference) and
+// the new one performs once (only Commit's CheckAndSetReference).
+func TestRevertWritesTheBranchReferenceExactlyOnce(t *testing.T) {
+	s := applyFixture(t)
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "plain.txt"), []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Commit("new: second"); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeRef, err := s.Repo.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	counter := &branchWriteCounter{Storer: s.Repo.Storer, branch: beforeRef.Name()}
+	s.Repo.Storer = counter
+
+	if _, err := s.Revert(1); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(s.SkillsDir(), "plain.txt"))
+	if err != nil || string(got) != "v1" {
+		t.Fatalf("revert must put the worktree back: %q %v", got, err)
+	}
+	head, err := s.Repo.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := s.Repo.CommitObject(head.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commit.ParentHashes) != 1 {
+		t.Fatalf("revert must be a forward snapshot with one parent, got %d", len(commit.ParentHashes))
+	}
+	dirty, err := s.ChangedPathsIncludingIgnored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirty) != 0 {
+		t.Fatalf("revert must leave the store clean, still dirty: %v", dirty)
+	}
+	if counter.count != 1 {
+		t.Fatalf("revert must write the branch reference exactly once, wrote it %d times", counter.count)
+	}
+}
+
+// branchWriteCounter wraps a real storage.Storer and counts writes -- via
+// either SetReference (unconditional) or CheckAndSetReference (a
+// compare-and-swap) -- that target one specific reference name. See
+// TestRevertWritesTheBranchReferenceExactlyOnce for why counting is the part
+// that actually distinguishes the old Revert from the new one.
+type branchWriteCounter struct {
+	storage.Storer
+	branch plumbing.ReferenceName
+	count  int
+}
+
+func (c *branchWriteCounter) SetReference(ref *plumbing.Reference) error {
+	if ref.Name() == c.branch {
+		c.count++
+	}
+	return c.Storer.SetReference(ref)
+}
+
+func (c *branchWriteCounter) CheckAndSetReference(ref, old *plumbing.Reference) error {
+	if ref.Name() == c.branch {
+		c.count++
+	}
+	return c.Storer.CheckAndSetReference(ref, old)
+}
+
+// TestRevertKeepsRevertedCommitsReachable pins that fu's revert is a revert
+// and not a reset: the commits it rolls past stay on the branch, which is what
+// SPEC's "store content is backed by git history" rests on.
+func TestRevertKeepsRevertedCommitsReachable(t *testing.T) {
+	s := applyFixture(t)
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "plain.txt"), []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Commit("new: second"); err != nil {
+		t.Fatal(err)
+	}
+	rolled, err := s.Repo.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rolledHash := rolled.Hash()
+
+	if _, err := s.Revert(1); err != nil {
+		t.Fatal(err)
+	}
+
+	head, err := s.Repo.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter, err := s.Repo.Log(&git.LogOptions{From: head.Hash()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer iter.Close()
+	found := false
+	if err := iter.ForEach(func(c *object.Commit) error {
+		if c.Hash == rolledHash {
+			found = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("the rolled-past commit must remain reachable from the branch")
+	}
+}
+
 // A-B-C → revert 1 → D(parent=C, tree=B) → revert 1 → E(parent=D, tree=C)
 func TestRevertSnapshotForward(t *testing.T) {
 	s, err := Init(t.TempDir()) // commit A (init)
 	if err != nil {
 		t.Fatal(err)
 	}
+	s = pinnedForWrite(t, s)
 	f := filepath.Join(s.Dir(), "state.txt")
 	os.WriteFile(f, []byte("B"), 0o644)
-	s.Commit("op: B")
+	s.Commit("new: b")
 	os.WriteFile(f, []byte("C"), 0o644)
-	s.Commit("op: C")
+	s.Commit("new: c")
 
 	treeOf := func() string {
 		head, _ := s.Repo.Head()
@@ -72,7 +204,7 @@ func TestRevertSnapshotForward(t *testing.T) {
 
 	cHash, cTree := headHash(), treeOf()
 
-	if err := s.Revert(1); err != nil { // → D
+	if _, err := s.Revert(1); err != nil { // → D
 		t.Fatal(err)
 	}
 	dHash := headHash()
@@ -84,7 +216,7 @@ func TestRevertSnapshotForward(t *testing.T) {
 		t.Fatalf("worktree not restored to B, got %q", got)
 	}
 
-	if err := s.Revert(1); err != nil { // → E, undoing the revert itself
+	if _, err := s.Revert(1); err != nil { // → E, undoing the revert itself
 		t.Fatal(err)
 	}
 	eCommit, _ := s.Repo.CommitObject(mustHead(t, s))
@@ -109,16 +241,40 @@ func mustHead(t *testing.T, s *Store) plumbing.Hash {
 	return head.Hash()
 }
 
+// pinnedForWrite opens a write session on s and returns its pinned Store,
+// registering the session's Close with t.Cleanup. Revert now reaches
+// applyTreeToWorktree (worktree_apply.go), which refuses to touch a worktree
+// outside a checked write session (errUnpinnedWorktree); a plain
+// Init/Open-returned Store has no pinned worktree, so every test below that
+// calls Revert needs this first.
+func pinnedForWrite(t *testing.T, s *Store) *Store {
+	t.Helper()
+	session, err := s.BeginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := session.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return session.Store
+}
+
 // A non-positive count is rejected before touching the repository at all.
 //
-// Asserting merely err != nil would not isolate the n < 1 guard: for
-// negative n, the revision string "HEAD~-1" the code would go on to build
-// is itself invalid syntax and ResolveRevision rejects it independently
-// (confirmed via go-git's revision parser -- "-1" after "~" scans as a
-// second Ref, and "reference must be defined once at the beginning" fires
-// there), so a test that only checks for *an* error would stay green even
-// if the guard were deleted. Checking the exact message ties the failure
-// to the guard itself, not to whatever downstream parsing happens to reject.
+// Asserting merely err != nil would not isolate the n < 1 guard, so the exact
+// message is checked instead. The reason has changed since this was written
+// and the assertion has not, which is why it is restated rather than left as
+// it was: the original argument was that a negative n produced the revision
+// string "HEAD~-1", which go-git's own parser rejects independently, so any
+// test looking only for *an* error stayed green with the guard deleted.
+// resolveOperationsBack replaced that string-building entirely -- it walks
+// first-parent history counting operations -- but the hazard it created is the
+// same shape. A walk asked for a non-positive count runs off the end of
+// history and fails there, on its own terms, so the message is still what ties
+// this failure to the guard rather than to whatever downstream step happens to
+// reject first.
 func TestRevertRejectsNonPositiveCount(t *testing.T) {
 	s, err := Init(t.TempDir())
 	if err != nil {
@@ -127,7 +283,7 @@ func TestRevertRejectsNonPositiveCount(t *testing.T) {
 	before := mustHead(t, s)
 
 	for _, n := range []int{0, -1, -5} {
-		err := s.Revert(n)
+		_, err := s.Revert(n)
 		if err == nil {
 			t.Fatalf("Revert(%d) must fail, got nil error", n)
 		}
@@ -158,7 +314,7 @@ func TestRevertPastBeginningOfHistory(t *testing.T) {
 	}
 	before := mustHead(t, s)
 
-	if err := s.Revert(1); err == nil {
+	if _, err := s.Revert(1); err == nil {
 		t.Fatal("Revert(1) past the root commit must fail, got nil error")
 	}
 
@@ -182,6 +338,7 @@ func TestRevertWorktreeMatchesSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s = pinnedForWrite(t, s)
 	keep := filepath.Join(s.Dir(), "keep.txt")
 	toDelete := filepath.Join(s.Dir(), "to-delete.txt")
 	added := filepath.Join(s.Dir(), "added.txt")
@@ -192,7 +349,7 @@ func TestRevertWorktreeMatchesSnapshot(t *testing.T) {
 	if err := os.WriteFile(toDelete, []byte("bye"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Commit("op: B"); err != nil { // B has keep.txt + to-delete.txt
+	if _, err := s.Commit("new: b"); err != nil { // B has keep.txt + to-delete.txt
 		t.Fatal(err)
 	}
 
@@ -202,11 +359,11 @@ func TestRevertWorktreeMatchesSnapshot(t *testing.T) {
 	if err := os.WriteFile(added, []byte("new"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Commit("op: C"); err != nil { // C drops to-delete.txt, adds added.txt
+	if _, err := s.Commit("new: c"); err != nil { // C drops to-delete.txt, adds added.txt
 		t.Fatal(err)
 	}
 
-	if err := s.Revert(1); err != nil { // back to B's tree
+	if _, err := s.Revert(1); err != nil { // back to B's tree
 		t.Fatal(err)
 	}
 
@@ -236,11 +393,12 @@ func TestRevertPreservesOldHistoryAndBranchRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s = pinnedForWrite(t, s)
 	f := filepath.Join(s.Dir(), "state.txt")
 	os.WriteFile(f, []byte("B"), 0o644)
-	s.Commit("op: B")
+	s.Commit("new: b")
 	os.WriteFile(f, []byte("C"), 0o644)
-	s.Commit("op: C")
+	s.Commit("new: c")
 
 	headBefore, err := s.Repo.Head()
 	if err != nil {
@@ -248,7 +406,7 @@ func TestRevertPreservesOldHistoryAndBranchRef(t *testing.T) {
 	}
 	cHash := headBefore.Hash()
 
-	if err := s.Revert(1); err != nil {
+	if _, err := s.Revert(1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -275,79 +433,98 @@ func TestRevertPreservesOldHistoryAndBranchRef(t *testing.T) {
 	}
 }
 
-// Worktree.Reset re-writes the branch ref unconditionally (no old-value
-// check) while it refreshes the index and worktree -- see Revert's doc
-// comment. A write that lands in that specific window cannot be prevented
-// by the CAS that came before it, so Revert must at least detect it
-// afterward instead of reporting success.
+// TestRevertDetectsConcurrentWriteDuringReset used to pin a manual
+// post-Worktree.Reset verification: Reset rewrote the branch ref
+// unconditionally after Revert's own compare-and-swap, so a write landing in
+// that specific window could only be caught after the fact, not prevented.
+// Reordering the worktree update before the commit (this task) deletes that
+// window outright -- Worktree.Reset is no longer called at all, so there is
+// no second ref write for a concurrent one to race against or hide behind.
 //
-// indexSpyStorer.Index() is the first call Reset makes after its own ref
-// write and is never revisited once Reset moves on, so firing a foreign
-// SetReference from inside it deterministically reproduces a write
-// landing in that exact window, without any test-only seam in revert.go
-// itself: Repository.Storer is already a plain exported interface field.
-func TestRevertDetectsConcurrentWriteDuringReset(t *testing.T) {
-	s, err := Init(t.TempDir())
+// A rewritten version of this test that fires a foreign SetReference during
+// applyTreeToWorktree's first Storer.Index() call (the replacement for the
+// old hook point) does not reproduce a race: that call now runs before
+// Commit's own capture-and-CAS even starts, so Commit simply reads the
+// (unconditionally rewritten, but unchanged-in-value) branch as its "before"
+// and publishes normally -- confirmed by actually running that rewrite, which
+// got "Revert must report an error ... got nil". The concurrent-write
+// detection this test exercised now lives entirely in Commit's own
+// compare-and-swap, which already has dedicated, more general coverage in
+// git_test.go: TestCommitDetectsConcurrentBranchUpdate (a move landing before
+// Commit captures its "before" reference) and
+// TestCommitDetectsBranchMoveAfterItsOwnRefWrite (a move landing immediately
+// after Commit's own compare-and-swap succeeds). Revert has no ref-writing
+// logic of its own left to test past what those two already cover.
+
+// TestRevertRefusesWhenTheCommittedTreeWouldNotBeTheTargetTree pins the
+// primitive's defining invariant: after Revert, the branch tip's tree must be
+// the target's tree, exactly.
+//
+// Nothing enforced it. RevertOperations does not go through run (pipeline.go),
+// so the AllowedChanges declaration and the UnstagedPathsIncludingIgnored
+// guard every other write command gets from validatePreparedOperation never
+// ran here, and applyTreeToWorktree's returned change set -- which the design
+// names as revert's declared path set -- was discarded at the call site. Any
+// content landing in the store between the sweep and Commit's staging was then
+// folded into the revert commit by stageAll, which force-adds untracked files:
+// the result was a commit claiming to be "back n operations" whose tree was
+// the target plus whatever else happened to be lying around.
+//
+// An untracked file reproduces it with no hook at all, because it is exactly
+// the thing the updater is defined not to touch (it is in neither the index
+// nor the target, so its name is not in union(index, target)) and exactly the
+// thing stageAll is defined to add.
+func TestRevertRefusesWhenTheCommittedTreeWouldNotBeTheTargetTree(t *testing.T) {
+	s := applyFixture(t)
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "plain.txt"), []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Commit("new: second"); err != nil {
+		t.Fatal(err)
+	}
+	// Neither tracked nor in the target: the updater leaves it alone by
+	// construction, and stageAll would sweep it into the revert commit.
+	stray := filepath.Join(s.SkillsDir(), "stray.txt")
+	if err := os.WriteFile(stray, []byte("landed between the sweep and the commit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Revert(1); err == nil {
+		t.Fatal("revert must refuse to publish a tree that is not the target's tree")
+	}
+
+	head, err := s.Repo.Head()
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := filepath.Join(s.Dir(), "state.txt")
-	os.WriteFile(f, []byte("B"), 0o644)
-	s.Commit("op: B")
-	os.WriteFile(f, []byte("C"), 0o644)
-	s.Commit("op: C")
-
-	headBefore, err := s.Repo.Head()
+	commit, err := s.Repo.CommitObject(head.Hash())
 	if err != nil {
 		t.Fatal(err)
 	}
-	branch := headBefore.Name()
-	// Stand-in for "whatever a concurrent writer left the branch pointing
-	// at": any resolvable commit other than the one Revert is about to
-	// create works, so headBefore's own hash (the pre-revert C) does fine.
-	foreign := headBefore.Hash()
-
-	real := s.Repo.Storer
-	s.Repo.Storer = &indexSpyStorer{
-		Storer: real,
-		onIndex: func() {
-			interloper := plumbing.NewHashReference(branch, foreign)
-			if err := real.SetReference(interloper); err != nil {
-				t.Fatalf("simulated concurrent write failed: %v", err)
-			}
-		},
-	}
-
-	err = s.Revert(1)
-	if err == nil {
-		t.Fatal("Revert must report an error when the branch ref is clobbered mid-reset, got nil")
-	}
-	if !strings.Contains(err.Error(), "concurrent write") {
-		t.Fatalf("error must describe a detected concurrent write, got %q", err.Error())
-	}
-
-	current, err := s.Repo.Reference(branch, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.Hash() != foreign {
-		t.Fatalf("branch must be left exactly as the interloper set it (%s), not silently corrected, got %s", foreign, current.Hash())
+	if commit.Message != "new: second" {
+		t.Fatalf("no commit may be published on the refusal path, HEAD is now %q", commit.Message)
 	}
 }
 
-// indexSpyStorer wraps a real storage.Storer and runs onIndex the first
-// time Index is called, then delegates. All other methods are promoted
-// straight through to the embedded Storer.
-type indexSpyStorer struct {
-	storage.Storer
-	onIndex func()
-	fired   bool
-}
-
-func (s *indexSpyStorer) Index() (*index.Index, error) {
-	if !s.fired {
-		s.fired = true
-		s.onIndex()
+// TestRevertReportsThePathsItChanged pins the report half. `fu restore --hard`
+// lists every path it reset; revert had the same list in hand at the
+// applyTreeToWorktree call and threw it away, so the command could only say
+// "reverted n operation(s)" -- which is also why a link layer reconciled
+// against a stale config produced no visible sign of anything wrong.
+func TestRevertReportsThePathsItChanged(t *testing.T) {
+	s := applyFixture(t)
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "plain.txt"), []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	return s.Storer.Index()
+	if _, err := s.Commit("new: second"); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := s.Revert(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 1 || changed[0] != "skills/plain.txt" {
+		t.Fatalf("revert must report the paths it converged, got %v", changed)
+	}
 }

@@ -14,7 +14,7 @@ const (
 	CreateLink ActionType = iota
 	RemoveLink
 	ReportConflict        // desired path occupied by foreign content — never overwrite
-	ReportForeign         // name fu.yaml has no opinion on at all — informational only, reserved for a future `fu status`
+	ReportForeign         // name fu.yaml has no opinion on at all — informational only; `fu status` reports this state, but from its own Diff pass, not from Result.Foreign
 	ReportDisabledForeign // name fu.yaml tracks and wants off, but its path is occupied by foreign content — actionable, unlike ReportForeign
 	ReportReserved        // desired skill name collides with an agent's reserved entry — never linked (SPEC rule 11)
 	ReportInvalid         // desired skill name fails validation — never turned into a path component (round 2 finding 3)
@@ -28,7 +28,14 @@ type Action struct {
 	AgentName string
 	Skill     string
 	LinkPath  string
-	Target    string // link target, set for CreateLink only
+	// Target is the link target Diff sets on a CreateLink, and the only field
+	// whose meaning depends on who filled it. reconcile.go also sets it on a
+	// ReportConflict it derives from a RemoveLink, where it names the retired
+	// path fu moved the user's content to rather than a link target -- and
+	// cli/root.go's conflict message reads exactly that. Documenting it as
+	// "CreateLink only" made the one field two front ends rely on look like a
+	// field one of them was misusing.
+	Target string
 }
 
 // Diff computes actions turning actual into desired for one agent
@@ -121,8 +128,10 @@ func Diff(desired map[string]bool, state AgentState, storeSkillsDir string) []Ac
 		// user did caused it, and it would be noise on every write command.
 		// Reporting both the same way kept this actionable half exactly as
 		// silent as the merely informational half: Result.Foreign is
-		// deliberately never printed by printResult (reserved for a future
-		// `fu status`), so a disabled skill behind foreign content produced a
+		// deliberately never printed by printResult, and `fu status` does not
+		// consume it either -- that command runs its own Diff and reads the
+		// actions straight out of it -- so a disabled skill behind foreign
+		// content produced a
 		// confirmation and nothing else -- even though it is exactly the case
 		// the confirmation's "takes effect" claim cannot make good on.
 		// ReportDisabledForeign gives this half its own channel, so it can be
@@ -136,8 +145,9 @@ func Diff(desired map[string]bool, state AgentState, storeSkillsDir string) []Ac
 	// the loop above already handled every name desired has an opinion on,
 	// on or off. fu has no record of it at all, so a foreign entry found
 	// here stays on the informational-only ReportForeign/Result.Foreign
-	// channel (reserved for a future `fu status`), never the actionable
-	// ReportDisabledForeign above.
+	// channel, never the actionable ReportDisabledForeign above. `fu status`
+	// displays this state, but it recomputes Diff itself rather than reading
+	// Result.Foreign, so nothing here is written for that command's benefit.
 	for _, e := range state.Entries {
 		if _, known := desired[e.Name]; known {
 			continue

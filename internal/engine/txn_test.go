@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cosensexyz/fu/internal/agent"
 	"github.com/cosensexyz/fu/internal/store"
 )
 
@@ -308,14 +309,20 @@ func TestPruneCompletedTransactionsPreservesNonJournalAndPendingRecovery(t *test
 	if err := WriteTxn(s, pending); err != nil {
 		t.Fatal(err)
 	}
+	// SPEC §5.1 names four things gc must never delete, and three of them had
+	// no retention assertion anywhere: .fu-archive-*, rollback-* and
+	// adopt-link-*.json. All four are pinned here now.
 	preserved := []string{
 		"adopt-archive-claude-alpha-deadbeef",
 		"removed-alpha-deadbeef",
 		".fu-config-exchange-deadbeefdeadbeef.json",
+		".fu-archive-0011223344556677aabbccdd",
+		"rollback-new-alpha-deadbeef",
+		"adopt-link-00112233.json",
 	}
 	for _, name := range preserved {
 		path := filepath.Join(s.RecoveryDir(), name)
-		if strings.Contains(name, "archive") || strings.HasPrefix(name, "removed-") {
+		if strings.Contains(name, "archive") || strings.HasPrefix(name, "removed-") || strings.HasPrefix(name, "rollback-") {
 			if err := os.Mkdir(path, 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -794,5 +801,118 @@ func TestTxnLifecycleRejectsReplacementAtUpdateAndCompletionBoundaries(t *testin
 				t.Fatal("the replaced journal must remain a visible safe conflict")
 			}
 		})
+	}
+}
+
+// TestRecoverPendingNamesTheWayOutOfADamagedConfigExchangeRecord pins the one
+// recovery-directory failure in this package that used to arrive without a
+// remedy.
+//
+// It is also the worst place to omit one. RecoverConfigExchanges is the first
+// step of every write command and of `fu restore`, so a name fu cannot parse
+// stops all of them; and the pending scan reads a looser grammar than the
+// collector does, so it takes authority over names `fu gc` walks straight past
+// and no command will ever clear. What the user saw was a bare filename with
+// no directory and no instruction.
+func TestRecoverPendingNamesTheWayOutOfADamagedConfigExchangeRecord(t *testing.T) {
+	s, _ := setupStore(t)
+	// A well-formed-enough name for the loose pending grammar, holding bytes
+	// no version of the record schema accepts.
+	name := ".fu-config-exchange-nothex.json"
+	if err := os.WriteFile(filepath.Join(s.RecoveryDir(), name), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Through a real write command, which is where a user meets this: recovery
+	// is its mandatory first step, so the record wedges the command before it
+	// does anything of its own.
+	_, err := NewSkill(s, nil, "alpha")
+	if err == nil {
+		t.Fatal("a record fu cannot read must stop the write command")
+	}
+	for _, want := range []string{name, s.RecoveryDir(), "move the exact file"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the refusal must say where the file is and what to do with it (missing %q): %v", want, err)
+		}
+	}
+}
+
+// TestEveryOperationCommitThisPackageWritesIsCountable is the coupling test
+// store.IsOperationMessage's whitelist actually needs.
+//
+// The guard that existed for it lived in internal/store and asserted against a
+// hand-maintained list of message strings, so both sides of the coupling were
+// hand-maintained lists of the same thing: a ninth verb-producing command could
+// be added, operationVerbs left alone, and the test would stay green because
+// nobody had told it about the new verb either. The failure that hides behind
+// that is quiet and wrong in the worst direction -- an uncounted operation is
+// one `fu revert n` steps straight over, reaching one operation too far back.
+//
+// This runs the real commands and reads back what they actually committed, so
+// the message set is the engine's rather than a copy of it. Every commit fu
+// writes must be classifiable: an operation SPEC §5.3 lists, or one of the
+// three forms that are deliberately not operations.
+func TestEveryOperationCommitThisPackageWritesIsCountable(t *testing.T) {
+	s, _ := setupStore(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	agentDir := filepath.Join(home, ".claude", "skills")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agents := []agent.Agent{agent.Claude{}}
+
+	// One call per Op.Message producer in this package: ops.go's three forms,
+	// rm.go, adopt.go, and the store's own revert message.
+	if _, err := NewSkill(s, agents, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetGlobal(s, agents, "alpha", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetAgentSwitch(s, agents, "alpha", "claude", true); err != nil {
+		t.Fatal(err)
+	}
+	// A hand edit, so a sweep's own "external" commit is in history too and the
+	// classification below has to admit it without counting it.
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "alpha", "NOTES.md"), []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSkillTree(t, agentDir, "beta", "---\nname: beta\ndescription: d\n---\n")
+	if _, err := adopt(s, agents, "", hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RemoveSkill(s, agents, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RevertOperations(s, agents, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	log, err := s.Log(200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verbs := map[string]bool{}
+	for _, commit := range log {
+		message := commit.Message
+		switch {
+		case message == store.ExternalCommitMessage:
+		case strings.HasPrefix(message, store.RecoveryCompensationPrefix):
+		case message == "init: store":
+		case store.IsOperationMessage(message):
+			verb, _, _ := strings.Cut(message, ":")
+			verbs[verb] = true
+		default:
+			t.Errorf("commit %q is neither one of SPEC §5.3's operations nor one of fu's three bookkeeping forms; if it is a new operation, add its verb to operationVerbs (internal/store/git.go) and to SPEC §5.3", message)
+		}
+	}
+	// And the fixture really did drive the producers, so a future edit that
+	// quietly stops exercising one is visible rather than silently narrowing
+	// what the loop above can catch.
+	for _, want := range []string{"new", "enable", "disable", "adopt", "rm", "revert"} {
+		if !verbs[want] {
+			t.Errorf("the fixture must exercise the %q producer; observed %v", want, verbs)
+		}
 	}
 }

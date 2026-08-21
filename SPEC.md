@@ -51,7 +51,7 @@ v1 以下列七个场景全程可走通为完成标志：
 2. **临时禁用**：某 skill 干扰当前任务 → `fu disable <name> --agent claude` → 新会话生效；用毕 `enable` 恢复。
 3. **更新**：`fu outdated` 列出可更新项 → `fu update <name>` 升级并记录新 commit。
 4. **换机**：新机器上 `fu clone <远端地址>` → 全部 skills 与开关状态按记录重建。
-5. **误操作恢复**：未提交的手工损坏由 `fu status` 发现、`fu restore` 复原；已提交的误操作由 `fu log` 查看、`fu revert` 回退。
+5. **误操作恢复**：未提交的手工损坏由 `fu status` 发现，链接层由 `fu restore` 按期望重建，工作区改动由 `fu restore --hard` 复位到最近一次提交；已提交的误操作由 `fu revert` 回退，`fu log` 查看仍未交付。
 6. **存量迁入**：已有散装 skills 的老环境（真实目录或 symlink 结构均可）→ `fu adopt` 收编入 store，原地留下链接，开关保持收编前现状，agent 侧体验不变；既有 symlink 只复制目标内容，原目标仓库不受影响。
 7. **自写 skill**：`fu new <name>` 在 store 中创建骨架，直接编辑，默认对所有 agent 生效；编辑完成后 `fu commit <name>` 主动记录，或留待自动入账。
 
@@ -136,8 +136,8 @@ v1 以下列七个场景全程可走通为完成标志：
 |------|------|------|
 | `fu list` | 已交付 | 全部 skills × agent 的生效状态矩阵 |
 | `fu show <name>` | 已交付 | 详情：来源、锁定版本、描述、各级开关状态 |
-| `fu status` | 规划 | 只读一致性检查：期望与现实的偏差、断链与未纳管条目、store 工作区状态、远端同步状态、未完成事务（如中断的 adopt） |
-| `fu restore` | 规划 | 双层修复：store 工作区复位到最近一次提交（撤销未提交的手工删改）；链接层按期望重建缺失、清理断链 |
+| `fu status` | 已交付 | 只读一致性检查：期望与现实的偏差、未纳管条目、store 工作区状态、未完成事务、`recovery/` 与 `staging/` 留存盘点 |
+| `fu restore [--hard]` | 已交付 | 链接层按期望重建缺失、清理断链；store 工作区有未提交改动时默认仅报告、不触碰，`--hard` 复位到最近一次提交——只复位已跟踪路径，未跟踪内容不动、也不归档。注意「被 .gitignore 忽略」不等于「未跟踪」：sweep 会把被忽略的内容一并提交（§5.3），一旦入账它就是已跟踪路径，`--hard` 与对待任何已跟踪路径一样复位它，其上未提交的改动就此丢弃 |
 
 **提交与历史**
 
@@ -145,7 +145,7 @@ v1 以下列七个场景全程可走通为完成标志：
 |------|------|------|
 | `fu commit [name] [-m <说明>]` | 规划 | 主动提交工作区的手工修改；带 name 仅提交该 skill，省略则提交全部；`-m` 省略时自动生成描述 |
 | `fu log` | 规划 | 操作历史的友好视图 |
-| `fu revert [n]` | 规划 | 回退最近 n 次操作（默认 1），链接随之重建；本身也是一次可回退的操作 |
+| `fu revert <n>` | 已交付 | 回退最近 n 次操作，链接随之重建；本身也是一次可回退的操作 |
 
 **store 与同步**
 
@@ -174,7 +174,7 @@ v1 不实现 GUI，仅交付 CLI。本地 web GUI（`fu web`）列入 roadmap；
 
 ### 5.3 自动提交
 
-每次改变 store 状态的操作（add、rm、adopt、new、update、enable、disable、revert）自动生成一次 commit，提交信息为可读的操作描述。上述操作以及 `push`、`pull` 执行前，若工作区存在未经 fu 的手工改动（如直接编辑 skill 内容），先将其单独提交为一笔"外部修改"，再执行本次操作——任何内容变化都进入历史，`push` 与换机恢复因此完整。主动、带语义的记录用 `fu commit`；自动入账是它的兜底。`restore` 使现实回归期望、不产生新历史；`pull` 的合并提交由 git 自身完成。`fu log` 与 `fu revert` 建立在此之上。
+每次改变 store 状态的操作（add、rm、adopt、new、update、enable、disable、revert）自动生成一次 commit，提交信息为可读的操作描述。上述操作以及 `push`、`pull` 执行前，若工作区存在未经 fu 的手工改动（如直接编辑 skill 内容），先将其单独提交为一笔"外部修改"，再执行本次操作——任何内容变化都进入历史，`push` 与换机恢复因此完整。主动、带语义的记录用 `fu commit`；自动入账是它的兜底。`restore` 使现实回归期望：它自身不将工作区的外部修改提交入账、不产生属于自己的 commit；但它在重建链接前先把未完成的事务驱动到终态，其中走回滚分支的那些会写入其自身的补偿 commit（完成分支不写提交）。加 `--hard` 时它同样不产生 commit，但会改动 store 工作区——把已跟踪路径复位到最近一次提交，其上的未提交改动就此丢弃（见 §9）。`pull` 的合并提交由 git 自身完成。`fu log` 与 `fu revert` 建立在此之上。**本段开头的操作清单是承重的**：`fu revert n` 按操作而非按裸提交计数，判据正是这份清单，以白名单 `operationVerbs`（`internal/store/git.go`）的形式在代码中重述一遍。没有任何机制自动校验两处一致，因此增删操作时必须同时改动两处——只改这里而漏改白名单，该操作不会被计数，`fu revert n` 会静默地越过它多退一次。
 
 ## 6. 行为规则
 
@@ -183,11 +183,11 @@ v1 不实现 GUI，仅交付 CLI。本地 web GUI（`fu web`）列入 roadmap；
 3. **本地修改与更新**：`fu update` 检测该 skill 自安装以来是否被本地修改；有则拒绝覆盖并提示差异，`--force` 强制，被覆盖内容留存于 git 历史。
 4. **agent 检测**：按特征路径探测（`~/.claude/`、`~/.codex/`），检测到即纳管，未检测到的 agent 不投放、不报错。新 agent 的首次投放由下一次任意写操作或 `restore` 完成，只读命令仅提示待投放。
 5. **专有元数据透明传递**：如 Codex 的 `openai.yaml`，随 skill 目录整体投放，fu 不解析、不修改。
-6. **断链与漂移**：链接指向缺失目标（如 store 实体被手工删除）、期望与现实不符等偏差，由 `fu status` 发现；`fu restore` 将 store 工作区复位到最近一次提交，并按期望重建、清理链接。
+6. **断链与漂移**：链接指向缺失目标（如 store 实体被手工删除）、期望与现实不符等偏差，由 `fu status` 发现；`fu restore` 按期望重建、清理链接，`--hard` 另外把 store 工作区复位到最近一次提交。
 7. **安装校验**：add 与 adopt 时按 Agent Skills 规范校验：SKILL.md 存在；name 与 description 非空且长度合规（≤64 / ≤1024 字符）；name 仅含小写字母数字与连字符、不以连字符首尾、无连续连字符，且与目录名一致；skill 内无越界引用（symlink 逃逸等路径安全检查）。当被扫描的 source 根自身就是一个 skill 时，根目录名是调用方的路径或临时 clone 名，不参与 name↔目录名校验，但其余校验全部照常。不合规拒绝并说明原因。
 8. **生效时机**：各 agent 在会话启动时加载 skills，开关变更于下次新会话生效；fu 不干预运行中的进程，仅在 CLI 输出与 GUI 中如实提示。
 9. **更新基准**：git 来源沿其跟踪 ref 判定与获取新版本；`fu add --ref` 接受 branch 或 tag，不接受 commit hash。ref 缺省时在安装当时解析为默认分支并固定记录，不动态跟随远端变更；tag 来源与已有记录中的 commit-pinned lock 视为固定，不参与 `outdated`。本地目录来源以源路径内容相对**安装基线**的差异判定 `outdated`——store 侧相对基线的差异属"本地修改"（规则 3），二者不混同；local 来源仅在其路径存在的机器上可更新与判定，其他机器上 `status` 如实提示。
-10. **agent 目录前置检查**：某 agent 的 skills 目录本身是 symlink 时，日常投放（reconcile）拒绝执行并提示，绝不写穿链接改动其目标；`fu adopt` 是唯一例外——它以只读方式扫描链接目标完成收编，随后在 retirement 前持久化链接身份、原路径与原始 target，再归档链接条目本身、原位创建真实目录并投放，目标目录自始至终不被修改。该记录包含未来还原所需 authority；当前 `fu restore` 尚未交付，不能解读为已有自动还原命令。
+10. **agent 目录前置检查**：某 agent 的 skills 目录本身是 symlink 时，日常投放（reconcile）拒绝执行并提示，绝不写穿链接改动其目标；`fu adopt` 是唯一例外——它以只读方式扫描链接目标完成收编，随后在 retirement 前持久化链接身份、原路径与原始 target，再归档链接条目本身、原位创建真实目录并投放，目标目录自始至终不被修改。该记录包含未来还原所需 authority；当前没有命令会读取它执行自动还原，不能解读为已有这一能力。
 11. **保留条目**：各适配器可声明保留条目（如 Codex 的 `.system`），fu 永不纳管、永不收编、不在未纳管清单中提示。
 
 ## 7. Non-goals
@@ -220,7 +220,7 @@ How 层面仅约定以下边界，具体方案由实现规划文档承担：
 - 业务逻辑全部位于核心库，CLI 只做参数解析与呈现（为将来的 GUI 预留同一调用面）；
 - store 目录布局与 `fu.yaml` 格式保持前向兼容；
 - 只读命令（list、show、status、log、outdated、agent、无参数的 remote）不修改 store 内容与 agent 目录；status 的远端核对仅作网络查询，不落盘；
-- 所有破坏性操作均可恢复：store 内容以 git 历史兜底，adopt / restore 触及的本机原有条目以 recovery 归档兜底；
+- 所有破坏性操作均可恢复：已提交的 store 内容以 git 历史兜底，adopt 触及的本机原有条目以 recovery 归档兜底。`restore` 不写 recovery：它重建链接层时退休的断链或拼法过期的旧链接，改名到该 agent skills 目录内的兄弟名后随即删除，不归档；这类链接由 `restore` 依 `fu.yaml` 重建，故无需兜底。唯一不可恢复的是 `fu restore --hard` 丢弃的未提交改动——它们既未进入 git 历史，也不归档，因此不在兜底范围内，这是该选项的明示语义；
 - v1 平台：macOS 与 Linux。
 
 ## 10. 验收标准
@@ -240,6 +240,6 @@ How 层面仅约定以下边界，具体方案由实现规划文档承担：
 | GUI | 移出 v1，列入 roadmap | 先交付 CLI 核心价值；此前定为与 CLI 对等、本地 web（`fu web`）承载，该形态作为 roadmap 方向保留 |
 | 两级开关语义 | 全局为默认值，agent 级为覆盖 | 支持"全局关但个别 agent 开"的精细控制；覆盖按同值归一，无需清除类命令；取代旧原型的 profiles 机制 |
 | skill 层动词 | add / rm | 与 git（`submodule add`、`git rm`）及新一代包管理器（yarn、pnpm、cargo、uv）一致 |
-| store 层动词 | 严格 git 化 | init、clone、status、restore、commit、log、revert、push、pull、remote 与 git 动词语义对应，直觉可整体迁移（`fu revert` 以操作次数为参数，是对 git revert 的简化） |
+| store 层动词 | 严格 git 化 | init、clone、status、restore、commit、log、revert、push、pull、remote 与 git 动词语义对应，直觉可整体迁移（`fu revert` 以操作次数为参数，是对 git revert 的简化；`restore --hard` 的选项名借自 `git reset --hard`，而非取自 `git restore`——`git restore` 本身没有 `--hard`，是动词对应原则的一个已知例外） |
 | 重名与改名 | 重名即拒，不提供改名 | 规范要求 frontmatter name 与目录名一致，改名即改内容，违反"fu 不修改内容"原则 |
 | adopt 范围 | 完整收编（含 symlink 环境） | 真实环境即 symlink 管理（整目录链接与逐项链接并存），adopt 必须安全处理：symlink 只复制目标、不移动；整目录 symlink 由 adopt 自动迁移（归档链接条目、原位建真实目录），日常 reconcile 仍拒绝写穿 |

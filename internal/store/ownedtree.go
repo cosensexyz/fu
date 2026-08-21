@@ -1605,6 +1605,70 @@ func (s *Store) ArchiveRecoveryPayloadOwned(name string, expected OwnedTree) err
 	return archiveRecoveryPayloadOwned(s, name, expected, ownedCleanupHooks{})
 }
 
+// RetiredRecoveryRootName returns the sibling name ReclaimRecoveryPayloadOwned
+// parks a payload's root at between emptying it and unlinking it. The name is
+// derived from the manifest rather than randomised precisely so an interrupted
+// disposal can be recognised and resumed, which also makes it the one name a
+// caller outside this package needs to reason about the intermediate state.
+//
+// Prefer RecoveryPayloadSettled for the question callers actually have -- "is
+// there anything left here" -- so a protocol that grows another intermediate
+// name cannot leave them behind.
+func RetiredRecoveryRootName(name string, expected OwnedTree) string {
+	return ownedCleanupRetiredName(".fu-retired-dir-", name, expected.RootIdentity)
+}
+
+// RecoveryPayloadSettled reports whether a transaction payload has been
+// disposed of completely: neither its live name nor the deterministic retired
+// root name ReclaimRecoveryPayloadOwned parks it at mid-removal holds an
+// object.
+//
+// The retired half is the whole point of the predicate. Reclamation is not one
+// syscall: RemoveOwnedTreeAt empties the tree, renames the root to a sibling
+// derived from the manifest, and only then unlinks it, so a process that dies
+// between the last two steps leaves the payload absent from its live name while
+// the emptied root remains. Judging that state by the live name alone answers
+// "settled", which is exactly what lets `fu gc` prune the journal family
+// carrying the manifest RemoveOwnedTreeAt needs to resume from that sibling.
+// Once it is gone the retired root can never be collected by anything, while
+// `fu status` goes on counting it collectable (status.go) -- a report telling
+// the user to run a command and watch a count not move.
+//
+// The name derivation stays private to this package deliberately: callers ask
+// whether the payload is settled, not what fu calls its intermediate states, so
+// a protocol that grows another intermediate name cannot leave them behind.
+func (s *Store) RecoveryPayloadSettled(name string, expected OwnedTree) (bool, error) {
+	defer keepDescriptorOwnersAlive(s)
+	if s.writeRoots == nil || s.writeRoots.recovery == nil || s.writeRoots.recovery.dir == nil {
+		return false, errors.New("store is not attached to a checked recovery-root session")
+	}
+	// The same name check its disposal counterpart applies, and for the same
+	// reason: gc reaches both with a name derived from a completed family's
+	// Name field, and nothing on the prune path validates that field --
+	// decodeTxnFile checks op, id, sequence and digest, while
+	// validateRemoveTxn's skill.ValidateName runs only in the recovery
+	// handlers. A hand-edited journal carrying "/../" in Name would otherwise
+	// have this fstatat outside recovery/. It is a stat rather than a
+	// deletion, and the threat model is single-user, so the impact is
+	// negligible -- but the whole file rests on this discipline and the pair
+	// should not be asymmetric about it.
+	if !validPublicLogicalEntry(name) {
+		return false, fmt.Errorf("recovery payload requires a public single-component name outside the .fu- namespace: %q", name)
+	}
+	parentFD := int(s.writeRoots.recovery.dir.Fd())
+	candidates := []string{name, RetiredRecoveryRootName(name, expected)}
+	for _, candidate := range candidates {
+		present, err := pathPresentAt(parentFD, candidate)
+		if err != nil {
+			return false, err
+		}
+		if present {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // ReclaimRecoveryPayloadOwned disposes of a transaction payload whose owning
 // transaction has already reached its terminal marker. It is the disposal
 // counterpart of ArchiveRecoveryPayloadOwned: the manifest binds every entry,

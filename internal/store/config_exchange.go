@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -172,30 +174,6 @@ func configObjectMatches(state configObjectState, identity FileIdentity, digest 
 	return state.exists && state.identity == identity && state.digest == digest
 }
 
-func configExchangeCompleted(archive *checkedRoot, record configExchangeRecord, raw []byte) (bool, error) {
-	defer keepDescriptorOwnersAlive(archive)
-	doneName, err := configExchangeDoneName(record.Candidate)
-	if err != nil {
-		return false, err
-	}
-	doneRaw, err := readRegularFileAt(int(archive.dir.Fd()), doneName, maxConfigExchangeRecordBytes)
-	if errors.Is(err, unix.ENOENT) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("read config exchange completion %s/%s: %w", archive.display, doneName, err)
-	}
-	var completion configExchangeCompletion
-	if err := json.Unmarshal(doneRaw, &completion); err != nil {
-		return false, fmt.Errorf("decode config exchange completion %s/%s: %w", archive.display, doneName, err)
-	}
-	wantDigest := digestConfigExchangeBytes(raw)
-	if completion.Version != configExchangeRecordVersion || completion.RecordDigest != wantDigest || completion.Outcome == "" {
-		return false, fmt.Errorf("config exchange completion %s/%s does not match its record", archive.display, doneName)
-	}
-	return true, nil
-}
-
 func completeConfigExchange(archive *checkedRoot, record configExchangeRecord, raw []byte, outcome string) error {
 	defer keepDescriptorOwnersAlive(archive)
 	doneName, err := configExchangeDoneName(record.Candidate)
@@ -252,9 +230,29 @@ func completeConfigExchange(archive *checkedRoot, record configExchangeRecord, r
 // name states the device/inode of the object it must hold, so gc can prove that
 // identity before unlinking exactly as this function does.
 // ReclaimCompletedConfigExchanges is that collector.
+// reclaimConfigExchangeOrderHook observes the order the two bookkeeping names
+// are disposed in. It is nil in production and set only by the test that pins
+// that order.
+//
+// A seam is needed because the order is observable only at a crash. The loop
+// below has no early exit -- a failed removal does not stop the next one -- so
+// in any completed run both names are gone regardless of sequence, and the
+// whole internal/store suite stayed green with the two swapped. gc's
+// implementation of the same invariant is pinned by
+// TestReclaimCompletedConfigExchangesKeepsAMarkerWhoseRecordSurvives, which
+// can observe it because that sweep really does condition one removal on the
+// other; this one cannot, and had no guard at all. Injecting a crash into
+// completeConfigExchange would be the faithful reproduction and is by some
+// distance the riskiest change available here, so this records the sequence
+// instead: it cannot alter behaviour, and it kills the swap.
+var reclaimConfigExchangeOrderHook func(name string)
+
 func reclaimConfigExchangeResidue(archive *checkedRoot, record configExchangeRecord, recordName, doneName string) {
 	defer keepDescriptorOwnersAlive(archive)
 	for _, name := range []string{recordName, doneName} {
+		if reclaimConfigExchangeOrderHook != nil {
+			reclaimConfigExchangeOrderHook(name)
+		}
 		reclaimConfigExchangeOwnName(archive, name)
 	}
 	// The archives are the opposite case: their names *are* recorded identities,
@@ -322,13 +320,32 @@ func reclaimConfigExchangeFile(archive *checkedRoot, name string, expected FileI
 // names, so anything else there is someone's replacement and is left alone --
 // and the retirement proof, which unlinks the object that was stat'd or
 // nothing at all.
+// reclaimConfigExchangeOwnNameHook observes whether the regular-file pre-flight
+// above admitted or rejected a name. It is nil in production and set only by the
+// test that pins the check, and it exists for the same reason its archive twin
+// does: a completed run cannot tell the two apart.
+//
+// Delete the requireRegularStat term and a directory at one of these two names
+// is retired to an unpredictable sibling, then handed straight back by
+// retireOwnedLeafAt's own S_IFREG revalidation -- so contents, inode and a
+// collected count of zero all still hold, and the whole package stays green.
+// The difference appears only if the process dies inside that window or
+// RestoreRetiredAt loses an EEXIST race, and then the user's object is parked
+// under a .fu-retired-entry- name this repository documents as permanently
+// unattributable.
+var reclaimConfigExchangeOwnNameHook func(name string, admitted bool)
+
 func reclaimConfigExchangeOwnName(archive *checkedRoot, name string) bool {
 	defer keepDescriptorOwnersAlive(archive)
 	if !validLogicalEntry(name) {
 		return false
 	}
 	stat, err := statAt(int(archive.dir.Fd()), name)
-	if err != nil || requireRegularStat(name, &stat) != nil {
+	admitted := err == nil && requireRegularStat(name, &stat) == nil
+	if reclaimConfigExchangeOwnNameHook != nil {
+		reclaimConfigExchangeOwnNameHook(name, admitted)
+	}
+	if !admitted {
 		return false
 	}
 	return reclaimConfigExchangeFile(archive, name, identityFromStat(&stat)) == nil
@@ -345,10 +362,29 @@ func reclaimConfigExchangeOwnName(archive *checkedRoot, name string) bool {
 // regenerated name, which the exchange path can produce and does preserve --
 // from being walked through a window where an interruption would leave it
 // parked under an unpredictable name no evidence anywhere leads back to.
+// reclaimConfigExchangeStatedArchiveHook observes whether the pre-flight
+// identity check above admitted or rejected a name. It is nil in production
+// and set only by the test that pins the check.
+//
+// Needed because a completed run cannot distinguish the two. When the check is
+// deleted, an object the name does not describe is retired and then restored
+// by the revalidation, so every end-state assertion -- contents equal,
+// os.SameFile, collected == 0 -- still holds and the whole suite stays green.
+// The difference only appears if the process dies inside that window, or if
+// RestoreRetiredAt loses an EEXIST race: the user's file is then parked under
+// a random name this repository documents as permanently unattributable. The
+// same two conditions in CollectableConfigArchiveNames are pinned; without
+// this the two copies can drift apart in the dangerous direction.
+var reclaimConfigExchangeStatedArchiveHook func(name string, admitted bool)
+
 func reclaimConfigExchangeStatedArchive(archive *checkedRoot, name string, stated FileIdentity) bool {
 	defer keepDescriptorOwnersAlive(archive)
 	stat, err := statAt(int(archive.dir.Fd()), name)
-	if err != nil || identityFromStat(&stat) != stated || requireRegularStat(name, &stat) != nil {
+	admitted := err == nil && identityFromStat(&stat) == stated && requireRegularStat(name, &stat) == nil
+	if reclaimConfigExchangeStatedArchiveHook != nil {
+		reclaimConfigExchangeStatedArchiveHook(name, admitted)
+	}
+	if !admitted {
 		return false
 	}
 	return reclaimConfigExchangeFile(archive, name, stated) == nil
@@ -377,9 +413,20 @@ func readPendingConfigExchangeRecords(archive *checkedRoot) ([]struct {
 		// bounded reads, two JSON parses and a digest comparison. Every write
 		// command runs this scan, and three files accumulate per config write
 		// with nothing pruning them, so verifying every historical record made
-		// the cost of a write grow with the store's whole history. The marker's
-		// contents are still verified whenever a record is actually acted on --
-		// which is the only time it decides anything.
+		// the cost of a write grow with the store's whole history.
+		//
+		// The evidence this scan acts on is therefore the marker's *existence*,
+		// never its contents, and nothing downstream re-checks them either. An
+		// earlier version of this loop called a configExchangeCompleted helper
+		// below, whose own version/digest/outcome validation read as a safety
+		// net -- but the continue above has already proved the marker absent by
+		// the time that call was reached, so it could only ever return
+		// (false, nil) on ENOENT and the validation inside it never ran. Helper
+		// and call are both gone rather than left in place looking
+		// load-bearing; the same derivation
+		// is stated honestly at ReclaimCompletedConfigExchanges, which says
+		// outright that a `.done` whose record is gone is finished by
+		// construction.
 		if _, statErr := statAt(int(archive.dir.Fd()), doneName); statErr == nil {
 			continue
 		} else if !errors.Is(statErr, unix.ENOENT) {
@@ -396,16 +443,10 @@ func readPendingConfigExchangeRecords(archive *checkedRoot) ([]struct {
 		if err := validateConfigExchangeRecord(name, record); err != nil {
 			return nil, err
 		}
-		completed, err := configExchangeCompleted(archive, record, raw)
-		if err != nil {
-			return nil, err
-		}
-		if !completed {
-			pending = append(pending, struct {
-				record configExchangeRecord
-				raw    []byte
-			}{record: record, raw: raw})
-		}
+		pending = append(pending, struct {
+			record configExchangeRecord
+			raw    []byte
+		}{record: record, raw: raw})
 	}
 	return pending, nil
 }
@@ -643,23 +684,218 @@ func (s *Store) ReclaimCompletedConfigExchanges() (int, error) {
 	return collected, nil
 }
 
+// CollectableConfigArchiveNames returns the subset of names that the archive
+// sweep in ReclaimCompletedConfigExchanges would actually unlink, judged by
+// the same two conditions that sweep applies: the name must round-trip through
+// the archive naming grammar, and it must still resolve to the very
+// device/inode it states it holds.
+//
+// It exists so the read-only inventory can report an archive as collectable
+// only when gc will really collect it. Neither condition is a formality. A
+// malformed .fu-config-archive-* name is skipped by parseConfigArchiveName and
+// never collected at all; a well-formed name whose inode has since drifted is
+// preserved on every run by design -- that preservation is what
+// TestReclaimCompletedConfigExchangesPreservesAnArchiveNameItDoesNotDescribe
+// pins -- so both are permanent residue, and reporting them as collectable is
+// the same empty promise an unclaimed removed- payload was.
+//
+// This reads names and inode metadata only; no archive is opened or parsed.
+// Callers still have to decide the freeze question separately
+// (PendingConfigExchangeRecords), since a pending exchange stops the sweep
+// before it reaches any of these.
+func (s *Store) CollectableConfigArchiveNames(names []string) map[string]bool {
+	out := make(map[string]bool, len(names))
+	// Pinned when a write session is open, by pathname when it is not, the
+	// same way scanTxnJournalReport (engine/txn.go) reaches this directory.
+	// `fu status` takes no lock and opens no session by design, so the
+	// pathname branch is its ordinary route; the worst a swap under it costs a
+	// read-only report is a stale count.
+	archive := s.checkedRecovery()
+	for _, name := range names {
+		stated, ok := parseConfigArchiveName(name)
+		if !ok {
+			continue
+		}
+		var stat unix.Stat_t
+		var err error
+		if archive != nil {
+			stat, err = statAt(int(archive.dir.Fd()), name)
+		} else {
+			err = unix.Lstat(filepath.Join(s.RecoveryDir(), name), &stat)
+		}
+		if err != nil || identityFromStat(&stat) != stated || requireRegularStat(name, &stat) != nil {
+			continue
+		}
+		out[name] = true
+	}
+	if archive != nil {
+		keepDescriptorOwnersAlive(archive)
+	}
+	return out
+}
+
+// checkedRecovery returns the pinned recovery root when this store is attached
+// to a write session, and nil when it is not. Read-only callers use the nil
+// case deliberately: `fu status` neither opens a session nor takes fu.lock.
+func (s *Store) checkedRecovery() *checkedRoot {
+	if s.writeRoots == nil {
+		return nil
+	}
+	return s.writeRoots.recovery
+}
+
+// RecoveryNames lists the recovery directory, through the pinned descriptor
+// when one is held and by pathname otherwise. Same fallback as
+// scanTxnJournalReport's, kept in one place so a read-only reporter does not
+// have to restate it.
+func (s *Store) RecoveryNames() ([]string, error) {
+	return s.logicalRootNames(s.checkedRecovery(), s.RecoveryDir())
+}
+
+// StagingNames is RecoveryNames for the staging directory.
+func (s *Store) StagingNames() ([]string, error) {
+	var staging *checkedRoot
+	if s.writeRoots != nil {
+		staging = s.writeRoots.staging
+	}
+	return s.logicalRootNames(staging, s.StagingDir())
+}
+
+func (s *Store) logicalRootNames(root *checkedRoot, dir string) ([]string, error) {
+	if root != nil {
+		return readCheckedRootNames(root)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// CollectableConfigExchangeNames returns the subset of names that
+// ReclaimCompletedConfigExchanges would actually unlink from the record/marker
+// side of its sweep, judged by that sweep's own strict grammar.
+//
+// It exists because "not pending" and "collectable" are not complements, and
+// treating them as such made the inventory promise collections that never
+// happen. The pending scan uses the loose grammar
+// (configExchangeRecordMarkerName: prefix plus ".json", hex unchecked); the
+// collector uses the strict one (configExchangeMarkedRecordName, which
+// round-trips through configCandidateSuffix and requires exactly 16 hex
+// digits). Anything carrying the prefix but failing the strict form -- a
+// ".json.bak" an editor left, a non-hex suffix -- was counted Collectable and
+// then walked past by every `fu gc` run forever.
+//
+// fu never writes such a name itself, but a user can reach the state by hand,
+// which is the same reachability argument that hardened the neighbouring
+// .fu-config-archive- case. Keeping the judgement here rather than in the
+// reporter is the point: the grammar was written twice, in two packages, at
+// two strictnesses, and that is what let them disagree.
+//
+// Names only; nothing is opened or stat'd. Callers must still apply the freeze
+// separately (PendingConfigExchangeRecords), since one pending exchange stops
+// the sweep before it reaches any archive.
+func CollectableConfigExchangeNames(names []string) map[string]bool {
+	present := make(map[string]bool, len(names))
+	for _, name := range names {
+		present[name] = true
+	}
+	out := make(map[string]bool, len(names))
+	for _, marker := range names {
+		record, ok := configExchangeMarkedRecordName(marker)
+		if !ok {
+			continue
+		}
+		// Both, when both are there. The sweep removes the record because its
+		// marker exists, then re-checks the record and removes the marker
+		// because it is now gone -- so a complete pair is fully collected
+		// within a single run, not one name per run.
+		if present[record] {
+			out[record] = true
+		}
+		out[marker] = true
+	}
+	return out
+}
+
+// PendingConfigExchangeRecords returns the names in a recovery-directory
+// listing that are config exchange records with no completion marker beside
+// them -- the exchanges this package's sweep will not collect, and which freeze
+// its archive sweep along with them (ReclaimCompletedConfigExchanges). It
+// exists so a read-only reporter can say what `fu gc` would and would not
+// collect without restating the naming grammar: the answer comes from
+// pendingConfigExchangeRecords below, the same derivation gc and recovery
+// already share. Names alone are read; nothing is opened, parsed or stat'd.
+func PendingConfigExchangeRecords(names []string) []string {
+	present := make(map[string]bool, len(names))
+	for _, name := range names {
+		present[name] = true
+	}
+	return pendingConfigExchangeRecords(names, present)
+}
+
+// PendingConfigExchangeStagingNames returns every entry under staging that the
+// given pending exchange records still govern: each record's own candidate,
+// plus the single active swap name they all share. A caller holding the record
+// names could take these apart itself, and deliberately does not -- the naming
+// scheme would then live in two places, which is the disagreement between
+// recovery and its readers that PendingConfigExchangeRecords already exists to
+// prevent.
+//
+// Records that do not parse are skipped rather than reported. The only caller
+// is a read-only inventory, and it passes names this package just selected as
+// pending, so a malformed one is not a state this function can usefully raise:
+// the write path fails loudly on it long before a count would matter.
+func PendingConfigExchangeStagingNames(pendingRecords []string) []string {
+	if len(pendingRecords) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(pendingRecords)+1)
+	for _, record := range pendingRecords {
+		suffix := strings.TrimSuffix(strings.TrimPrefix(record, configExchangeRecordPrefix), ".json")
+		candidate := configCandidatePrefix + suffix
+		if _, err := configCandidateSuffix(candidate); err != nil {
+			continue
+		}
+		names = append(names, candidate)
+	}
+	return append(names, configSwapName)
+}
+
 // configExchangePending reports whether any exchange is still unfinished, by
 // the same predicate readPendingConfigExchangeRecords selects pending work
-// with -- configExchangeRecordMarkerName, called by both. Sharing it is what
+// with -- configExchangeRecordMarkerName. The two reach it differently and
+// deliberately: this side derives the marker name and asks whether the listing
+// already holds it, while readPendingConfigExchangeRecords derives the same
+// name and settles it with one fstatat, because it runs on every write command
+// and must not grow a listing. Sharing the derivation, not the lookup, is what
 // keeps gc from ever disagreeing with recovery about which records still have
 // authority -- including over a record recovery can only fail on, which stays
 // pending precisely because nothing can finish it.
 func configExchangePending(names []string, present map[string]bool) bool {
+	return len(pendingConfigExchangeRecords(names, present)) != 0
+}
+
+func pendingConfigExchangeRecords(names []string, present map[string]bool) []string {
+	var pending []string
 	for _, name := range names {
 		doneName, ok := configExchangeRecordMarkerName(name)
 		if !ok {
 			continue
 		}
 		if !present[doneName] {
-			return true
+			pending = append(pending, name)
 		}
 	}
-	return false
+	return pending
 }
 
 // configExchangeRecordMarkerName reports whether name is a config exchange

@@ -1177,6 +1177,86 @@ func (s *Store) IsDirty() (bool, error) {
 	return len(changed) != 0, nil
 }
 
+// ExternalCommitMessage is the message every sweep commit carries. It is
+// load-bearing in two directions: Sweep writes it, and the operation counting
+// behind `fu revert n` reads it to tell fu's own bookkeeping entries apart
+// from the operations SPEC §5.3 enumerates. Naming it once keeps the two ends
+// from drifting apart silently.
+const ExternalCommitMessage = "external: manual modifications"
+
+// RecoveryCompensationPrefix begins every commit a recovery pass writes to
+// undo an interrupted transaction (committedInstallRecovery,
+// internal/engine/new_txn.go, which builds it as this prefix followed by the
+// interrupted operation's own message).
+//
+// It lives beside ExternalCommitMessage for the reason that one's comment
+// gives: these are the two kinds of commit fu writes on its own account rather
+// than on the user's, and operation counting has to recognise both. Keeping
+// them apart is what let the second one be missed -- `fu revert 1` after a
+// crash counted fu's own rollback as the user's last operation and undid it,
+// putting back the very content the rollback had just removed.
+//
+// The suffix matters as well as the prefix: it names the operation this
+// compensation cancels, which is how resolveOperationsBack (revert.go, not
+// this file) can discount the pair rather than only the compensation. An
+// interrupted operation that was rolled back nets to zero; it was never an
+// operation the user completed.
+const RecoveryCompensationPrefix = "recover: roll back interrupted "
+
+// operationVerbs is SPEC §5.3's list of the operations that change store
+// state, in the form their commit messages carry: the verb before the first
+// colon (internal/engine's ops.go, add.go, rm.go, adopt.go and revert all
+// build "<verb>: <detail>").
+//
+// A whitelist, not a blacklist, because the two fail in different directions
+// and only one of them is recoverable by reading the code. An unknown message
+// under a blacklist silently becomes a user operation, which is how a recovery
+// compensation came to be one; under a whitelist it is simply not counted, and
+// `init: store` -- which is not in SPEC's list and can never be a revert
+// target anyway -- stops inflating the count in the out-of-range refusal.
+//
+// Adding an operation here is required when adding one to SPEC §5.3. Nothing
+// enforces that mechanically; the coupling is stated in both places instead.
+//
+// One of the two drift directions is guarded and the other is not, and the
+// unguarded one is *removal* (review round 27, recommendation). Adding a
+// verb-producing command without adding it here is caught:
+// TestOperationVerbsCoverEveryMessageProducingCommand drives the engine's real
+// commands and puts the messages they actually produce through
+// IsOperationMessage, so a new verb fails it. Deleting a line from this map
+// fails nothing -- the test only asks that every message produced is counted,
+// and a command whose verb is gone simply stops producing a counted one. The
+// damage is silent and lands on `fu revert n`: that operation vanishes from
+// resolveOperationsBack's count, so `revert 1` walks past it to the one before,
+// and the user undoes an operation they did not name. Removing a verb here
+// therefore requires removing the command, not merely tidying the map.
+var operationVerbs = map[string]bool{
+	"add":     true,
+	"rm":      true,
+	"adopt":   true,
+	"new":     true,
+	"update":  true,
+	"enable":  true,
+	"disable": true,
+	"revert":  true,
+}
+
+// IsOperationMessage reports whether a commit message names one of SPEC §5.3's
+// state-changing operations.
+//
+// Exported for the engine's own coupling test. The list this consults is a
+// hand-maintained restatement of SPEC §5.3, and the test that guarded it lived
+// here and asserted against a second hand-maintained list of message strings --
+// so adding a ninth verb-producing command and forgetting operationVerbs left
+// both lists agreeing with each other and disagreeing with the engine. The
+// engine can drive its real commands and put the messages they actually
+// produce through this, which is the only side of the coupling that can
+// observe a new producer.
+func IsOperationMessage(message string) bool {
+	verb, _, found := strings.Cut(message, ":")
+	return found && operationVerbs[verb]
+}
+
 // Sweep commits pending manual edits as one "external" operation so any
 // content change enters history before fu's own operation (SPEC §5.3). A
 // public staged snapshot is committed first; if the worktree contains a later
@@ -1195,7 +1275,7 @@ func (s *Store) Sweep() error {
 		return err
 	}
 	if len(staged.changed) != 0 {
-		if _, err := s.CommitPrepared("external: manual modifications", staged); err != nil {
+		if _, err := s.CommitPrepared(ExternalCommitMessage, staged); err != nil {
 			return err
 		}
 	}
@@ -1203,7 +1283,7 @@ func (s *Store) Sweep() error {
 	if err != nil || !dirty {
 		return err
 	}
-	_, err = s.Commit("external: manual modifications")
+	_, err = s.Commit(ExternalCommitMessage)
 	return err
 }
 

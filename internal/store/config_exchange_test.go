@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -602,6 +603,45 @@ func TestReclaimCompletedConfigExchangesPreservesAnArchiveNameItDoesNotDescribe(
 	}
 }
 
+// TestReclaimConfigExchangeRejectsAnArchiveNameBeforeRetiringIt pins *where*
+// the preservation above happens, which every assertion in it is blind to.
+//
+// The identity check is a pre-flight: it refuses before the object is renamed
+// aside. Delete it and the object is retired to an unpredictable sibling and
+// then restored by the post-move revalidation, so this file's end-state
+// assertions -- contents equal, os.SameFile, collected == 0 -- all still hold
+// and the entire package stays green. What is lost is only visible at a crash
+// inside that window, or when RestoreRetiredAt loses an EEXIST race: the
+// user's file is then stranded under a random name that, by this repository's
+// own account, nothing can ever attribute back to fu.
+//
+// Its own comment calls the check load-bearing, and the same two conditions in
+// CollectableConfigArchiveNames are pinned; this stops the two copies drifting
+// apart in the direction that loses data.
+func TestReclaimConfigExchangeRejectsAnArchiveNameBeforeRetiringIt(t *testing.T) {
+	s := checkedWriteSession(t)
+	name := configArchiveName(FileIdentity{Device: 1, Inode: 2})
+	if err := os.WriteFile(filepath.Join(s.RecoveryDir(), name), []byte("not what the name says\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]bool{}
+	reclaimConfigExchangeStatedArchiveHook = func(n string, admitted bool) { seen[n] = admitted }
+	t.Cleanup(func() { reclaimConfigExchangeStatedArchiveHook = nil })
+
+	if _, err := s.ReclaimCompletedConfigExchanges(); err != nil {
+		t.Fatal(err)
+	}
+
+	admitted, examined := seen[name]
+	if !examined {
+		t.Fatalf("the sweep must consider %s at all; hook saw %v", name, seen)
+	}
+	if admitted {
+		t.Fatalf("%s states an identity it does not hold and must be rejected before any rename", name)
+	}
+}
+
 // The state the sweep exists for. Inline reclamation begins the instant the
 // terminal marker is durable, so the first thing a crash can cut is the step
 // that retires the record -- leaving a record beside its own marker.
@@ -685,5 +725,145 @@ func TestReclaimCompletedConfigExchangesKeepsAMarkerWhoseRecordSurvives(t *testi
 	}
 	if _, err := os.Lstat(base + ".done"); err != nil {
 		t.Fatalf("a marker whose record survives must survive with it, err=%v", err)
+	}
+}
+
+// TestReclaimConfigExchangeResidueRemovesTheRecordBeforeItsMarker pins the
+// order reclaimConfigExchangeResidue's own comment calls load-bearing, for the
+// *inline* reclaim rather than gc's.
+//
+// The order is not decoration. readPendingConfigExchangeRecords treats a
+// record with no marker beside it as pending work, so removing the marker
+// first makes a finished exchange look interrupted and sends the next write
+// command through a completed exchange again, against a store that has already
+// moved on. That is the one silent, destructive failure mode in this file.
+//
+// Nothing pinned it. Swapping the loop to []string{doneName, recordName} left
+// the whole internal/store suite green: the loop has no early exit, so both
+// names are gone by the end of any completed run and only a crash between the
+// two removals can tell the orders apart. gc's twin invariant is pinned by
+// TestReclaimCompletedConfigExchangesKeepsAMarkerWhoseRecordSurvives above --
+// that sweep genuinely conditions one removal on the other, so a frozen
+// intermediate state is observable there and not here.
+//
+// So the sequence is observed directly, through a hook that is nil in
+// production. That is a smaller change than injecting a crash into
+// completeConfigExchange, and it fails on the swap, which is what was needed.
+func TestReclaimConfigExchangeResidueRemovesTheRecordBeforeItsMarker(t *testing.T) {
+	s := checkedWriteSession(t)
+	suffix := strings.Repeat("cd", 8)
+	recordName := configExchangeRecordPrefix + suffix + ".json"
+	doneName := configExchangeRecordPrefix + suffix + ".done"
+	for _, name := range []string{recordName, doneName} {
+		if err := os.WriteFile(filepath.Join(s.RecoveryDir(), name), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var order []string
+	reclaimConfigExchangeOrderHook = func(name string) { order = append(order, name) }
+	t.Cleanup(func() { reclaimConfigExchangeOrderHook = nil })
+
+	reclaimConfigExchangeResidue(s.writeRoots.recovery, configExchangeRecord{
+		Candidate: configCandidatePrefix + suffix,
+	}, recordName, doneName)
+
+	if len(order) != 2 || order[0] != recordName || order[1] != doneName {
+		t.Fatalf("the record must go first: a marker removed ahead of it leaves a bare record that reads as pending work; got %v", order)
+	}
+}
+
+// TestCollectableConfigArchiveNamesAdmitsANameItDescribes is the positive half
+// of the archive derivation. Only its negative direction was tested: replacing
+// the result with an empty map left every status test green, which would move
+// an archive `fu gc` really does unlink into "no command collects this yet".
+//
+// It lives here rather than in engine because it needs configArchiveName, and
+// exporting a naming function for a test would be a worse trade than putting
+// the test beside it.
+func TestCollectableConfigArchiveNamesAdmitsANameItDescribes(t *testing.T) {
+	s := checkedWriteSession(t)
+	scratch := filepath.Join(s.RecoveryDir(), "scratch")
+	if err := os.WriteFile(scratch, []byte("archived config\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("expected a unix stat")
+	}
+	described := configArchiveName(FileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)})
+	if err := os.Rename(scratch, filepath.Join(s.RecoveryDir(), described)); err != nil {
+		t.Fatal(err)
+	}
+	// A second name that states an identity it does not hold, so this asserts
+	// a real division rather than "everything is admitted".
+	undescribed := configArchiveName(FileIdentity{Device: 1, Inode: 2})
+	if err := os.WriteFile(filepath.Join(s.RecoveryDir(), undescribed), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got := s.CollectableConfigArchiveNames([]string{described, undescribed})
+	if !got[described] {
+		t.Fatalf("%s holds exactly the object it names and must be collectable", described)
+	}
+	if got[undescribed] {
+		t.Fatalf("%s states an identity it does not hold and must not be", undescribed)
+	}
+}
+
+// TestReclaimConfigExchangeRejectsANonRegularOwnNameBeforeRetiringIt is the
+// mirror of TestReclaimConfigExchangeRejectsAnArchiveNameBeforeRetiringIt, on
+// the half of the sweep that had no such test.
+//
+// reclaimConfigExchangeOwnName's doc comment claims the same load-bearing
+// property its archive twin claims -- "a name holding anything but a regular
+// file is left where it is rather than taken through the retirement rename" --
+// and until this test the claim was unenforced: deleting requireRegularStat
+// left the whole internal/store suite green, including
+// TestReclaimCompletedConfigExchangesKeepsAMarkerWhoseRecordSurvives, whose
+// comment nominates itself as the coverage. It is not: retireOwnedLeafAt's own
+// S_IFREG check catches the directory *after* the retirement rename and hands
+// it back, so every end-state assertion still holds. Only the position of the
+// check distinguishes the two, and only this hook can see it.
+func TestReclaimConfigExchangeRejectsANonRegularOwnNameBeforeRetiringIt(t *testing.T) {
+	s := checkedWriteSession(t)
+	// A well-formed record name -- so the sweep's grammar admits it and the
+	// only thing standing between a directory and the rename is the pre-flight.
+	name := configExchangeRecordPrefix + strings.Repeat("ab", 8) + ".json"
+	if err := os.Mkdir(filepath.Join(s.RecoveryDir(), name), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.RecoveryDir(), name, "user-content.txt"), []byte("mine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A marker beside it, which is what makes the record collectable at all;
+	// without one the pending scan claims the pair and the sweep never looks.
+	doneName := configExchangeRecordPrefix + strings.Repeat("ab", 8) + ".done"
+	if err := os.WriteFile(filepath.Join(s.RecoveryDir(), doneName), []byte("marker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]bool{}
+	reclaimConfigExchangeOwnNameHook = func(n string, admitted bool) { seen[n] = admitted }
+	t.Cleanup(func() { reclaimConfigExchangeOwnNameHook = nil })
+
+	if _, err := s.ReclaimCompletedConfigExchanges(); err != nil {
+		t.Fatal(err)
+	}
+
+	admitted, examined := seen[name]
+	if !examined {
+		t.Fatalf("the sweep must consider %s at all; hook saw %v", name, seen)
+	}
+	if admitted {
+		t.Fatalf("%s holds a directory, not a regular file, and must be rejected before any rename", name)
+	}
+	// And the end state fu never disturbed.
+	if got, err := os.ReadFile(filepath.Join(s.RecoveryDir(), name, "user-content.txt")); err != nil || string(got) != "mine\n" {
+		t.Fatalf("the directory and its content must be left exactly where they were: %q %v", got, err)
 	}
 }

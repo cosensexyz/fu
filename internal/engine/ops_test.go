@@ -2823,3 +2823,527 @@ func TestInstallCompensationPayloadNameUsesFullStartHead(t *testing.T) {
 		t.Fatalf("compensation payload name %q does not contain full start HEAD %q", name, startHead)
 	}
 }
+
+// TestRevertSweepsHandEditsIntoHistoryWithoutReplayingThem pins the one
+// deliberate divergence from git recorded in DESIGN: git revert refuses on a
+// dirty worktree, fu sweeps it into history first. fu's rule is SPEC's --
+// every write command records pending hand edits before doing its own work
+// -- and fu's revert is a tree snapshot that cannot conflict, so git's
+// reason for refusing does not apply here.
+//
+// The sweep gives the hand edit its own "external: manual modifications"
+// commit before store.Store.Revert ever runs, so the edit is in git history
+// and reachable with `fu log` no matter what the checkout below does to the
+// worktree afterwards. It does not survive *in the worktree*: Revert is a
+// tree checkout with no notion of "newer than the target", so it converges
+// alpha/SKILL.md back to whatever the target tree says, the same as every
+// other path the target names. An earlier version of RevertOperations
+// snapshotted the dirty content and replayed it once the checkout landed,
+// specifically so the edit would still be sitting in the worktree
+// afterwards; that replay is gone, and what this test pins is narrower,
+// matching what the sweep commit actually buys: recorded in history, not
+// restored to the worktree.
+//
+// This has to still be revert 1, not revert 2: the sweep's own commit sits
+// between the hand edit and the operation the user asked to undo, so getting
+// that right end to end is what proves operation counting (resolveOperationsBack)
+// -- without it, revert 1 undoes the sweep's own commit and stops there,
+// leaving beta (the operation the user actually asked to revert) in place.
+// So beta must be gone and alpha -- the operation *before* the one being
+// undone -- must be untouched by this revert; asserted directly below rather
+// than left to follow incidentally from the history/cleanliness checks.
+//
+// alpha is created through NewSkill rather than setupStore(t, "alpha"):
+// setupStore's variadic form only mkdir's an empty directory and never
+// commits a SKILL.md (see setupStore's own doc comment), so "alpha" would
+// carry no real content for the hand edit below to modify. NewSkill gives it
+// a real, committed SKILL.md the way sibling tests in this file already do
+// when they need genuine content rather than a bare registration.
+func TestRevertSweepsHandEditsIntoHistoryWithoutReplayingThem(t *testing.T) {
+	s, _ := setupStore(t)
+	if _, err := NewSkill(s, nil, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSkill(s, nil, "beta"); err != nil {
+		t.Fatal(err)
+	}
+	edited := filepath.Join(s.SkillsDir(), "alpha", "SKILL.md")
+	if err := os.WriteFile(edited, []byte("hand edited"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RevertOperations(s, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Operation counting, pinned explicitly: revert 1 must undo beta (the
+	// user's one operation), not stop one commit short at its own sweep.
+	if _, err := os.Stat(filepath.Join(s.SkillsDir(), "beta")); !os.IsNotExist(err) {
+		t.Fatalf("revert must roll back the user's operation (new: beta), err=%v", err)
+	}
+	// ...and it must not overshoot into the operation before that either --
+	// alpha (and its SKILL.md) must still exist, just not with the hand
+	// edit (checked separately below).
+	if _, err := os.Stat(filepath.Join(s.SkillsDir(), "alpha", "SKILL.md")); err != nil {
+		t.Fatalf("revert 1 must not also undo the earlier operation (new: alpha): %v", err)
+	}
+
+	// Recorded in history, in order, with the right bytes. Scanning the whole
+	// log for *any* commit with the sweep's message asserted none of the three
+	// things design §8 asks for: a sweep that committed an empty or wrong tree
+	// would have kept such a scan green while destroying the user's edit, and
+	// nowhere in the repository was the swept blob ever read back. The claim
+	// resting on this -- that fu diverges from git's refusal precisely because
+	// sweeping loses not one byte -- was entirely untested.
+	entries, err := s.Log(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) < 2 {
+		t.Fatalf("want the revert commit over the sweep commit, got %+v", entries)
+	}
+	if !strings.HasPrefix(entries[0].Message, "revert: back ") {
+		t.Fatalf("the revert commit must sit on top, got %q", entries[0].Message)
+	}
+	if entries[1].Message != "external: manual modifications" {
+		t.Fatalf("the sweep must be the commit directly beneath it, got %q", entries[1].Message)
+	}
+	// The bytes themselves, read back out of the sweep's own tree. Resolved
+	// through the commit graph rather than entries[1].Hash, because LogEntry
+	// carries a seven-character abbreviation for display and CommitObject
+	// needs the full hash.
+	head, err := s.Repo.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revertCommit, err := s.Repo.CommitObject(head.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sweptCommit, err := revertCommit.Parent(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := sweptCommit.File("skills/alpha/SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := file.Contents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contents != "hand edited" {
+		t.Fatalf("the sweep must commit the edit itself, got %q", contents)
+	}
+
+	// Not replayed: the checkout converged alpha/SKILL.md to the target
+	// tree's content, so the hand edit is gone from the worktree even
+	// though it lives on in the commit found above.
+	got, err := os.ReadFile(edited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) == "hand edited" {
+		t.Fatalf("the swept hand edit must not be replayed back into the worktree, got %q", got)
+	}
+
+	// Clean afterwards: the checkout landed exactly on the target tree, with
+	// nothing left dangling on top of it.
+	dirty, err := s.ChangedPathsIncludingIgnored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirty) != 0 {
+		t.Fatalf("revert must leave the store clean, still dirty: %v", dirty)
+	}
+}
+
+// TestRevertOperationsPlainCaseWithNoPendingEdits pins the common case the
+// operation counting must degrade to when there is
+// nothing to sweep: with a clean store, Sweep is a no-op and does not add a
+// commit, so revert 1 must undo exactly the most recent operation (new: beta)
+// and nothing more -- neither under- nor over-shooting into new: alpha.
+func TestRevertOperationsPlainCaseWithNoPendingEdits(t *testing.T) {
+	s, _ := setupStore(t)
+	if _, err := NewSkill(s, nil, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSkill(s, nil, "beta"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RevertOperations(s, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(s.SkillsDir(), "beta")); !os.IsNotExist(err) {
+		t.Fatalf("revert 1 must undo the most recent operation (new: beta), err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.SkillsDir(), "alpha", "SKILL.md")); err != nil {
+		t.Fatalf("revert 1 must leave the earlier operation (new: alpha) untouched: %v", err)
+	}
+	dirty, err := s.ChangedPathsIncludingIgnored()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirty) != 0 {
+		t.Fatalf("revert must leave the store clean, still dirty: %v", dirty)
+	}
+}
+
+// TestRevertOperationsRecoversPendingTransactionBeforeSweeping pins review
+// finding 1's fix: RevertOperations must recover a pending transaction before
+// it sweeps, the same order every other write command uses (run, in
+// pipeline.go, and Reconcile itself). Before the fix, RevertOperations swept
+// and reverted first and only recovered afterward -- inside the trailing
+// Reconcile call -- so Sweep ran against a store that still held an
+// unrecovered transaction's on-disk state and had every opportunity to fold
+// its in-flight content into "external: manual modifications" before recovery
+// ever got a look at it.
+//
+// A same-process test cannot fabricate the exact shape a crashed "new" or
+// "add" transaction leaves on disk: every hook-driven interruption this
+// package can trigger without a real process crash (see hooks in
+// pipeline.go) either fires before Txn creation, or fires after it but is
+// routed through rollback() -- which itself calls RecoverPending and cleanly
+// unwinds the partial state in-process -- so nothing pending and dirty
+// survives to be handed to RevertOperations. Only a genuine crash (os.Exit,
+// as TestNewSkillRecoversAfterProcessInterruption uses) skips rollback()
+// entirely, and reaching for that here would only add a subprocess and not
+// change what this test actually needs to observe. So this uses a synthetic,
+// registered op instead, the same technique TestRunBlocksOnUnknownPendingTxn
+// and TestRecoverHandlerRunsAndClears already use for handler-level tests
+// that do not need a real operation's own recovery logic: what this test
+// measures is purely the *order* of two calls -- does the registered handler
+// observe dirty content still uncommitted, or does it find the store already
+// clean because Sweep beat it there -- which a synthetic op answers exactly
+// as well as a real one would.
+//
+// Self-review note on why this is the chosen test, per the two options the
+// review offered: holding fu.lock in the same goroutine before calling
+// RevertOperations was the other one, but withLock (lock.go) blocks on
+// LOCK_EX with no LOCK_NB, so a synchronous same-process hold-then-call would
+// deadlock the test rather than making RevertOperations fail. Nothing in this
+// codebase tests lock contention around a blocking call today --
+// TestWithLockReleasesOnMutateError (pipeline_test.go) only checks the lock
+// is free *after* a call returns, via TryLock -- and reaching for a
+// goroutine-plus-timeout would only prove the call blocks, leaving a
+// goroutine parked on the lock for the rest of the test binary's life.
+// Proving the recovery/sweep order directly is deterministic, fast, and
+// needs neither a subprocess nor a goroutine.
+func TestRevertOperationsRecoversPendingTransactionBeforeSweeping(t *testing.T) {
+	s, _ := setupStore(t)
+	if _, err := NewSkill(s, nil, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSkill(s, nil, "beta"); err != nil {
+		t.Fatal(err)
+	}
+	// Fabricate a pending transaction and leave matching dirty content in the
+	// store worktree -- the shape a crash mid-operation would leave, per the
+	// doc comment above.
+	if err := WriteTxn(s, &TxnRecord{Op: "test-revert-recovery", Stage: "started"}); err != nil {
+		t.Fatal(err)
+	}
+	inFlight := filepath.Join(s.SkillsDir(), "beta", "NOTES.md")
+	if err := os.WriteFile(inFlight, []byte("in-flight"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var recovered, sawDirtyDuringRecovery bool
+	RegisterRecoverHandler("test-revert-recovery", func(st *store.Store, r TxnRecord) error {
+		recovered = true
+		dirty, err := st.IsDirty()
+		if err != nil {
+			return err
+		}
+		sawDirtyDuringRecovery = dirty
+		return ClearTxn(st, r)
+	})
+	t.Cleanup(func() { deleteRecoverHandler("test-revert-recovery") })
+
+	if _, err := RevertOperations(s, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	if !recovered {
+		t.Fatal("RevertOperations must recover the pending transaction; the registered handler never ran")
+	}
+	if !sawDirtyDuringRecovery {
+		t.Fatal("recovery must run before Sweep: the in-flight content was already gone by the time recovery ran, meaning Sweep folded it away first instead of it being recovered")
+	}
+	pending, err := PendingTxns(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("the transaction must be settled by RevertOperations, got %+v", pending)
+	}
+}
+
+// TestRevertCommitMessageStatesTheCountTheUserAsked pins that the commit
+// message names the user's own count even when the command's prelude has just
+// added a sweep commit of its own.
+//
+// It originally pinned review round 2's finding against an n+skip adjustment:
+// the resolved count was n plus however many commits the sweep added, and only
+// the *reported* count stayed n. That adjustment is gone -- store.Store.Revert
+// now resolves by counting operations rather than raw commits
+// (resolveOperationsBack), so the sweep is skipped for the same reason every
+// sweep is, and there is no second count to leak. Renamed from
+// TestRevertReportsTheUserFacingCountNotFusOwnAdjustedOne, whose name and
+// comment both described a mechanism that no longer exists.
+//
+// The assertion is weaker than it was -- with one count there is nothing for
+// it to differ from -- and it is kept as a regression guard on the message a
+// user reads for a commit fu itself authors.
+func TestRevertCommitMessageStatesTheCountTheUserAsked(t *testing.T) {
+	s, _ := setupStore(t)
+	if _, err := NewSkill(s, nil, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	edited := filepath.Join(s.SkillsDir(), "alpha", "SKILL.md")
+	if err := os.WriteFile(edited, []byte("hand edited"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RevertOperations(s, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.Log(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 || !strings.HasPrefix(entries[0].Message, "revert: back 1 operation") {
+		t.Fatalf("fu revert 1 must report back 1 operation(s), got %q", entries[0].Message)
+	}
+}
+
+// TestRevertRebuildsLinksFromThePostRevertConfig pins SPEC:148's "链接随之重建"
+// for revert: the link layer must be reconciled against the config the revert
+// actually landed on, not the copy loaded before it ran.
+//
+// Both directions are walked because each fails in its own way and only one of
+// them is visibly wrong. Reverting a disable leaves fu.yaml saying enabled with
+// no link to show for it -- annoying, and `fu status` names it. Reverting an
+// enable leaves fu.yaml saying disabled while the link is still live, so fu
+// reports the skill as off and the agent loads it every session anyway; that is
+// the direction worth a test of its own.
+//
+// The agent list is deliberately non-empty. Every other revert test in this
+// file passes nil, which makes the reconcile pass a no-op and is precisely why
+// this defect survived a suite that already had a test named for it
+// (scenario_test.go's scenario 5, which called Store.Revert and the public
+// Reconcile separately -- and the public Reconcile reloads the config from
+// disk, so it passed for the reason the product failed).
+func TestRevertRebuildsLinksFromThePostRevertConfig(t *testing.T) {
+	t.Run("reverting a disable puts the link back", func(t *testing.T) {
+		s, _ := setupStore(t)
+		dir := t.TempDir()
+		agents := []agent.Agent{fakeAgent{"claude", dir}}
+		if _, err := NewSkill(s, agents, "alpha"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := SetGlobal(s, agents, "alpha", false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, "alpha")); !os.IsNotExist(err) {
+			t.Fatalf("precondition: disable must have removed the link, err=%v", err)
+		}
+
+		if _, err := RevertOperations(s, agents, 1); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg, err := store.LoadConfig(s.ConfigPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.Enabled("alpha") {
+			t.Fatal("precondition: revert must have restored enabled: true in fu.yaml")
+		}
+		if _, err := os.Readlink(filepath.Join(dir, "alpha")); err != nil {
+			t.Fatalf("fu.yaml says enabled, so the link must be back: %v", err)
+		}
+	})
+
+	t.Run("reverting an enable takes the link away", func(t *testing.T) {
+		s, _ := setupStore(t)
+		dir := t.TempDir()
+		agents := []agent.Agent{fakeAgent{"claude", dir}}
+		if _, err := NewSkill(s, agents, "alpha"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := SetGlobal(s, agents, "alpha", false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := SetGlobal(s, agents, "alpha", true); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Readlink(filepath.Join(dir, "alpha")); err != nil {
+			t.Fatalf("precondition: enable must have created the link: %v", err)
+		}
+
+		if _, err := RevertOperations(s, agents, 1); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg, err := store.LoadConfig(s.ConfigPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Enabled("alpha") {
+			t.Fatal("precondition: revert must have restored enabled: false in fu.yaml")
+		}
+		// The dangerous half: a live link under a config that says the skill is
+		// off means fu reports it disabled while the agent still loads it.
+		if _, err := os.Lstat(filepath.Join(dir, "alpha")); !os.IsNotExist(err) {
+			t.Fatalf("fu.yaml says disabled, so the link must be gone, err=%v", err)
+		}
+	})
+}
+
+// TestRevertCountsOperationsNotRawCommits pins what "n operations back" means
+// when history already holds an external sweep commit.
+//
+// SPEC:177 lists the operations revert counts -- add, rm, adopt, new, update,
+// enable, disable, revert -- and an external sweep is not among them; it is
+// the bookkeeping entry a write command makes *before* its own operation. The
+// skip adjustment in RevertOperations already agreed with that reading, but it
+// only compensated for the sweep this very call performs. A sweep sitting in
+// the window from some earlier command still consumed one of the n the user
+// asked for, so `fu revert 2` here undid one real operation and one piece of
+// fu's own bookkeeping, and left the other operation in place.
+//
+// The fixture puts the sweep strictly inside the window: gamma and beta are
+// the two operations to undo, and the external commit from alpha's hand edit
+// sits between them.
+func TestRevertCountsOperationsNotRawCommits(t *testing.T) {
+	s, _ := setupStore(t)
+	if _, err := NewSkill(s, nil, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSkill(s, nil, "beta"); err != nil {
+		t.Fatal(err)
+	}
+	// Swept into its own commit by the next write command, so it lands between
+	// new: beta and new: gamma.
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "alpha", "SKILL.md"), []byte("hand edited"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSkill(s, nil, "gamma"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.Log(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries[1].Message != "external: manual modifications" {
+		t.Fatalf("precondition: the sweep must sit inside the count window, got %+v", entries)
+	}
+
+	// Two operations back from here is new: beta's parent -- gamma and beta
+	// both undone, alpha still present.
+	if _, err := RevertOperations(s, nil, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(s.SkillsDir(), "gamma")); !os.IsNotExist(err) {
+		t.Fatalf("revert 2 must undo new: gamma, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.SkillsDir(), "beta")); !os.IsNotExist(err) {
+		t.Fatalf("revert 2 must undo new: beta too -- the external sweep in between is not an operation, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.SkillsDir(), "alpha", "SKILL.md")); err != nil {
+		t.Fatalf("revert 2 must not reach past beta into new: alpha: %v", err)
+	}
+}
+
+// TestRevertDoesNotCountFusOwnRecoveryCompensationAsAnOperation pins the rule
+// resolveOperationsBack's comment has always stated -- SPEC §5.3's list of
+// operations -- against the one-item blacklist the code actually implemented.
+//
+// fu writes two kinds of bookkeeping commit, not one. The sweep's "external:
+// manual modifications" was skipped; the recovery pass's "recover: roll back
+// interrupted <op>" (new_txn.go) was not, so it counted as a user operation.
+//
+// The timing is not hypothetical, it is the normal one: RevertOperations runs
+// RecoverPendingReporting inside its own lock, before its sweep. So a
+// `fu revert 1` issued straight after a crashed `fu new gamma` writes the
+// compensation commit itself and then reverts that -- resurrecting gamma,
+// leaving the user's actual last operation (beta) untouched, and exiting 0.
+// revert is precisely the command a user reaches for after something has gone
+// wrong, which is exactly the state this got wrong.
+//
+// Both halves of the pair have to be skipped, not just the compensation: an
+// interrupted operation that was rolled back nets to zero and was never an
+// operation the user completed.
+func TestRevertDoesNotCountFusOwnRecoveryCompensationAsAnOperation(t *testing.T) {
+	s, _ := setupStore(t)
+	if _, err := NewSkill(s, nil, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSkill(s, nil, "beta"); err != nil {
+		t.Fatal(err)
+	}
+	// Crash gamma after its commit, leaving a committed, unrecovered
+	// transaction -- the state the next command's recovery pass compensates.
+	interrupted := errors.New("interrupted after commit")
+	outcome := OperationOutcome{}
+	if _, err := newSkillTracked(s, nil, "gamma", hooks{
+		afterCommit: func() error { return interrupted },
+	}, &outcome); !errors.Is(err, interrupted) {
+		t.Fatalf("new error = %v, want %v", err, interrupted)
+	}
+	if !outcome.Committed || !outcome.RecoveryPending {
+		t.Fatalf("setup check: need a committed, unrecovered transaction: %+v", outcome)
+	}
+
+	// This call recovers first (writing the compensation commit), then reverts.
+	if _, err := RevertOperations(s, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// gamma was rolled back by the recovery pass and must stay rolled back:
+	// counting the compensation as an operation made revert undo it, which put
+	// gamma back on disk and in fu.yaml.
+	if _, err := os.Stat(filepath.Join(s.SkillsDir(), "gamma")); !os.IsNotExist(err) {
+		t.Fatalf("revert must not resurrect the rolled-back skill, err=%v", err)
+	}
+	cfg, err := store.LoadConfig(s.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HasSkill("gamma") {
+		t.Fatal("revert must not re-register the skill fu itself judged invalid")
+	}
+	// beta is the user's real last operation and is what `revert 1` means.
+	if _, err := os.Stat(filepath.Join(s.SkillsDir(), "beta")); !os.IsNotExist(err) {
+		t.Fatalf("revert 1 must undo the user's last operation (new: beta), err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.SkillsDir(), "alpha", "SKILL.md")); err != nil {
+		t.Fatalf("revert 1 must not reach past beta into new: alpha: %v", err)
+	}
+}
+
+// TestRevertOutOfRangeMessageCountsOnlyOperations pins the count the refusal
+// reports. `operations++` fired before the parentless check, so the root
+// commit `init: store` -- which can never be a revert target, and is not in
+// SPEC §5.3's list -- was included: a store with four real operations told the
+// user it held five and then refused to go back five.
+func TestRevertOutOfRangeMessageCountsOnlyOperations(t *testing.T) {
+	s, _ := setupStore(t)
+	if _, err := NewSkill(s, nil, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := RevertOperations(s, nil, 9)
+	if err == nil {
+		t.Fatal("revert past the beginning of history must fail")
+	}
+	// One operation (new: alpha) over the init commit.
+	if !strings.Contains(err.Error(), "holds 1 operation(s)") {
+		t.Fatalf("the refusal must count operations, not commits: %v", err)
+	}
+}

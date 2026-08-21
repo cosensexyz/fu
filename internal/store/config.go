@@ -642,9 +642,14 @@ func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *che
 	defer displaced.Close()
 	previousBytes, err := readAllRegularFile(displaced, configSwapName, displacedStat, MaxConfigBytes)
 	if err == nil && identityFromStat(&displacedStat) == previousIdentity && bytes.Equal(previousBytes, expect) {
-		// The precondition held. Retain the superseded inode unchanged: a path
-		// outside fu may be a hard link to it, and an external process may still
-		// hold a descriptor for it after the exchange.
+		// The precondition held. The superseded inode is archived rather than
+		// modified: a path outside fu may be a hard link to it, and an external
+		// process may still hold a descriptor for it after the exchange, so it
+		// must never be truncated or rewritten in place. The archive name it
+		// lands under is not retained, though -- completeConfigExchange below
+		// runs reclaimConfigExchangeResidue, which unlinks that name as soon as
+		// the terminal marker is durable. Only the object's contents are
+		// preserved from modification; the link is transient by design.
 		if archiveErr := archiveNamedConfigEntry(scratch, configSwapName, archive, previousIdentity); archiveErr != nil {
 			return fmt.Errorf("archive the displaced %s parked at %s without modifying it: %w", targetPath, scratchPath, archiveErr)
 		}

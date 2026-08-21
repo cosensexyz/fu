@@ -109,12 +109,27 @@ func (a *Application) PruneRecovery() (PruneOutcome, error) {
 	return PruneCompletedTransactions(st)
 }
 
-func readDiagnostics(st *store.Store, cfg *store.Config) ReadDiagnostics {
+// readDiagnostics collects the config-level findings every read command
+// carries. agents is what a caller passes when its command also reports
+// per-agent findings, and nil when it does not.
+//
+// The suppression matters only for the first kind. A name an agent reserves is
+// reported by that agent's own ReportReserved finding in the terms the user
+// needs -- "reserved name, never linked codex/.system" -- and repeating it here
+// as "invalid: skill name \".system\" fails validation" describes one fact
+// twice in two vocabularies, on two different streams. Write commands already
+// suppressed it through alreadyReportedAsReserved (reconcile.go); this path did
+// not, because before `fu status` no read command produced both channels at
+// once.
+func readDiagnostics(st *store.Store, cfg *store.Config, agents []agent.Agent) ReadDiagnostics {
 	diagnostics := ReadDiagnostics{
 		ConfigPath:    st.ConfigPath(),
 		VersionTooNew: cfg.VersionTooNew(),
 	}
 	for _, invalid := range cfg.InvalidNames() {
+		if alreadyReportedAsReserved(agents, invalid) {
+			continue
+		}
 		diagnostics.InvalidNames = append(diagnostics.InvalidNames, InvalidConfigName{
 			Name: invalid.Name, Reason: invalid.Reason,
 		})
@@ -134,13 +149,77 @@ func (a *Application) readStore() (*store.Store, *store.Config, error) {
 	return st, cfg, nil
 }
 
+// StatusOutcome pairs the report with the diagnostics every read command
+// carries, so the CLI prints both from one call.
+type StatusOutcome struct {
+	Report      StatusReport
+	Diagnostics ReadDiagnostics
+}
+
+// Status assembles the read-only consistency report. Like ListSkills it takes
+// no lock and writes nothing.
+//
+// Whatever Status assembled before it failed is returned with the error, never
+// instead of it: Status reads the store-side facts after the agents precisely
+// so one damaged journal family costs the user that section rather than the
+// whole report, and dropping the partial report here would undo that one step
+// later. `fu gc` isolates the same damage per family and still reports what it
+// did. The only failure that yields nothing is one that leaves no report to
+// return -- a store that cannot be opened or a config that cannot be read.
+func (a *Application) Status() (StatusOutcome, error) {
+	st, cfg, err := a.readStore()
+	if err != nil {
+		return StatusOutcome{}, err
+	}
+	agents := a.detectedAgents()
+	report, statusErr := Status(st, cfg, agents)
+	return StatusOutcome{Report: report, Diagnostics: readDiagnostics(st, cfg, inspectedAgents(agents, report))}, statusErr
+}
+
+// inspectedAgents drops the agents Status could not scan, so the suppression
+// in readDiagnostics is asked about agents that actually produced findings.
+//
+// alreadyReportedAsReserved interrogates the agent *list*: some agent reserves
+// the name, therefore some agent's ReportReserved explains it. That inference
+// is exactly one step too long here. Status returns before Desired runs for an
+// agent whose ScanAgent failed (status.go), so no ReportReserved exists for it,
+// and standing the config-level `invalid:` line down on its behalf left a
+// reserved-and-invalid name reported on neither stream -- `fu status` exiting 0
+// having said nothing, while `fu list` still printed the line and `fu enable`
+// still failed on it.
+//
+// Filtering the input rather than teaching the predicate about scan failures
+// keeps the write path's own caller (configInvalidNames, reconcile.go)
+// untouched: there a scan failure lands in Result.Failed and the command exits
+// 1, so nothing is silently withheld.
+func inspectedAgents(agents []agent.Agent, report StatusReport) []agent.Agent {
+	failed := make(map[string]bool, len(report.Agents))
+	for _, status := range report.Agents {
+		if status.ScanErr != "" {
+			failed[status.Name] = true
+		}
+	}
+	if len(failed) == 0 {
+		return agents
+	}
+	kept := make([]agent.Agent, 0, len(agents))
+	for _, detected := range agents {
+		if !failed[detected.Name()] {
+			kept = append(kept, detected)
+		}
+	}
+	return kept
+}
+
 func (a *Application) ListSkills() (ListOutcome, error) {
 	st, cfg, err := a.readStore()
 	if err != nil {
 		return ListOutcome{}, err
 	}
 	agents := a.detectedAgents()
-	outcome := ListOutcome{Diagnostics: readDiagnostics(st, cfg)}
+	// nil agents: `fu list` prints no per-agent reserved finding, so this
+	// diagnostic is the only channel a reserved-and-invalid name has here.
+	outcome := ListOutcome{Diagnostics: readDiagnostics(st, cfg, nil)}
 	for _, detected := range agents {
 		outcome.Agents = append(outcome.Agents, detected.Name())
 	}
@@ -162,7 +241,9 @@ func (a *Application) ShowSkill(name string) (ShowOutcome, error) {
 	if err != nil {
 		return ShowOutcome{}, err
 	}
-	outcome := ShowOutcome{Name: name, Diagnostics: readDiagnostics(st, cfg)}
+	// nil agents for the same reason as ListSkills, and one more: the
+	// unknown-skill error below reads the name back out of these diagnostics.
+	outcome := ShowOutcome{Name: name, Diagnostics: readDiagnostics(st, cfg, nil)}
 	if !cfg.HasSkill(name) {
 		for _, invalid := range outcome.Diagnostics.InvalidNames {
 			if invalid.Name == name {
@@ -314,4 +395,26 @@ func (a *Application) RemoveSkill(name string) (RemoveOutcome, error) {
 		return RemoveOutcome{Name: name, Operation: OperationOutcome{Name: name}}, err
 	}
 	return removeSkill(st, a.detectedAgents(), name, a.hooks)
+}
+
+// Restore repairs the link layer and, when hard is set, discards uncommitted
+// content in the store's own worktree instead of merely reporting it; see
+// engine.Restore's doc comment for exactly what hard does and does not touch.
+func (a *Application) Restore(hard bool) (RestoreOutcome, error) {
+	st, err := a.openStore()
+	if err != nil {
+		return RestoreOutcome{}, err
+	}
+	return Restore(st, a.detectedAgents(), hard)
+}
+
+// Revert rolls the store back n operations; see RevertOperations' doc comment
+// for why it sweeps pending hand edits into history first rather than
+// refusing the way `git revert` does.
+func (a *Application) Revert(n int) (RevertOutcome, error) {
+	st, err := a.openStore()
+	if err != nil {
+		return RevertOutcome{}, err
+	}
+	return RevertOperations(st, a.detectedAgents(), n)
 }

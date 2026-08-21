@@ -459,6 +459,95 @@ func TestPruneKeepsProblemsAccumulatedBeforeAHardFailure(t *testing.T) {
 // in question. Skipping those too let one malformed journal filename pin every
 // rm family ever settled -- which is nearly all of them, because the inline
 // reclaim collects the payload the moment its transaction completes.
+// orphanedRemoveManifest returns the ownership manifest the crashed rm
+// family's still-unpruned journal carries: the same record `fu gc` reclaims
+// the orphaned payload by, and the one thing that makes an interrupted
+// disposal resumable.
+func orphanedRemoveManifest(t *testing.T, s *store.Store) store.OwnedTree {
+	t.Helper()
+	journal, err := scanTxnJournalReport(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key := range journal.completed {
+		if key.op != "rm" {
+			continue
+		}
+		latest, err := validateTxnChain(s, key, journal.revisions[key])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if latest.Payload == nil {
+			t.Fatal("the completed rm family must carry its payload manifest")
+		}
+		return *latest.Payload
+	}
+	t.Fatal("no completed rm family left by the crash")
+	return store.OwnedTree{}
+}
+
+// TestPruneKeepsFamilyWhosePayloadIsParkedAtItsRetiredRootName pins the other
+// half of the "vanished payload needs no pending set" rule below. Disposal is
+// not one syscall: RemoveOwnedTreeAt empties the tree, renames the root to a
+// sibling derived from the manifest, and only then unlinks it, so a crash
+// between the last two steps frees the live payload name while the emptied root
+// remains. Judging that state by the live name alone answers "settled" and
+// prunes the family -- destroying the one manifest RemoveOwnedTreeAt could have
+// resumed from, after which nothing collects the retired root while `fu status`
+// goes on counting it collectable (status.go).
+func TestPruneKeepsFamilyWhosePayloadIsParkedAtItsRetiredRootName(t *testing.T) {
+	crashRemoveAfterTxnClearedChild()
+
+	home := runCrashedRemove(t, "TestPruneKeepsFamilyWhosePayloadIsParkedAtItsRetiredRootName")
+	s, err := store.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := orphanedRemovePayload(t, s)
+	manifest := orphanedRemoveManifest(t, s)
+
+	// Reproduce the interrupted disposal through the same two steps
+	// RemoveOwnedTreeAt performs in that order, so the fixture cannot drift
+	// from the protocol it stands for.
+	payloadDir, err := os.Open(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveOwnedContents(payloadDir, manifest); err != nil {
+		_ = payloadDir.Close()
+		t.Fatal(err)
+	}
+	if err := payloadDir.Close(); err != nil {
+		t.Fatal(err)
+	}
+	retired := filepath.Join(s.RecoveryDir(),
+		store.RetiredRecoveryRootName(filepath.Base(payload), manifest))
+	if err := os.Rename(payload, retired); err != nil {
+		t.Fatal(err)
+	}
+
+	// A malformed pending journal name makes the claims read fail, which is the
+	// branch that consults the payload directly instead of the pending set.
+	malformed := filepath.Join(s.RecoveryDir(), "txn-adopt-not-a-record.json")
+	if err := os.WriteFile(malformed, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := PruneCompletedTransactions(s); err == nil {
+		t.Fatal("a malformed journal filename must still be reported")
+	}
+	remaining, globErr := filepath.Glob(filepath.Join(s.RecoveryDir(), "txn-rm-*"))
+	if globErr != nil {
+		t.Fatal(globErr)
+	}
+	if len(remaining) == 0 {
+		t.Fatal("pruning the family strands the retired root: its manifest was the only way to resume the disposal")
+	}
+	if _, err := os.Lstat(retired); err != nil {
+		t.Fatalf("the retired root must be left in place for a later resume: %v", err)
+	}
+}
+
 func TestPruneSettlesAFamilyWhoseVanishedPayloadNeedsNoPendingSet(t *testing.T) {
 	s, _ := setupStore(t)
 	dir := t.TempDir()
@@ -486,5 +575,73 @@ func TestPruneSettlesAFamilyWhoseVanishedPayloadNeedsNoPendingSet(t *testing.T) 
 	}
 	if len(remaining) != 0 {
 		t.Fatalf("an already-settled rm family must prune even when the pending set is unreadable, left %v (err=%v)", remaining, err)
+	}
+}
+
+// TestPruneFinishesADisposalParkedAtItsRetiredRootName is the positive half of
+// TestPruneKeepsFamilyWhosePayloadIsParkedAtItsRetiredRootName above. That one
+// asserts gc leaves the retired root and its family alone; then it ends. Why
+// leaving them is the right answer -- that a later gc, with the manifest still
+// in place, actually finishes the disposal -- was never asserted anywhere.
+//
+// The gap was specific: retire_test.go covers resuming from an inner retired
+// leaf and an inner retired directory, and the failure branch for a retired
+// root, but not RemoveOwnedTreeAt's `!livePresent && retiredPresent` success
+// branch -- which is the entire reason RecoveryPayloadSettled checks two names
+// instead of one. Without it, a regression in finishRetiredOwnedDirectory
+// would strand the retired root forever while `fu status` kept counting it
+// collectable: exactly the failure that check exists to prevent.
+//
+// Same fixture as its negative twin, minus the malformed journal name, so this
+// is the ordinary run that follows a repaired one.
+func TestPruneFinishesADisposalParkedAtItsRetiredRootName(t *testing.T) {
+	crashRemoveAfterTxnClearedChild()
+
+	home := runCrashedRemove(t, "TestPruneFinishesADisposalParkedAtItsRetiredRootName")
+	s, err := store.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := orphanedRemovePayload(t, s)
+	manifest := orphanedRemoveManifest(t, s)
+
+	// The interrupted disposal, reproduced through the same two steps
+	// RemoveOwnedTreeAt performs in that order.
+	payloadDir, err := os.Open(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveOwnedContents(payloadDir, manifest); err != nil {
+		_ = payloadDir.Close()
+		t.Fatal(err)
+	}
+	if err := payloadDir.Close(); err != nil {
+		t.Fatal(err)
+	}
+	retired := filepath.Join(s.RecoveryDir(),
+		store.RetiredRecoveryRootName(filepath.Base(payload), manifest))
+	if err := os.Rename(payload, retired); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome, err := PruneCompletedTransactions(s)
+	if err != nil {
+		t.Fatalf("gc must resume the interrupted disposal, not report a problem: %v", err)
+	}
+	if outcome.Transactions == 0 {
+		t.Fatalf("the family must be pruned once its payload is disposed of: %+v", outcome)
+	}
+	if _, err := os.Lstat(retired); !os.IsNotExist(err) {
+		t.Fatalf("the retired root must be collected, not left forever, stat err=%v", err)
+	}
+	if _, err := os.Lstat(payload); !os.IsNotExist(err) {
+		t.Fatalf("the live payload name must stay gone, stat err=%v", err)
+	}
+	remaining, globErr := filepath.Glob(filepath.Join(s.RecoveryDir(), "txn-rm-*"))
+	if globErr != nil {
+		t.Fatal(globErr)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("the family's journal must be pruned once the disposal completed: %v", remaining)
 	}
 }

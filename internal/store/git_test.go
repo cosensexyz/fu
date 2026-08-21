@@ -1544,3 +1544,45 @@ func TestSessionProjectionCommitsEveryEntryKind(t *testing.T) {
 		t.Error("the session projection must converge after committing every entry kind")
 	}
 }
+
+// TestOperationVerbsCoverEveryMessageProducingCommand guards the coupling
+// resolveOperationsBack now depends on: a whitelist is only safe while it
+// actually lists every operation. A new write command whose verb is missing
+// here would be silently skipped by `fu revert n`, which would then reach one
+// operation too far back -- the same class of silent wrongness the blacklist
+// produced in the other direction.
+//
+// The verbs are checked against the message forms the engine builds
+// (ops.go "new: "/"<verb>: "/"<verb>: <name> --agent <a>", add.go "add: ",
+// rm.go "rm: ", adopt.go "adopt: ", and this package's own "revert: back ...").
+// SPEC §5.3 is the source of the list; this asserts the parser accepts each
+// message shape those sites produce, and rejects fu's two bookkeeping forms.
+func TestOperationVerbsCoverEveryMessageProducingCommand(t *testing.T) {
+	for _, msg := range []string{
+		"new: alpha",
+		"add: alpha",
+		"rm: alpha",
+		"adopt: alpha",
+		"update: alpha",
+		"enable: alpha",
+		"disable: alpha",
+		"enable: alpha --agent claude",
+		"disable: alpha --agent codex",
+		"revert: back 2 operation(s) to abc1234",
+	} {
+		if !IsOperationMessage(msg) {
+			t.Errorf("%q must count as an operation (SPEC §5.3)", msg)
+		}
+	}
+	for _, msg := range []string{
+		ExternalCommitMessage,
+		RecoveryCompensationPrefix + "new: alpha",
+		"init: store",
+		"",
+		"no colon here",
+	} {
+		if IsOperationMessage(msg) {
+			t.Errorf("%q is not one of SPEC §5.3's operations", msg)
+		}
+	}
+}

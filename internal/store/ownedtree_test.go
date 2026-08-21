@@ -147,6 +147,104 @@ func TestReclaimRecoveryPayloadOwnedRejectsReservedName(t *testing.T) {
 	}
 }
 
+// TestRecoveryPayloadSettledRejectsReservedName is the mirror of the guard
+// above, on the disposal counterpart's read-only twin.
+//
+// RecoveryPayloadSettled and ReclaimRecoveryPayloadOwned are reached with the
+// same kind of name -- one taken straight off a completed family's Name field,
+// which nothing on the prune path validates: decodeTxnFile checks op, id,
+// sequence and digest, while validateRemoveTxn's skill.ValidateName runs only
+// in the recovery handlers. A hand-edited journal carrying a traversal in Name
+// would otherwise put this fstatat outside recovery/. Its twin has had a test
+// since it was written; this one is a stat rather than a deletion, but the
+// whole file rests on the discipline and the pair must not be asymmetric about
+// it -- least of all in the tests, where the asymmetry is what lets one copy
+// be deleted while the suite stays green.
+func TestRecoveryPayloadSettledRejectsReservedName(t *testing.T) {
+	checked, manifest, payload := ownedRecoveryFixture(t, true)
+	reserved := ownedArchiveName(payload, manifest)
+	settled, err := checked.RecoveryPayloadSettled(reserved, manifest)
+	if err == nil || !strings.Contains(err.Error(), "public single-component name") {
+		t.Fatalf("reserved payload name %q must be refused, got settled=%v err=%v", reserved, settled, err)
+	}
+	if settled {
+		t.Fatal("a refused name must never be reported settled")
+	}
+}
+
+// interruptReclaimAtRetiredRoot reproduces the exact durable state
+// RemoveOwnedTreeAt leaves behind when the process dies between the root's
+// retirement rename and the rmdir that immediately follows it: the contents are
+// already gone, the live payload name is free, and the emptied root sits at the
+// deterministic sibling derived from the manifest. It drives the same two steps
+// RemoveOwnedTreeAt runs in that order (retire.go) rather than hand-building a
+// directory, so the fixture cannot drift from the protocol it stands for.
+func interruptReclaimAtRetiredRoot(t *testing.T, s *Store, payload string, manifest OwnedTree) string {
+	t.Helper()
+	payloadDir := filepath.Join(s.RecoveryDir(), payload)
+	root, err := os.Open(payloadDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := removeOwnedDirectoryContents(root, "", manifest); err != nil {
+		_ = root.Close()
+		t.Fatal(err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
+	retired := ownedCleanupRetiredName(".fu-retired-dir-", payload, manifest.RootIdentity)
+	if err := os.Rename(payloadDir, filepath.Join(s.RecoveryDir(), retired)); err != nil {
+		t.Fatal(err)
+	}
+	return retired
+}
+
+func TestRecoveryPayloadSettledReportsLivePayloadUnsettled(t *testing.T) {
+	checked, manifest, payload := ownedRecoveryFixture(t, true)
+
+	settled, err := checked.RecoveryPayloadSettled(payload, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settled {
+		t.Fatal("a payload still standing at its live name has not been disposed of")
+	}
+}
+
+// TestRecoveryPayloadSettledReportsRetiredRootUnsettled pins the state an
+// active-name-only check cannot see. RemoveOwnedTreeAt's retirement protocol
+// spans two names, and the manifest is what lets it resume from the second one;
+// answering "settled" here is what lets `fu gc` prune the journal carrying that
+// manifest, after which nothing can ever collect the retired root.
+func TestRecoveryPayloadSettledReportsRetiredRootUnsettled(t *testing.T) {
+	checked, manifest, payload := ownedRecoveryFixture(t, true)
+	retired := interruptReclaimAtRetiredRoot(t, checked, payload, manifest)
+
+	settled, err := checked.RecoveryPayloadSettled(payload, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settled {
+		t.Fatalf("an interrupted reclaim parked at %q still needs its manifest to resume", retired)
+	}
+}
+
+func TestRecoveryPayloadSettledReportsFullyReclaimedPayloadSettled(t *testing.T) {
+	checked, manifest, payload := ownedRecoveryFixture(t, true)
+	if err := checked.ReclaimRecoveryPayloadOwned(payload, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	settled, err := checked.RecoveryPayloadSettled(payload, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settled {
+		t.Fatal("a fully reclaimed payload holds nothing under either name")
+	}
+}
+
 func TestOwnedTreeCleanupPreservesEntryReplacedAtRemovalBoundary(t *testing.T) {
 	checked, manifest, payload := ownedRecoveryFixture(t, true)
 	foreignBytes := []byte("foreign replacement")
