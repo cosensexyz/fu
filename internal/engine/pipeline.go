@@ -65,8 +65,16 @@ type Op struct {
 	// no error return by construction: the operation has already succeeded
 	// durably by the time it runs, so nothing it does may change the command's
 	// result. Only transaction operations have a terminal marker, so it is
-	// ignored when Txn is nil. rm sets it to reclaim its quarantined payload;
-	// every other operation leaves it nil.
+	// ignored when Txn is nil. Two operations set it: rm reclaims its
+	// quarantined payload (rm.go) and update reclaims the tree its exchange
+	// left in staging (update.go); every other operation leaves it nil.
+	//
+	// The set matters to anyone adding a third, because the whole correctness
+	// argument for this callback is an ordering rule -- it runs strictly after
+	// the terminal marker, so nothing it does can ever be a recovery
+	// precondition. DESIGN §6 states the same pair; this is the third distinct
+	// place that statement lives, and it has now been found stale in two of
+	// them, so keep them in step.
 	afterTxnCleared func(st *store.Store)
 	outcome         *OperationOutcome
 }
@@ -202,6 +210,7 @@ type hooks struct {
 	afterSnapshot               func() error       // rm: content snapshotted, not yet quarantined
 	afterQuarantine             func() error       // rm: content quarantined, config not yet touched
 	beforeReclaim               func() error       // rm: WAL cleared, quarantined payload not yet reclaimed
+	beforeUpdateReclaim         func() error       // update: WAL cleared, replaced tree still at staging/<name>
 	afterAdoptSwitch            func() error       // adopt: first agent switched, rest pending
 	beforeAdoptRetire           func() error       // adopt: original approved, retirement not yet attempted
 	afterAdoptRetire            func() error       // adopt: original retired, exact archive not yet copied

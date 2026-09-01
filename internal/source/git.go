@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -45,6 +46,11 @@ func cloneRef(ctx context.Context, src Source, dir string, ref plumbing.Referenc
 // user-supplied ref is tried as a branch first, then as a tag -- go-git's
 // error for a missing branch is a transport-level one that does not say
 // whether the name exists as a tag, so both forms are probed.
+//
+// The probe is only for a ref whose form is unknown. When src.RefKind names
+// one, that form alone is cloned: a recorded ref_kind is the answer the probe
+// exists to guess at, and guessing again could resolve a deleted branch to a
+// same-named tag and silently change what the skill tracks (Source.RefKind).
 func cloneSource(src Source, dir string, reset func() error) (LockInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -80,6 +86,35 @@ func cloneSourceWithContextBudget(ctx context.Context, src Source, dir string, r
 			return repo, head.Name(), "branch", nil
 		}
 		branch, tag := plumbing.NewBranchReferenceName(src.Ref), plumbing.NewTagReferenceName(src.Ref)
+		switch src.RefKind {
+		case "branch":
+			repo, ref, kind, err := cloneRef(ctx, src, dir, branch, "branch", budget, clone)
+			if err != nil {
+				return nil, "", "", fmt.Errorf("clone URL %s with recorded branch %q: %w", src.URL, src.Ref, err)
+			}
+			return repo, ref, kind, nil
+		case "tag":
+			repo, ref, kind, err := cloneRef(ctx, src, dir, tag, "tag", budget, clone)
+			if err != nil {
+				return nil, "", "", fmt.Errorf("clone URL %s with recorded tag %q: %w", src.URL, src.Ref, err)
+			}
+			return repo, ref, kind, nil
+		case "":
+			// No recorded kind, so there is nothing to honour and the
+			// branch-then-tag probe below is the answer. This is the `fu add`
+			// path -- ParseArgWithRef never sets RefKind (source.go) -- and it
+			// is the only arm permitted to guess.
+		default:
+			// Fail closed. A bare `!= "branch"` test let an unrecognised value
+			// fall into the probe, which is the guessing a recorded kind exists
+			// to remove, and it would probe an unstripped ref besides:
+			// shortRecordedRef leaves a kind it does not recognise alone, so
+			// the attempt would be for refs/heads/refs/heads/<ref>. Refusing is
+			// also the only answer that keeps the promise this switch makes --
+			// that a recorded kind names the one form cloned -- for a value the
+			// switch cannot interpret.
+			return nil, "", "", fmt.Errorf("clone URL %s: unrecognized recorded ref kind %q for ref %q", src.URL, src.RefKind, src.Ref)
+		}
 		repo, ref, kind, err := cloneRef(ctx, src, dir, branch, "branch", budget, clone)
 		if err == nil {
 			return repo, ref, kind, nil
@@ -239,6 +274,16 @@ func (s Source) prepare(stagingDir string, stagingIdentity store.FileIdentity) (
 		}
 		return &Prepared{src: s, dir: scratch.Path(), root: scratch.root, lock: lock, cleanup: scratch.Close}, nil
 	case KindLocal:
+		// Defence in depth, the local counterpart to ResolveRemoteRef's
+		// empty-URL refusal. openPreparedRoot opens whatever it is handed, so a
+		// relative recorded path resolves against the process's working
+		// directory and would prepare a source from a directory the record does
+		// not name. judgeLocalUpdate holds the primary guard one layer up
+		// (internal/engine/outdated.go); this refuses nothing fu can write,
+		// since ParseArg absolutizes and resolves symlinks before recording.
+		if !filepath.IsAbs(s.Path) {
+			return nil, fmt.Errorf("local source path %q must be absolute", s.Path)
+		}
 		root, err := openPreparedRoot(s.Path)
 		if err != nil {
 			return nil, fmt.Errorf("local source %s: %w", s.Path, err)

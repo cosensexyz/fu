@@ -21,6 +21,15 @@ import (
 // exactly what this closes.
 var lockAcquiredHook func(displayPath string)
 
+// lockReleasedHook observes the end of each fu.lock critical section. It is the
+// other edge of lockAcquiredHook, and exists because the rule that matters --
+// design §4.4's "no network I/O while the lock is held" -- is about an
+// interval, not a point. With only the opening edge, a test can assert at best
+// that some work precedes the first acquisition ever made, which stops being
+// the same statement as soon as a command legitimately takes and releases the
+// lock earlier (writeCommandPrologue). Nil in production, set only by tests.
+var lockReleasedHook func(displayPath string)
+
 // withLock serializes write commands across fu processes; read commands
 // never take the lock (DESIGN §6).
 func withLock(root *os.Root, lockName, displayPath string, fn func() error) error {
@@ -52,6 +61,15 @@ func withLock(root *os.Root, lockName, displayPath string, fn func() error) erro
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX); err != nil {
 		return fmt.Errorf("acquire lock %s: %w", displayPath, err)
 	}
+	// Registered before the unlock defer so that it runs after it: defers are
+	// LIFO, and a hook firing while the lock was still held would report an edge
+	// that has not happened yet -- which is the one thing a test measuring the
+	// held interval cannot tolerate.
+	defer func() {
+		if lockReleasedHook != nil {
+			lockReleasedHook(displayPath)
+		}
+	}()
 	defer unix.Flock(int(file.Fd()), unix.LOCK_UN)
 	if lockAcquiredHook != nil {
 		lockAcquiredHook(displayPath)

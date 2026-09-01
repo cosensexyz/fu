@@ -22,19 +22,50 @@ type StatusReport struct {
 }
 
 // StagingInventory counts what the staging area is holding, bucketed the same
-// way RecoveryInventory is -- by what the user can do about each -- but with
-// three buckets where recovery has four. The missing one is Retained: staging
-// holds no authority SPEC §9 promises, only work in progress and what a
-// process exit left of it. Nothing here is collectable either, in recovery's
-// sense of the word: `fu gc` never looks at staging at all.
+// way RecoveryInventory is -- by what the user can do about each. It has the
+// same four buckets recovery does, though not the same four: staging holds no
+// authority SPEC §9 promises, so there is no Retained bucket, and Unmatched
+// takes its place -- a bucket recovery has no counterpart for.
 //
-// That every cleanup path in staging is an in-process defer is exactly why the
-// second bucket exists. A source scratch is removed by its own constructor's
-// failure path or by Close (source/scratch.go); a private staged root by the
-// reservation's cleanup (ownedtree.go). All of them are correct while the
-// process lives and none of them run again afterwards, so a process exit
-// strands names that no later run enumerates the directory to collect.
+// Collectable was not always one of these, and the other three still cover
+// far more ground: until update learned to leave the tree it replaced
+// orphaned at staging/<name> -- which happens on either of two faults, a
+// crash before its own inline reclaim runs, or that reclaim running and
+// failing, since it drops its own error (reclaimExchangedUpdatePayload,
+// update.go) -- `fu gc` never looked at staging at all. That single residue
+// class is still the only staging content any collector reaches; everything
+// else here is settled by a recovery pass, by nothing, or by whoever put it
+// there.
+//
+// That every one of those other cleanup paths is an in-process defer is why
+// Uncollectable exists at all. A source scratch is removed by its own
+// constructor's failure path or by Close (source/scratch.go); a private
+// staged root by the reservation's cleanup (ownedtree.go). All of them are
+// correct while the process lives and none of them run again afterwards, so a
+// process exit strands names that no later run enumerates the directory to
+// collect.
 type StagingInventory struct {
+	// Collectable counts the one staging residue class `fu gc` reclaims: the
+	// tree a completed, unpruned update family replaced, still sitting at the
+	// live name staging/<name> or parked at the deterministic retired sibling
+	// (store.RetiredRecoveryRootName) an interrupted `fu gc` reclaim attempt
+	// can leave it at. The gate is gc's own (txn_prune.go): a completed
+	// family whose newest revision is Op == "update" with PreviousPayload
+	// still set. The gate alone is not enough to report Collectable --
+	// collectableRecoveryNamesFromJournal's own note explains why the entry
+	// still has to look like the tree the manifest describes, and how little
+	// short of that a bare skill name says -- but once both hold, this bucket,
+	// unlike Uncollectable below, has a named remedy: `fu gc`.
+	//
+	// A name a pending record claims never reaches this bucket, whatever it
+	// holds and whatever it looks like: the switch in Status tests
+	// pendingStagingClaims first, and gc stops at the same claim without
+	// inspecting the tree either (txn_prune.go). Both stop there because
+	// nothing about the object can settle the question the claim raises --
+	// the exchange is a rename, so a completed family's manifest can match a
+	// pending transaction's live tree exactly. It is Blocked, because a
+	// recovery pass is what settles it.
+	Collectable int
 	// Blocked counts entries a recovery pass settles: a pending transaction's
 	// published staged root and its private reservation, and a pending config
 	// exchange's candidate and active swap name. RecoverPending and
@@ -46,8 +77,12 @@ type StagingInventory struct {
 	// half that can be delivered without ownership evidence, and offering to
 	// delete it is the half that cannot.
 	Uncollectable int
-	// Unmatched counts public staging names no pending record claims -- the
-	// content `fu new` and `fu add` refuse to run against, naming the path
+	// Unmatched counts staging names no pending record claims and none of the
+	// buckets above accounts for. Not only public ones: a
+	// .fu-retired-dir-<token> stranded by the double fault txn_prune.go
+	// records lands here too, and no command will ever reuse a name of that
+	// shape. The ones that are skill names hold the content `fu new`, `fu
+	// add`, `fu adopt` and `fu update` refuse to run against, naming the path
 	// when they do. Those refusals are a better remedy than a count, which is
 	// why this is a separate bucket rather than part of Uncollectable, but
 	// they only appear once the user tries the command: someone who has just
@@ -126,12 +161,14 @@ type RecoveryInventory struct {
 //
 // Bucketing a listed name is a set membership test in every arm: prefix
 // membership in one of these two tables, or exact membership in a set built
-// before the walk -- pendingPayloadClaims, collectableRecoveryNames,
-// store.PendingConfigExchangeRecords, store.CollectableConfigExchangeNames.
-// The one exception is store.CollectableConfigArchiveNames, which lstats each
-// candidate, because gc's own condition for unlinking an archive is that the
-// name still resolves to the identity it states, and re-deriving that without
-// asking is how the two would come to disagree.
+// before the walk -- pendingPayloadClaims, pendingStagingClaims,
+// collectableRecoveryNames, store.PendingConfigExchangeRecords,
+// store.CollectableConfigExchangeNames. Two sets are built by lstat rather than
+// by derivation alone -- store.CollectableConfigArchiveNames, and the
+// staging/<name> half of collectableRecoveryNamesFromJournal's update residue
+// -- because in both cases gc's own condition for acting is an identity the
+// name does not carry, and re-deriving that without asking is how the two would
+// come to disagree.
 //
 // Building those sets is where the reads happen, and they are reads of fu's own
 // journal rather than of the objects it describes. pendingPayloadClaims derives
@@ -299,10 +336,37 @@ type recoveryCollection struct {
 	// unpruned family describes -- the ones `fu gc` reclaims on the way to
 	// pruning that family.
 	payloads map[string]bool
+	// stagingPayloads is payloads' counterpart for update's own residue: the
+	// live name staging/<name> -- recorded only once the entry there is shown
+	// to hold the recorded root identity -- and its deterministic retired
+	// sibling (store.RetiredRecoveryRootName), which needs no such check
+	// because its name is derived from that identity. Kept apart from payloads
+	// because it names entries under the staging root rather than the recovery
+	// root -- the two directories status counts in separate inventories
+	// (StagingInventory, RecoveryInventory) -- so a staging-directory listing
+	// must only ever be tested against this set, never against payloads.
+	stagingPayloads map[string]bool
 	// journal names the txn-* files `fu gc` would delete on its next run: a
 	// settled family's revisions, its completion marker, and the prune record
 	// an interrupted prune already wrote.
 	journal map[string]bool
+	// stagingBlocked names the txn-* files of a settled update family gc will
+	// not prune, because reclaiming its staging residue fails first and a
+	// failed reclaim skips the whole family (txn_prune.go's default arm).
+	//
+	// Round 2, Important #3: these files used to be counted Collectable, and
+	// the state is reachable by ordinary user action -- `staging/<name>` is the
+	// bare skill name, so a user creating a directory there on a name some
+	// completed update family also holds made `fu status` promise "N
+	// collectable" while `fu gc` exited 1 and the count never moved, run after
+	// run. That is the exact failure this file's own accounting exists to
+	// prevent, stated in this type's doc for the rm-side payload.
+	//
+	// It is a superset test, in the safe direction: identity failing proves gc
+	// fails, while identity holding leaves the full manifest check to gc, so a
+	// family whose orphan drifted in content only is still counted Collectable.
+	// That case is fu's own residue going bad, not a name a user can land on.
+	stagingBlocked map[string]bool
 	// attributed names every txn-* file the scan resolved to some family,
 	// collectable or not. Its complement inside the txn- prefix is the set no
 	// producer in fu writes and no consumer reads -- a hand-dropped
@@ -370,13 +434,32 @@ type recoveryCollection struct {
 // derivation needs -- rmPayloadName and the payload manifest both come from it
 // -- and decodeTxnFile still checks the digest its own filename commits to.
 //
-// This does mean the Collectable count is a superset of gc's in two degraded
-// states, both of which surface an error rather than a silent miscount: a
-// completion marker whose bytes are damaged (gc decodes it and compares
-// sequence and revision digest; this does neither), and a payload whose
-// content no longer matches its manifest (gc's RemoveOwnedTreeAt refuses).
+// This does mean the Collectable count is a superset of gc's, and the rule
+// behind that is a class rather than a list: every check gc performs and this
+// derivation does not is a state where the count names files gc then refuses.
+// gc re-reads and re-hashes the whole revision chain, decodes and cross-checks
+// the completion marker, validates any prune record, and runs the reclaim
+// itself; this decodes one revision. Each of those is a way to be a superset,
+// and all of them surface an error rather than a silent miscount.
+//
+// Worth naming, because they were each arrived at separately: a damaged
+// completion marker (gc compares sequence and revision digest; this does
+// neither), a damaged newest revision (the decode below fails and the loop
+// moves on with the family's files already admitted, while validateTxnChain
+// refuses the family), a prune record validatePrunedTxn rejects (the scan
+// checks prune-record *names* only), a payload whose content no longer matches
+// its manifest, and the pair reclaimUpdateStagingPayload refuses before
+// reaching the tree at all -- a Name outside the public namespace, and a
+// PreviousPayload RemoveOwnedTreeAt will not act on. Each needs a hand-edited
+// or corrupted journal, the same reachability that earned gc its own guards
+// (update.go), and in each gc skips the family and errors while this count
+// still names its files.
+//
 // "Collectable" therefore means "gc is entitled to collect this", not "gc will
-// certainly succeed".
+// certainly succeed". Widening it to the second reading would mean re-deriving
+// every one of gc's refusals here, on a read path whose whole cost model is one
+// decode per family and no re-hash at all.
+//
 // It takes the journal already scanned rather than scanning one itself. Its
 // only caller, Status, also needs PendingTxns over the same directory, and both
 // used to read recovery/ independently -- so a damaged store paid for the walk
@@ -384,15 +467,65 @@ type recoveryCollection struct {
 // wrappers naming the same directory (review round 27 finding 2). One scan
 // feeds both; an unreadable directory is now one read and one error line.
 //
-// Nothing here can fail as a result, which is why there is no error return: the
-// scan was the only thing that could, and the caller has already faced it.
-func collectableRecoveryNamesFromJournal(st *store.Store, journal txnJournal) recoveryCollection {
+// The same scan also derives update's own residue under staging/, into
+// stagingPayloads rather than payloads: a completed, unpruned family whose
+// newest revision is Op == "update" with PreviousPayload still set entitles
+// gc to reclaim the tree at staging/<Name> or at its retired sibling
+// (store.RetiredRecoveryRootName), the identical pair
+// updateStagingTreePresent (update.go) checks under gc's own checked staging
+// root. The retired sibling is admitted by name, the way every other set here
+// is, with its actual presence decided later by the single directory listing;
+// staging/<Name> is admitted only when the entry there still resolves to the
+// root identity the manifest states, for the reason the arm below gives at
+// length -- that name is the bare skill name and carries no ownership by
+// itself.
+//
+// That identity probe is the only thing here that reaches the filesystem, and
+// it cannot fail into an error: store.StagingRootMatches answers "can this be
+// shown to be the manifested tree", whose honest answer under any stat failure
+// is no. There is therefore still no error return -- the scan was the only
+// thing that could fail, and the caller has already faced it.
+// stagingClaims and stagingPresent are the two things the update arm below
+// needs to answer whether `fu gc` will ever prune such a family: which staging
+// names a pending record governs, and which of them are on disk. Both are read
+// once by the caller and shared with the staging walk, so the two accounts
+// cannot come from different listings.
+// claimsKnown says whether the pending set behind stagingClaims could be read
+// at all. When it could not, no payload or staging name is admitted as
+// collectable, because an empty claims set is indistinguishable from "nothing
+// is claimed" and the difference decides whether a name belongs to a pending
+// transaction.
+//
+// The journal half is withheld on a narrower condition, because it answers a
+// different question. A claim never blocks a prune: both of gc's claimed arms
+// leave the object exactly where it is and prune the family anyway
+// (txn_prune.go). What can stop a prune while the claims set is unreadable is
+// a payload of the family's own -- gc asks the filesystem whether anything is
+// still at one of its two names, and skips the family when something is. This
+// derivation does not ask: it withholds every family whose newest revision
+// *declares* a payload manifest at all, whether or not anything is still
+// sitting there. The test below is on the record's shape (Op plus which
+// manifest field is set), never on residue, and the difference is
+// deliberate -- see the arm's own comment. What is still recorded whatever happens is everything
+// that depends on neither: which files were attributed to a family, and which
+// families are damaged, so a damaged journal is still accounted for rather
+// than dropped from the report.
+// stagingKnown is the same question asked of stagingPresent, and needs its own
+// answer for the same reason: a listing that failed yields an empty set that
+// reads exactly like a staging directory with nothing in it, and the update arm
+// below decides a bucket on that difference. Unknown is treated as blocked
+// rather than clear -- withholding a collection that turns out to be possible
+// costs one re-read, while promising one gc will refuse is the "watch a count
+// not move" incoherence this accounting exists to prevent.
+func collectableRecoveryNamesFromJournal(st *store.Store, journal txnJournal, stagingClaims, stagingPresent map[string]bool, claimsKnown, stagingKnown bool) recoveryCollection {
 	collection := recoveryCollection{
-		payloads:   map[string]bool{},
-		journal:    map[string]bool{},
-		attributed: map[string]bool{},
-		damaged:    map[string]bool{},
-		scanned:    true,
+		payloads:        map[string]bool{},
+		stagingPayloads: map[string]bool{},
+		journal:         map[string]bool{},
+		stagingBlocked:  map[string]bool{},
+		attributed:      map[string]bool{},
+		damaged:         map[string]bool{},
+		scanned:         true,
 	}
 	keys := make(map[txnKey]bool, len(journal.revisions)+len(journal.completed)+len(journal.pruned))
 	for key := range journal.revisions {
@@ -439,17 +572,136 @@ func collectableRecoveryNamesFromJournal(st *store.Store, journal txnJournal) re
 			continue
 		}
 		latest, err := newestTxnRevision(st, journal.revisions[key])
-		if err != nil || latest.Op != "rm" || latest.Payload == nil {
+		if err != nil {
 			continue
 		}
-		payload := rmPayloadName(latest)
-		collection.payloads[payload] = true
-		// The retired root is the intermediate disposal leaves between
-		// emptying the tree and unlinking it. Its name is derived from this
-		// same manifest, which is exactly why RemoveOwnedTreeAt can resume
-		// from it -- and exactly why it stops being collectable when the
-		// manifest is gone.
-		collection.payloads[store.RetiredRecoveryRootName(payload, *latest.Payload)] = true
+		if !claimsKnown {
+			// Everything below is claim-dependent, so nothing below runs; the
+			// journal admission above is not, and stands unless this family's
+			// newest revision declares a payload manifest of its own -- see
+			// claimsKnown.
+			//
+			// Declares, not still has. gc decides the same families by asking
+			// the filesystem whether either payload name still holds anything
+			// (RecoveryPayloadSettled, updateStagingPayloadSettled,
+			// txn_prune.go); this withholds without asking, so an ordinary
+			// completed rm or update whose inline reclaim already cleared the
+			// name is withheld here and pruned there. That is the direction
+			// this whole derivation errs in on purpose: under-promising in a
+			// state status already exits 1 on costs one re-read, while
+			// over-promising is the count that does not move.
+			if (latest.Op == "rm" && latest.Payload != nil) ||
+				(latest.Op == "update" && latest.PreviousPayload != nil) {
+				for _, name := range files {
+					delete(collection.journal, name)
+				}
+			}
+			continue
+		}
+		if latest.Op == "rm" && latest.Payload != nil {
+			payload := rmPayloadName(latest)
+			collection.payloads[payload] = true
+			// The retired root is the intermediate disposal leaves between
+			// emptying the tree and unlinking it. Its name is derived from this
+			// same manifest, which is exactly why RemoveOwnedTreeAt can resume
+			// from it -- and exactly why it stops being collectable when the
+			// manifest is gone.
+			collection.payloads[store.RetiredRecoveryRootName(payload, *latest.Payload)] = true
+		}
+		// update's own residue, gated by exactly the condition gc applies
+		// before reclaiming it (txn_prune.go): a completed family whose
+		// newest revision is an update still carrying PreviousPayload. The
+		// gate alone settles nothing -- every content-shape update sets
+		// PreviousPayload unconditionally and nothing ever clears it, so the
+		// gate is true of nearly every completed update family, including the
+		// ordinary ones whose own inline reclaim
+		// (reclaimExchangedUpdatePayload, update.go) already cleared
+		// staging/<name> before status ever runs.
+		//
+		// The two candidate names are then admitted on different evidence,
+		// because they carry different amounts of it. The retired sibling is
+		// derived from this family's own manifest -- its token hashes the
+		// recorded root's device and inode (store.RetiredRecoveryRootName) --
+		// so no other producer derives that name, and membership plus actual
+		// presence in the walk below is proof enough, exactly as it is for the
+		// rm payload above.
+		//
+		// staging/<name> is the bare skill name and proves nothing at all. A
+		// user's own directory, an abandoned install's staged tree and a
+		// pending transaction's staged content all land on it just as
+		// legitimately as the tree this update replaced, so a name match here
+		// was a promise `fu gc` could not keep: gc refuses content that fails
+		// its manifest check, and the reader was told to run a command that
+		// exits 1 and repeats the refusal on every later run. The report
+		// therefore asks the filesystem the first question gc's own removal
+		// asks (store.StagingRootMatches): does the entry still resolve to the
+		// root identity and mode the manifest states. That is a stat, not a
+		// read -- this report still never opens a payload -- and it is the same
+		// exception CollectableConfigArchiveNames already is, for the same
+		// reason: gc's condition is an identity, and re-deriving it without
+		// asking is how the two would come to disagree.
+		//
+		// It is not an ownership test and nothing here treats it as one. Its
+		// job is to separate fu's own tree from an unrelated directory that
+		// merely occupies the name, which is all this bucket needs, and it is
+		// safe to be wrong about because the worst it produces is a miscounted
+		// line. Ownership proper is settled before this ever runs, by the claim
+		// the walk tests first -- and only by that; store.StagingRootMatches's
+		// own doc records why it can never stand in for it.
+		//
+		// It stays a superset in the one degraded state the doc above names:
+		// identity can hold while content has drifted, and only gc's full hash
+		// sees that. Content drift inside fu's own orphan is not a name a user
+		// can land on by accident, which is the whole difference.
+		if latest.Op == "update" && latest.PreviousPayload != nil {
+			retired := store.RetiredRecoveryRootName(latest.Name, *latest.PreviousPayload)
+			switch {
+			case stagingClaims[latest.Name]:
+				// A pending record governs the name, so gc's claimed arm returns
+				// without touching *either* candidate name and prunes the family
+				// anyway. Neither may be advertised as collectable -- including
+				// the retired sibling, which this arm used to admit
+				// unconditionally (round 3): status promised a collection, gc
+				// exited 0 having done everything except that collection, and
+				// the count never moved. The journal files themselves really are
+				// collectable, and the staging walk reports the live name as
+				// Blocked.
+				//
+				// The cost is the limitation DESIGN §2 already records for this
+				// double fault: once the family is pruned, a retired sibling left
+				// under a claimed name has lost its manifest and nothing can
+				// collect it. Reclaiming it here instead would mean deleting on
+				// gc's behalf from a report, which no bucket in this file is
+				// allowed to do.
+			case st.StagingRootMatches(latest.Name, *latest.PreviousPayload):
+				// Unclaimed and still fu's own tree: gc reclaims through
+				// RemoveOwnedTreeAt, which settles both names.
+				collection.stagingPayloads[latest.Name] = true
+				collection.stagingPayloads[retired] = true
+			case !stagingKnown || stagingPresent[latest.Name]:
+				// Something is on the name, it is not this family's tree, and no
+				// pending record claims it: gc's reclaim will fail and take the
+				// whole family's prune with it, every run, until the user moves
+				// that entry aside. Keep these files out of the Collectable
+				// promise -- see stagingBlocked's own doc. The retired sibling
+				// is not promised either, since gc fails before reaching it.
+				//
+				// An unreadable staging directory lands here too, and after the
+				// identity check above rather than before it: a tree that still
+				// answers StagingRootMatches is positive evidence gc can act on,
+				// while a failed listing is only the absence of evidence, and
+				// absence of evidence may not be read as a clear name.
+				for _, name := range files {
+					collection.stagingBlocked[name] = true
+				}
+			default:
+				// The live name is clear. If a disposal was interrupted between
+				// emptying the tree and unlinking its root, RemoveOwnedTreeAt
+				// resumes from the retired sibling, so that name -- and only
+				// that name -- is collectable.
+				collection.stagingPayloads[retired] = true
+			}
+		}
 	}
 	return collection
 }
@@ -495,10 +747,10 @@ func newestTxnRevision(st *store.Store, revisions []txnRevision) (TxnRecord, err
 // not-yet-committed forms (installCompensationPayloadName,
 // installUncommittedPayloadName, new_txn.go). All three are derived from every
 // record rather than from the records whose op produces each form, for the
-// reason pendingRecoveryPayloadClaims (txn_prune.go) states: a payload name is
-// a pure function of the skill name and the start HEAD, so any pending record
-// whose derivation lands on a name is one nothing can prove does not own the
-// object sitting there.
+// reason pendingTxnClaims (txn_prune.go) states: a payload name is a pure
+// function of the skill name and the start HEAD, so any pending record whose
+// derivation lands on a name is one nothing can prove does not own the object
+// sitting there.
 //
 // One derivation serves both callers, which is the point. `fu gc` asks it what
 // it must not collect; status asks it what it must not tell the user to
@@ -515,6 +767,44 @@ func pendingPayloadClaims(pending []TxnRecord) map[string]bool {
 		claims[rmPayloadName(record)] = true
 		claims[installCompensationPayloadName(record)] = true
 		claims[installUncommittedPayloadName(record)] = true
+	}
+	return claims
+}
+
+// pendingStagingClaims is pendingPayloadClaims for the other directory a
+// pending transaction holds content in: the published staged root, which
+// carries the skill's own name, and the private reservation, whose random name
+// only the record knows, so it is read back rather than derived.
+//
+// It is shared between this report and `fu gc` (pendingTxnClaims, txn_prune.go)
+// for the reason its recovery-side sibling is: the two ask opposite halves of
+// one question -- gc what it must not touch, status what it must not tell the
+// user to collect -- and an answer stated twice is an answer that comes apart.
+// It came apart exactly that way once: gc reclaimed staging/<name> on the
+// strength of a completed family naming it, with no claims test at all, while
+// this report was already excluding the same name because a pending record
+// claimed it.
+//
+// The name is taken from every pending record rather than from the ops that
+// actually stage content, on the same asymmetry pendingPayloadClaims rests on:
+// claiming a name too many only skips a reclaim, claiming one too few acts on
+// content another transaction is still counting on. An rm, which stages
+// nothing, therefore claims its own skill name here too.
+//
+// Config exchange staging names are deliberately not derived here. They come
+// from the exchange records rather than from any transaction journal
+// (store.PendingConfigExchangeStagingNames), and they are all reserved .fu-
+// names that no skill name can equal, so the one caller that needs them adds
+// them to its own set.
+func pendingStagingClaims(pending []TxnRecord) map[string]bool {
+	claims := make(map[string]bool, len(pending)*2)
+	for _, record := range pending {
+		if record.Name != "" {
+			claims[record.Name] = true
+		}
+		if record.StagingReservation != nil {
+			claims[record.StagingReservation.Name] = true
+		}
 	}
 	return claims
 }
@@ -581,12 +871,23 @@ func Status(st *store.Store, cfg *store.Config, agents []agent.Agent) (StatusRep
 	journal, scanErr := scanTxnJournalReport(st)
 
 	var pending []TxnRecord
+	// claimsKnown is the difference between "nothing is claimed" and "what is
+	// claimed could not be read", which an empty `pending` slice cannot express
+	// on its own. scanTxnJournalReport succeeds while recording malformed
+	// filenames in journal.problems, and pendingTxnsFromJournal is what fails on
+	// them -- so guarding the collectable derivation on scanErr alone ran it
+	// with an empty claims set and reported a *pending* transaction's own staged
+	// tree as collectable, on the one name where getting it wrong destroys the
+	// only copy recovery can exchange back (round 3). gc, given the same store,
+	// takes its claimErr arm and prunes nothing; this is status's counterpart.
+	claimsKnown := scanErr == nil
 	if scanErr != nil {
 		problems = append(problems, fmt.Errorf("read unfinished transactions: %w", scanErr))
 	} else {
 		var pendingErr error
 		pending, pendingErr = pendingTxnsFromJournal(st, journal)
 		if pendingErr != nil {
+			claimsKnown = false
 			problems = append(problems, fmt.Errorf("read unfinished transactions: %w", pendingErr))
 		}
 	}
@@ -599,6 +900,21 @@ func Status(st *store.Store, cfg *store.Config, agents []agent.Agent) (StatusRep
 	// compares its name against a set derived from already-parsed journal
 	// records.
 	claims := pendingPayloadClaims(pending)
+	// Read here rather than at the staging walk below, because the journal
+	// collector needs both: which staging names a pending record governs, and
+	// which of them actually exist. Round 2, Important #3 is what needs them --
+	// a completed update family whose staging residue gc will refuse must not
+	// have its journal files counted collectable. The staging walk further down
+	// reuses these two rather than reading either a second time.
+	stagingClaims := pendingStagingClaims(pending)
+	stagingNames, stagingNamesErr := st.StagingNames()
+	if stagingNamesErr != nil {
+		problems = append(problems, fmt.Errorf("read the staging directory %s: %w", st.StagingDir(), stagingNamesErr))
+	}
+	stagingPresent := make(map[string]bool, len(stagingNames))
+	for _, name := range stagingNames {
+		stagingPresent[name] = true
+	}
 	// The mirror of claims: what a settled family entitles gc to collect. Both
 	// are needed because the two buckets answer different questions -- claims
 	// keeps a pending transaction's own work out of the inventory, collectable
@@ -609,7 +925,7 @@ func Status(st *store.Store, cfg *store.Config, agents []agent.Agent) (StatusRep
 	// sets must not be read as "nothing here is collectable".
 	var collectable recoveryCollection
 	if scanErr == nil {
-		collectable = collectableRecoveryNamesFromJournal(st, journal)
+		collectable = collectableRecoveryNamesFromJournal(st, journal, stagingClaims, stagingPresent, claimsKnown, stagingNamesErr == nil)
 	}
 
 	// Through the store's own listing rather than os.ReadDir on the pathname:
@@ -678,6 +994,14 @@ func Status(st *store.Store, cfg *store.Config, agents []agent.Agent) (StatusRep
 				// The journal could not be read, so no family state is known
 				// and no bucket can be justified. The failure is already among
 				// the problems above.
+			case collectable.stagingBlocked[name]:
+				// Tested before the collectable arm: gc will not prune this
+				// family while its staging residue fails to reclaim, so the
+				// deliberately inactionable bucket is the honest one. The
+				// remedy is not fu's -- the staging section's own last line
+				// names the entry class that is in the way, and it belongs to
+				// whoever put it there.
+				report.Recovery.Uncollectable++
 			case collectable.journal[name]:
 				report.Recovery.Collectable++
 			case collectable.damaged[name]:
@@ -689,8 +1013,15 @@ func Status(st *store.Store, cfg *store.Config, agents []agent.Agent) (StatusRep
 				// would otherwise answer for the same name with no bucket.
 				report.Recovery.Uncollectable++
 			case collectable.attributed[name]:
-				// A pending family's own file, reported as an unfinished
-				// transaction instead.
+				// Attributed to a family, admitted to none of the sets above,
+				// and so counted in no bucket at all -- which is right for both
+				// states that reach here. A pending family's file is reported
+				// as the unfinished transaction it belongs to. A settled
+				// family's file whose journal promise was retracted (see
+				// claimsKnown) is reported as the unreadable pending set that
+				// caused the retraction: both are already named, and naming
+				// them again as residue would be the same fact told twice in
+				// incompatible terms.
 			default:
 				report.Recovery.Uncollectable++
 			}
@@ -831,32 +1162,23 @@ func Status(st *store.Store, cfg *store.Config, agents []agent.Agent) (StatusRep
 	}
 
 	// The staging inventory is assembled from what has already been read: the
-	// pending records above name their own staged content, and the pending
-	// exchange records name theirs through the store's own derivation. Like the
-	// recovery pass, this never opens or parses a staging entry -- every rule
-	// is a name comparison.
-	stagingClaims := make(map[string]bool, len(pending)*2+len(pendingExchanges)+1)
-	for _, record := range pending {
-		// A published staged root carries the skill's own name, and the private
-		// reservation the name recovery reads back off the record rather than
-		// deriving, since only the record knows which random name was taken.
-		if record.Name != "" {
-			stagingClaims[record.Name] = true
-		}
-		if record.StagingReservation != nil {
-			stagingClaims[record.StagingReservation.Name] = true
-		}
-	}
+	// pending records above name their own staged content, through the same
+	// derivation `fu gc` claims by (pendingStagingClaims), and the pending
+	// exchange records name theirs through the store's own. Like the recovery
+	// pass, this never opens or parses a staging entry -- every rule here is a
+	// name comparison, over sets one of which was built with a stat
+	// (collectableRecoveryNamesFromJournal, for the one name that carries no
+	// ownership at all).
 	pendingExchangeNames := make([]string, 0, len(pendingExchanges))
 	for name := range pendingExchanges {
 		pendingExchangeNames = append(pendingExchangeNames, name)
 	}
+	// Added after the journal collector ran, deliberately: a reserved .fu-
+	// exchange staging name can never equal a skill name, so it changes nothing
+	// the collector asked, and adding it before would have handed that function
+	// a set answering a question it does not ask.
 	for _, name := range store.PendingConfigExchangeStagingNames(pendingExchangeNames) {
 		stagingClaims[name] = true
-	}
-	stagingNames, err := st.StagingNames()
-	if err != nil {
-		problems = append(problems, fmt.Errorf("read the staging directory %s: %w", st.StagingDir(), err))
 	}
 	for _, name := range stagingNames {
 		switch {
@@ -865,16 +1187,44 @@ func Status(st *store.Store, cfg *store.Config, agents []agent.Agent) (StatusRep
 		// report a transaction's own work in progress as permanent litter.
 		case stagingClaims[name]:
 			report.Staging.Blocked++
+		// The tree a completed, unpruned update family replaced -- present
+		// under either candidate name collectableRecoveryNamesFromJournal
+		// admitted for it, decided here the same way every other bucket in
+		// this loop is: by testing the name this walk actually found against
+		// a set built before the walk began. What that set admits is where
+		// the ownership question was answered: the live skill name only once
+		// its identity matched the recorded manifest, the retired sibling on
+		// the strength of a name derived from that same identity. Given its
+		// own case, tested before the residue prefixes below, because the two
+		// answers are opposite: stagingResiduePrefixes is reserved for what
+		// nothing collects today, while this class has had a collector since
+		// `fu gc` learned to reclaim it -- folding it in there would tell a
+		// user to abandon by hand a tree `fu gc` is about to remove for them.
+		case collectable.stagingPayloads[name]:
+			report.Staging.Collectable++
 		case hasAnyPrefix(name, stagingResiduePrefixes):
 			report.Staging.Uncollectable++
 		default:
-			// A public name no pending transaction claims. It is not fu's
-			// residue, and `fu new` and `fu add` already refuse to run against
-			// it and name the path when they do (ops.go, add.go) -- a better
-			// remedy than a count, which is why it gets its own bucket rather
-			// than joining the residue above. Counting it at all is what
-			// answers the user who has just been refused, opened `fu status`
-			// to see what is in the way, and previously found nothing.
+			// A name no pending transaction claims, public or not -- this arm
+			// catches whatever the three above did not, including a
+			// .fu-retired-dir-<token> the double fault leaves stranded, which
+			// no command will ever try to reuse. It is not fu's residue, and
+			// when the name is a skill's, `fu new`, `fu add`, `fu adopt` and
+			// `fu update` already refuse to run against it and name the path
+			// when they do (ops.go, add.go, adopt.go via checkAddAvailable,
+			// update.go) -- a better remedy than a count, which is why it gets
+			// its own bucket rather than joining the residue above. Counting it
+			// at all is what answers the user who has just been refused, opened
+			// `fu status` to see what is in the way, and previously found
+			// nothing.
+			//
+			// A directory sitting on a skill name that some completed update
+			// family also names lands here too, and lands here for the same
+			// reason: nothing has shown it to be that family's tree, so the
+			// bucket that would name `fu gc` is the one bucket it must not
+			// have. It is exactly what the identical directory gets when no
+			// family names it at all -- which is the point, since the two are
+			// the same directory.
 			report.Staging.Unmatched++
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/cosensexyz/fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/skill"
 	"github.com/cosensexyz/fu/internal/store"
 )
 
@@ -675,6 +676,26 @@ func TestTxnUpdatesValidateThePersistedLatestRevision(t *testing.T) {
 	})
 }
 
+// swapRecoverReporter installs h as the recovery handler for op and returns a
+// function restoring whatever was registered before it, so a test that has to
+// observe dispatch can borrow an op name that already has a production handler
+// without taking it away from every test that runs after it.
+func swapRecoverReporter(op string, h recoverReporter) func() {
+	recoverHandlersMu.Lock()
+	previous, existed := recoverHandlers[op]
+	recoverHandlers[op] = h
+	recoverHandlersMu.Unlock()
+	return func() {
+		recoverHandlersMu.Lock()
+		defer recoverHandlersMu.Unlock()
+		if existed {
+			recoverHandlers[op] = previous
+			return
+		}
+		delete(recoverHandlers, op)
+	}
+}
+
 // TestTxnOpNamesAreValidatedAndDispatchFollowsTheFilename is round 6's
 // recovery-record finding. The operation name was concatenated straight
 // into "txn-"+op+".json", so a name carrying a path separator or dot-dot
@@ -726,10 +747,21 @@ func TestTxnOpNamesAreValidatedAndDispatchFollowsTheFilename(t *testing.T) {
 			t.Fatal(err)
 		}
 		ran := ""
-		RegisterRecoverHandler("update", func(*store.Store, TxnRecord) error { ran = "update"; return nil })
-		RegisterRecoverHandler("adopt", func(*store.Store, TxnRecord) error { ran = "adopt"; return nil })
-		defer deleteRecoverHandler("update")
-		defer deleteRecoverHandler("adopt")
+		// Swapped and put back rather than registered and deleted: both of
+		// these op names have a production handler registered at init, and
+		// deleting one leaves every later test in this package facing a store
+		// that cannot recover that operation at all -- which is what the
+		// update handler's own tests ran into once "update" gained one.
+		restoreUpdate := swapRecoverReporter("update", func(*store.Store, TxnRecord) (Result, error) {
+			ran = "update"
+			return Result{}, nil
+		})
+		defer restoreUpdate()
+		restoreAdopt := swapRecoverReporter("adopt", func(*store.Store, TxnRecord) (Result, error) {
+			ran = "adopt"
+			return Result{}, nil
+		})
+		defer restoreAdopt()
 
 		err := RecoverPending(checkedRecoveryStore(t, s))
 		if err == nil && ran == "update" {
@@ -863,8 +895,60 @@ func TestEveryOperationCommitThisPackageWritesIsCountable(t *testing.T) {
 	agents := []agent.Agent{agent.Claude{}}
 
 	// One call per Op.Message producer in this package: ops.go's three forms,
-	// rm.go, adopt.go, and the store's own revert message.
+	// rm.go, adopt.go, update.go's two shapes, and the store's own revert
+	// message.
 	if _, err := NewSkill(s, agents, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	// update, added for round 2's Minor #9: the fixture asserted a want list
+	// that named neither update nor add, so `update`'s conformance held only
+	// because the verb happened to be in operationVerbs already -- which is
+	// exactly the coupling this test exists to check rather than assume. Both
+	// of update's message shapes are driven: the content exchange ("update:
+	// <name>") and the lock-only form ("update: <name> (lock only)"), since
+	// IsOperationMessage has to cut both to the same verb.
+	updateCfg, err := store.LoadConfig(s.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	updateSrc, _ := installedFromLocal(t, s, updateCfg, "kitten", "version one")
+	writeSkillBody(t, updateSrc, "kitten", "version two")
+	updated := prepareLocal(t, updateSrc)
+	proj, err := skill.ProjectDir(mustRootFS(t, updated), ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDigest, err := skill.DigestManifest(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := updateSkill(s, agents, updated, "kitten",
+		Candidate{Name: "kitten", Subdir: ".", Digest: newDigest},
+		localSourceRecord(updateSrc), map[string]string{"type": "local", "path": updateSrc}, false, hooks{}); err != nil {
+		t.Fatal(err)
+	}
+	// add, the other verb the want list omitted: driven through the production
+	// install path so the message is the one `fu add` really writes.
+	addSrc := t.TempDir()
+	writeSkillBody(t, filepath.Join(addSrc, "gamma"), "gamma", "one")
+	addPrep, err := PrepareAdd(s, addSrc, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addPlan := addPrep.Session.(*AddPlan)
+	_, addErr := addPlan.Install(addPlan.Candidates())
+	closeErr := addPlan.Close()
+	if addErr != nil {
+		t.Fatal(addErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	// Second run over the same, now-identical content: the lock-only shape.
+	if _, err := updateSkill(s, agents, prepareLocal(t, updateSrc), "kitten",
+		Candidate{Name: "kitten", Subdir: ".", Digest: newDigest},
+		localSourceRecord(updateSrc), map[string]string{"type": "local", "path": updateSrc, "commit": "advanced"}, false, hooks{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := SetGlobal(s, agents, "alpha", false); err != nil {
@@ -910,7 +994,7 @@ func TestEveryOperationCommitThisPackageWritesIsCountable(t *testing.T) {
 	// And the fixture really did drive the producers, so a future edit that
 	// quietly stops exercising one is visible rather than silently narrowing
 	// what the loop above can catch.
-	for _, want := range []string{"new", "enable", "disable", "adopt", "rm", "revert"} {
+	for _, want := range []string{"new", "enable", "disable", "adopt", "rm", "revert", "update", "add"} {
 		if !verbs[want] {
 			t.Errorf("the fixture must exercise the %q producer; observed %v", want, verbs)
 		}

@@ -107,8 +107,8 @@ func printAgentSection(out io.Writer, agents []engine.AgentStatus) bool {
 		// CreateLink and storeSideMissing would upgrade the ones whose store
 		// content is absent to ReportMissing -- a store-side claim caused
 		// entirely by the agent's own directory. That guard is what keeps this
-		// argument true, and
-		// TestStatusDescribesNoPerEntryDriftForASymlinkedAgentDir pins it.
+		// argument true, and TestStatusDescribesNoPerEntryDriftForASymlinkedAgentDir
+		// pins it.
 		suppressProjection := false
 		switch {
 		case agentStatus.DirIsSymlink:
@@ -192,16 +192,28 @@ func plural(n int, one, many string) string {
 }
 
 // printStagingSection reads like the recovery section with one line's worth of
-// difference, which is the whole point of keeping them apart. `fu gc` never
-// looks at staging, so the waiting line stops at `fu restore` rather than
-// repeating recovery's "then `fu gc`"; and there is no collectable line at all,
-// because nothing under staging carries the ownership evidence a later run
-// would need to claim it.
+// difference, which is the whole point of keeping them apart. `fu gc` reaches
+// staging for exactly one residue class -- the tree a completed update family
+// left behind (StagingInventory.Collectable) -- so that one line is worded
+// identically to recovery's own collectable line.
+//
+// The waiting line stops at `fu restore` rather than repeating recovery's "then
+// `fu gc`", and that is a choice about what to promise rather than a statement
+// of fact. A staging entry is Blocked because a pending record claims its name,
+// and once that transaction settles the entry can become gc-collectable, so
+// "then `fu gc`" would sometimes apply here exactly as it does on the recovery
+// side. It is left off because it does not always apply: under-promising a
+// second command costs the user one `fu status` re-read, while promising one
+// that turns out to do nothing is the "run a command and watch a count not
+// move" failure this whole section exists to avoid.
 func printStagingSection(out io.Writer, inventory engine.StagingInventory) bool {
 	if inventory == (engine.StagingInventory{}) {
 		return false
 	}
 	fmt.Fprintln(out, "staging")
+	if inventory.Collectable != 0 {
+		fmt.Fprintf(out, "  %d collectable (run `fu gc`)\n", inventory.Collectable)
+	}
 	if inventory.Blocked != 0 {
 		fmt.Fprintf(out, "  %d waiting on an unfinished write (run `fu restore`)\n", inventory.Blocked)
 	}
@@ -212,20 +224,28 @@ func printStagingSection(out io.Writer, inventory engine.StagingInventory) bool 
 		fmt.Fprintf(out, "  %d that no command collects yet\n", inventory.Uncollectable)
 	}
 	// This one does have a remedy, and it is not fu's to perform: the content
-	// belongs to whoever put it there. The line exists so a user whom `fu new`
-	// or `fu add` has just refused can find out what is occupying the name
-	// without having to trigger the refusal again to read it.
+	// belongs to whoever put it there. The line exists so a user whom `fu new`,
+	// `fu add` or `fu update` has just refused can find out what is occupying
+	// the name without having to trigger the refusal again to read it.
 	//
 	// Worded narrowly on purpose. Those commands do not refuse because staging
 	// holds something -- they refuse when it holds the name of the skill being
-	// installed (ops.go, add.go), so `fu new bar` runs happily past a staging
-	// entry called foo. And the bucket catches every name that is neither
-	// claimed nor recognised residue, which need not be a public name at all.
-	// Saying more than "fu has no pending record for these, and they will
-	// block reuse of their own names" would promise a refusal that may not
-	// come.
+	// installed or updated (ops.go, add.go, adopt.go via checkAddAvailable,
+	// update.go), so `fu new bar` runs happily past a staging entry called
+	// foo. `fu update` joined that list when it learned to refuse an occupied
+	// staging name (checkUpdateAvailable), and it is the one whose own refusal
+	// points at `fu gc` first -- a reader who has just met that refusal and
+	// opened this report has to find their own command named here.
+	//
+	// So the promise is conditional, and says so (round 4). The bucket's
+	// default arm catches every name that is neither claimed nor recognised
+	// residue, which need not be a public skill name at all -- a
+	// `.fu-retired-dir-<token>` stranded under staging by the double fault
+	// lands here, and no command will ever be asked to reuse that name. The
+	// earlier wording promised a refusal for every entry counted, which for
+	// those is a refusal that cannot come.
 	if inventory.Unmatched != 0 {
-		fmt.Fprintf(out, "  %d staging entr%s fu has no pending record for (`fu new` and `fu add` refuse to reuse these names)\n",
+		fmt.Fprintf(out, "  %d staging entr%s fu has no pending record for (one on a skill's own name blocks `fu new`, `fu add`, `fu adopt` and `fu update` from reusing it)\n",
 			inventory.Unmatched, plural(inventory.Unmatched, "y", "ies"))
 	}
 	return true

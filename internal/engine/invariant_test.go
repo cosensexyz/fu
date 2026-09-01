@@ -739,10 +739,10 @@ func jsonRoundTrip[V any](t *testing.T, in map[string]V) map[string]V {
 // reconstructs from the transaction record (review finding C1). The record
 // JSON-round-trips Go maps, so reconstruction iterates a differently
 // ordered map than the operation did; insertion order must be canonical or
-// a committed git-source add / multi-override adopt can never validate on
-// recovery and stays pending forever. The loop repeats because the
-// nondeterminism it guards is itself per-iteration; before the canonical
-// ordering fix this fails within a handful of iterations.
+// a committed git-source add / multi-override adopt / lock-advancing update
+// can never validate on recovery and stays pending forever. The loop repeats
+// because the nondeterminism it guards is itself per-iteration; before the
+// canonical ordering fix this fails within a handful of iterations.
 func TestRecoveredConfigMatchesOperationBytes(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("0", 64)
 	fields := map[string]string{
@@ -752,6 +752,27 @@ func TestRecoveredConfigMatchesOperationBytes(t *testing.T) {
 		"ref_kind": "branch",
 		"commit":   strings.Repeat("ab", 20),
 		"subdir":   "alpha",
+	}
+	// What the same skill's record would look like before that update: pinned
+	// to a bare commit, with no ref recorded. EncodeFields guards ref, ref_kind
+	// and commit independently (source.go), so advancing from this shape
+	// appends two keys at once -- the case that makes append order observable
+	// at all, since a single new key has only one position to take.
+	//
+	// Deliberately constructed rather than reached: `fu update` never updates a
+	// bare-commit pin (judgeGitUpdate leaves it non-comparable and both arms of
+	// selectUpdateTargets require Comparable, as SPEC rule 9 requires), and for
+	// a row it does update the new key set is the old one, so append order is
+	// unobservable on that path. This test is the only place enforcing the
+	// ordering for update, which is why it builds the shape the live path
+	// cannot: the property is a defensive one, and the failure it prevents --
+	// a committed transaction whose config recovery can never reconstruct, so
+	// it stays pending forever -- is silent and permanent.
+	priorFields := map[string]string{
+		"type":   "git",
+		"url":    "file:///tmp/repo.git",
+		"commit": strings.Repeat("cd", 20),
+		"subdir": "alpha",
 	}
 	overrides := map[string]bool{"codex": false, "gemini": false, "peridot": false}
 	for i := 0; i < 100; i++ {
@@ -818,6 +839,67 @@ func TestRecoveredConfigMatchesOperationBytes(t *testing.T) {
 		if !bytes.Equal(opBytes2, recBytes2) {
 			t.Fatalf("recovered install config differs from the operation config\n--- operation ---\n%s\n--- recovered ---\n%s", opBytes2, recBytes2)
 		}
+
+		// The update reconstruction. Its shape is not install's: update
+		// advances a skill that is already registered, so both sides start
+		// from a config that already carries the entry and its previous source
+		// record, and the mutation is SetDigest + SetSourceFields rather than
+		// AddSkill (update.go's Mutate). That prior record is what makes this
+		// row exercise both halves of SetSourceFields at once -- keys already
+		// present are rewritten where the file already had them, while ref and
+		// ref_kind have to be appended, and only the sort decides their order.
+		beforeCfg, err := store.LoadConfigBytes(before, "fu.yaml at test start")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := beforeCfg.AddSkill("alpha", digest); err != nil {
+			t.Fatal(err)
+		}
+		beforeCfg.SetSourceFields("alpha", priorFields)
+		updateBefore, err := beforeCfg.Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		staged := newValidOwnedTree()
+		// The digest update's Mutate records is the one it computes over the
+		// staged manifest, so the operation side computes it the same way.
+		stagedDigest, err := digestOwnedPayload(*staged)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opCfg3, err := store.LoadConfigBytes(updateBefore, "fu.yaml before the update")
+		if err != nil {
+			t.Fatal(err)
+		}
+		opCfg3.SetDigest("alpha", stagedDigest)
+		opCfg3.SetSourceFields("alpha", fields)
+		opBytes3, err := opCfg3.Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Both of update's digest sources must rebuild that same config: the
+		// recorded digest, durable from the "config-saved" revision onwards,
+		// and the staged manifest, which is all a record stopped at
+		// updateTxnStaged carries (update_txn.go). Each record round-trips its
+		// own copy of the field map, so each reconstruction appends from an
+		// independently ordered range.
+		for _, rec := range []TxnRecord{
+			{Op: "update", Name: "alpha", ConfigBefore: updateBefore,
+				Digest: stagedDigest, SourceFields: jsonRoundTrip(t, fields)},
+			{Op: "update", Name: "alpha", ConfigBefore: updateBefore,
+				Payload: staged, SourceFields: jsonRoundTrip(t, fields)},
+		} {
+			recBytes3, err := expectedUpdatedConfig(rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(opBytes3, recBytes3) {
+				t.Fatalf("recovered update config differs from the operation config (digest %q, payload %v)\n--- operation ---\n%s\n--- recovered ---\n%s",
+					rec.Digest, rec.Payload != nil, opBytes3, recBytes3)
+			}
+		}
 	}
 }
 
@@ -842,6 +924,12 @@ func TestValidatorsAcceptFirstRevisionShape(t *testing.T) {
 		{"add", "add: alpha", validateInstallTxn},
 		{"adopt", "adopt: alpha", validateAdoptTxn},
 		{"rm", "rm: alpha", validateRemoveTxn},
+		// update is bound by the same invariant and was the one op missing from
+		// this table: validateUpdateRecord has its own "started" arm
+		// (update_txn.go) and nothing pinned it, so a regression there would
+		// deadlock every write command after a crash in update's opening window
+		// -- the window that has no afterTxnStart crash test either.
+		{"update", "update: alpha", validateUpdateRecord},
 	} {
 		record := base
 		record.Op = tc.op

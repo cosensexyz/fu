@@ -31,13 +31,20 @@ func newGCCmd(app gcApplication) *cobra.Command {
 				// files".
 				//
 				// The clause names journal and bookkeeping files specifically
-				// because that is all Files counts. A reclaimed rm payload is
-				// a directory tree removed whole against its manifest, and it
-				// is not tallied -- counting it would mean returning a file
-				// count from ReclaimRecoveryPayloadOwned, which is a deletion
-				// primitive whose signature is not worth widening for one line
-				// of output. An unqualified "recovery files" would have
-				// undercounted against a promise this makes explicit instead.
+				// because that is all Files counts. Neither tree a run can
+				// reclaim is tallied -- an rm family's quarantined payload
+				// under recovery/, and the tree an update family replaced
+				// under staging/ -- because each is a directory removed whole
+				// against its manifest by a deletion primitive whose signature
+				// is not worth widening to return a count for one line of
+				// output. The staging one was briefly counted here, which is
+				// how this line came to report a directory tree as a "recovery
+				// journal and bookkeeping file"; PruneOutcome's own doc carries
+				// the rest of that reasoning. An unqualified "recovery files"
+				// would have undercounted against a promise this makes
+				// explicit instead, and neither reclaim goes unmentioned: both
+				// happen only on the way to pruning the family that describes
+				// them, so the transaction count always moves with them.
 				fmt.Fprintf(cmd.OutOrStdout(), "pruned %d completed transactions; removed %d recovery journal and bookkeeping files\n", outcome.Transactions, outcome.Files)
 			}
 			return err

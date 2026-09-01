@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -15,6 +16,22 @@ import (
 // PruneOutcome reports what one gc run removed from the recovery directory:
 // completed transaction families, and the total files taken with them --
 // journal entries plus the config exchange bookkeeping swept alongside them.
+//
+// Files counts files, and only some of the ones under the recovery directory:
+// the journal entries a family is made of and the config exchange bookkeeping.
+// The .pruned record each family is deleted through is not among them -- it is
+// written by this run and removed by it, so counting it would report a file the
+// user never had. The two trees a run can also reclaim -- a completed rm
+// family's quarantined payload under recovery/, and the tree a completed update
+// family replaced under staging/ -- are deliberately not tallied either. They
+// are the same thing as each other: a directory removed whole against its
+// manifest, by a deletion
+// primitive whose signature is not worth widening to return a count for one
+// line of output. Counting one of the two and not the other, which this type
+// briefly did, left `fu gc` reporting a staging directory tree as a "recovery
+// journal and bookkeeping file". Neither reclaim goes unreported: each happens
+// only on the way to pruning the family that describes it, so Transactions
+// always moves with it.
 type PruneOutcome struct {
 	Transactions int
 	Files        int
@@ -221,19 +238,21 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 		// in the whole run.
 		problems = append(problems, fmt.Errorf("reclaim config exchange bookkeeping under %s: %w", st.RecoveryDir(), configErr))
 	}
-	// Every recovery payload name a pending transaction claims, computed once
-	// for the whole run and before any deletion. A payload name identifies
-	// content, never the transaction that owns it: two rm transactions of the
-	// same skill at the same HEAD derive the same name, and each hop between
-	// the skills root and the recovery directory is a rename, so device, inode
-	// and content are carried across all of them. A completed family's
-	// manifest can therefore match a pending family's live payload exactly,
-	// and matching it is not owning it.
+	// Every name a pending transaction claims, in both directories this run
+	// removes things from, computed once for the whole run and before any
+	// deletion. A name identifies content, never the transaction that owns it:
+	// two rm transactions of the same skill at the same HEAD derive the same
+	// removed- name, and each hop between the skills root and the recovery
+	// directory is a rename, so device, inode and content are carried across
+	// all of them. A completed family's manifest can therefore match a pending
+	// family's live payload exactly, and matching it is not owning it.
+	// staging/<name> is weaker still -- it is the bare skill name, which every
+	// operation that stages content publishes at.
 	//
 	// Reading the pending records is not recovering them: `fu gc` still never
 	// drives another command's transaction to a terminal state, which is why
 	// PruneRecovery deliberately runs without RecoverPending.
-	claimed, claimErr := pendingRecoveryPayloadClaims(st)
+	claimed, stagingClaimed, claimErr := pendingTxnClaims(st)
 	if claimErr != nil && len(journal.problems) == 0 && len(journal.invalid) == 0 {
 		// When the scan above found anything wrong, this is that same failure
 		// said twice: the claims read rescans the same directory under the
@@ -260,11 +279,78 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 		// loudly on exactly that chain.
 		problems = append(problems, addJournalScanRemedy(st, claimErr))
 	}
+	// A reclaim that failed its manifest check is held here rather than
+	// reported where it happened, and released once every family has been
+	// visited (releaseStagingPayloadProblems below).
+	var heldStagingProblems []heldStagingProblem
+	// releaseStagingPayloadProblems decides which held failures are real. A
+	// failed reclaim means the entry at staging/<name> is not the tree *that*
+	// family recorded -- which is news when the entry is the user's own
+	// directory, and is not news at all when a later family in this same run
+	// collected the tree as its own.
+	//
+	// Two completed, unpruned update families can name one staging name:
+	// families are ordered by (op, id) and id is random, so the one whose
+	// manifest no longer describes the tree may be visited first. It fails
+	// here, the other one collects the tree a moment later, and gc used to
+	// exit 1 telling the user to "restore it to its recorded content" about an
+	// entry that was already gone. Re-asking after the loop is what tells the
+	// two apart; the family itself is still skipped either way, so the next
+	// run prunes it exactly as before -- only the spurious message goes.
+	//
+	// A clear name is necessary but not sufficient to drop the failure: it must
+	// also be a failure a later collection could account for. Only
+	// ErrOwnedTreeChanged is -- it is what compareOwnedTreeCleanupState raises
+	// about a tree that is really there and is no longer the recorded one
+	// (retire.go), which is exactly the state another family collecting it
+	// resolves. Every other class fails before reaching the tree at all:
+	// reclaimUpdateStagingPayload refuses a Name that is not a public skill name
+	// before it opens staging (update.go), and RemoveOwnedTreeAt refuses an
+	// invalid manifest the same way -- both leave the two candidate names
+	// untouched and so answer "settled", and releasing on that answer alone
+	// dropped them. Dropped, gc reports "nothing to prune" and exits 0 while the
+	// family is skipped run after run and `fu status` goes on counting its files
+	// collectable: the "run a command and watch a count not move" incoherence
+	// this change exists to end, and the one PruneOutcome's own doc says cannot
+	// happen.
+	// Grouped by name, one remedy each. Two completed families can name one
+	// staging name -- it is the bare skill name and the families are
+	// independent -- and when the entry there matches neither manifest both fail
+	// here. The remedy is a long instruction about a single directory, so one
+	// copy per family told the user to move the same entry aside twice. The
+	// causes are joined rather than dropped: which family failed is still
+	// information, it just does not need its own copy of the instructions.
+	releaseStagingPayloadProblems := func() []error {
+		var order []string
+		causes := make(map[string][]error)
+		for _, held := range heldStagingProblems {
+			settled, settledErr := updateStagingPayloadSettled(st, held.name, held.expected)
+			var cause error
+			switch {
+			case settledErr != nil:
+				cause = errors.Join(held.err, settledErr)
+			case !settled || !errors.Is(held.err, store.ErrOwnedTreeChanged):
+				cause = held.err
+			default:
+				continue
+			}
+			if _, seen := causes[held.name]; !seen {
+				order = append(order, held.name)
+			}
+			causes[held.name] = append(causes[held.name], cause)
+		}
+		released := make([]error, 0, len(order))
+		for _, name := range order {
+			released = append(released, addStagingPayloadRemedy(st, name, errors.Join(dedupeErrorText(causes[name])...)))
+		}
+		return released
+	}
 	// Everything already accumulated is owed to the caller even when a write
 	// below stops the run outright: the config exchange sweep's failure and
 	// every family problem named so far are unrelated to whatever stopped it,
 	// and nothing else reports them.
 	abort := func(err error) (PruneOutcome, error) {
+		problems = append(problems, releaseStagingPayloadProblems()...)
 		return outcome, errors.Join(errors.Join(problems...), err)
 	}
 	for _, key := range ordered {
@@ -370,6 +456,141 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 					}
 				}
 			}
+			// The same reclaim-before-prune rule applies to update's own
+			// residue, and for the same reason: the tree the update replaced
+			// is left orphaned at staging/<Name> whenever this operation's own
+			// afterTxnCleared reclaim (reclaimExchangedUpdatePayload,
+			// update.go) does not complete -- a crash before it runs, or that
+			// reclaim running and failing, since it drops its own error -- and
+			// PreviousPayload, the only manifest that proves what that tree is,
+			// lives in the very revisions this loop is about to delete.
+			// Reclaiming after pruning would make the tree permanently
+			// unverifiable, so it happens here, before the journal goes,
+			// exactly like the rm payload above. It is not counted in
+			// outcome.Files: a tree removed whole against a manifest is not a
+			// journal file, and rm's is not counted either (PruneOutcome).
+			//
+			// The claims test is the rm arm's, applied to the weaker name.
+			// removed-<name>-<StartHead> at least says which manifest produced
+			// it; staging/<Name> is the bare skill name, so a user's own
+			// directory, an abandoned install's staged tree and a pending
+			// transaction's staged content all sit on it just as legitimately
+			// as this family's orphan. That every operation publishing there
+			// refuses an occupied name (checkNewSkillAvailable in ops.go,
+			// checkAddAvailable in add.go, shared by adopt's own Preflight and
+			// Mutate in adopt.go, checkUpdateAvailable in update.go) proves
+			// something about the *pending* transaction's starting state, not
+			// about the object sitting here now -- an argument this code once
+			// ran backwards, and acted on. What a claim settles is only that
+			// this name is no evidence of ownership -- and nothing else about
+			// the object is evidence of it either, which is why the arm below
+			// stops at the claim rather than going on to inspect the tree.
+			if latest.Op == "update" && latest.PreviousPayload != nil {
+				name := latest.Name
+				switch {
+				case claimErr != nil:
+					// The pending set could not be read, so no staging name can
+					// be shown to be unclaimed -- and this is the rm arm's
+					// reasoning verbatim. A family with nothing left at either
+					// of its own candidate names waits for nothing: there is no
+					// object for any transaction to claim, so ownership cannot
+					// be in question and the manifest has nothing left to
+					// prove. Asking that first keeps one malformed journal
+					// filename from pinning every update family ever settled,
+					// which is nearly all of them -- the inline reclaim clears
+					// staging/<Name> the moment its transaction completes.
+					settled, settledErr := updateStagingPayloadSettled(st, name, *latest.PreviousPayload)
+					if settledErr != nil {
+						problems = append(problems, fmt.Errorf(
+							"check the tree an interrupted update may have left at %s: %w",
+							filepath.Join(st.StagingDir(), name), settledErr))
+						continue
+					}
+					if !settled {
+						continue
+					}
+				case stagingClaimed[name]:
+					// Claimed: leave the tree where it is, whatever it holds,
+					// and prune the family anyway. Same call the rm arm makes
+					// above, and it has to be the same call for a second
+					// reason: leaving the journal instead would have
+					// `fu status` counting these files Collectable (status.go's
+					// own settled-family rule) while gc walked past them run
+					// after run, which is the disagreement this whole change
+					// exists to end.
+					//
+					// The claim alone decides it. An earlier revision tried to
+					// reclaim when the object still carried the root identity
+					// this family recorded, on the grounds that a claimant's
+					// staged content is a fresh copy with a fresh inode. That
+					// is false, and destructively so: the exchange is a rename,
+					// so it preserves inodes. A rolled-back update leaves a
+					// completed family whose PreviousPayload names the tree
+					// restoreExchangedUpdate put back at skills/<name>
+					// (update_txn.go), the next update exchanges that very
+					// inode out to staging/<name>, and if it is interrupted
+					// before its commit the object there matches the older
+					// family's manifest by identity, mode and content -- it is
+					// the same object. Reclaiming it destroys the only copy
+					// that update's own rollback can exchange back, leaving
+					// recovery unable to reach a terminal state and every write
+					// command blocked at its prologue.
+					// TestPruneKeepsATreeAPendingUpdateNeedsWhoseIdentityMatches
+					// AnOlderFamily builds exactly that. It is the staging-side
+					// case of the rule DESIGN §2 states for recovery payloads:
+					// a name plus a manifest that matches it is not ownership.
+					//
+					// The cost is a known limitation, not a second defect.
+					// pendingStagingClaims takes record.Name from every pending
+					// record whatever its op, deliberately, and `fu rm` stages
+					// nothing -- its preflight reads fu.yaml and skills/<name>
+					// and never looks at staging (checkRemoveAvailable,
+					// checkRemoveStoreEntry, rm.go). So an update whose inline
+					// reclaim did not complete, followed by an rm of the same
+					// skill that died mid-transaction, leaves this family's own
+					// orphan under a name the rm claims.
+					//
+					// Losing the tree takes a third condition, and it is this
+					// command's own timing: `fu gc` has to run while that rm is
+					// still pending. Then gc leaves the tree, prunes the
+					// manifest, and the tree becomes uncollectable and is
+					// reported under Unmatched. Run any write command first and
+					// it recovers the rm before doing anything else; a rm in a
+					// terminal state claims nothing, so the next `fu gc` takes
+					// the default arm below and collects the orphan as usual.
+					// Two faults and a window, then, with the replaced content
+					// still in the store's git history (SPEC rule 3), against
+					// the alternative of a wedged store.
+					// The asymmetry this file states everywhere decides it:
+					// collecting a name too many only skips a deletion,
+					// collecting one too few destroys content another
+					// transaction is still counting on.
+					//
+					// Only the bare name is tested against the claims set, and
+					// the retired sibling deliberately is not: the claims set
+					// holds skill names and StagingReservation names only, a
+					// skill name cannot begin with "." (skill.nameRe, meta.go)
+					// and a reservation is ".fu-new-", so nothing ever claims a
+					// ".fu-retired-dir-" name.
+					//
+					// The effect, stated plainly: this arm leaves *both*
+					// candidate names alone and prunes anyway, so a retired
+					// sibling under a claimed name loses its manifest here and
+					// nothing collects it afterwards -- the same double-fault
+					// limitation this comment already accepts for the live name.
+					// status.go's own update arm is the counterpart and mirrors
+					// it exactly: under a claim it promises neither name.
+				default:
+					if err := reclaimUpdateStagingPayload(st, name, *latest.PreviousPayload); err != nil {
+						// Held, not reported: another family later in this run
+						// may own the tree that failed this one's manifest
+						// check (releaseStagingPayloadProblems).
+						heldStagingProblems = append(heldStagingProblems,
+							heldStagingProblem{name: name, expected: *latest.PreviousPayload, err: err})
+						continue
+					}
+				}
+			}
 			revisions := append([]txnRevision(nil), journal.revisions[key]...)
 			sort.Slice(revisions, func(i, j int) bool { return revisions[i].sequence < revisions[j].sequence })
 			record = txnPrune{Op: key.op, TxnID: key.id, CompletionName: completionName, Completion: completion}
@@ -411,29 +632,64 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 		}
 		outcome.Transactions++
 	}
+	problems = append(problems, releaseStagingPayloadProblems()...)
 	return outcome, errors.Join(problems...)
 }
 
-// pendingRecoveryPayloadClaims collects the recovery payload name every
-// pending transaction claims. The name is derived from all pending records,
-// not just the rm ones: rmPayloadName is a pure function of the skill name and
-// the start HEAD, so any pending transaction whose derivation lands on a name
-// is one gc cannot prove does not own the object sitting there. The two
-// mistakes are not symmetric -- collecting a name too many only skips a
-// deletion, collecting one too few deletes content another transaction is
-// still counting on.
+// dedupeErrorText drops causes that read identically, preserving order. Two
+// completed families on one staging name usually fail the same way for the same
+// reason -- one entry failed both manifests -- so joining both copies would put
+// the same sentence into the remedy twice, which is the noise grouping by name
+// exists to remove.
+func dedupeErrorText(errs []error) []error {
+	seen := make(map[string]bool, len(errs))
+	out := make([]error, 0, len(errs))
+	for _, err := range errs {
+		if text := err.Error(); !seen[text] {
+			seen[text] = true
+			out = append(out, err)
+		}
+	}
+	return out
+}
+
+// heldStagingProblem is one update family's failed staging reclaim, kept with
+// the manifest it failed against so the failure can be re-asked once the whole
+// run is over. See releaseStagingPayloadProblems for why the question is worth
+// asking twice.
+type heldStagingProblem struct {
+	name     string
+	expected store.OwnedTree
+	err      error
+}
+
+// pendingTxnClaims collects both sets of names a pending transaction claims:
+// the recovery payload names, and the staging names. Both are derived from all
+// pending records rather than from the ops that produce each form -- rm's
+// rmPayloadName is a pure function of the skill name and the start HEAD, and
+// update's staging name is just the skill name -- so any pending transaction
+// whose derivation lands on a name is one gc cannot prove does not own the
+// object sitting there. The two mistakes are not symmetric: collecting a name
+// too many only skips a deletion, collecting one too few destroys content
+// another transaction is still counting on.
 //
-// The derivation itself is pendingPayloadClaims (status.go), shared with the
-// read-only inventory so the two can never disagree about what a pending
-// transaction claims. It also derives the two install compensation names,
-// which this caller never looks up -- an over-claim on a distinct prefix,
-// which by the asymmetry above is the harmless direction.
-func pendingRecoveryPayloadClaims(st *store.Store) (map[string]bool, error) {
+// The derivations themselves are pendingPayloadClaims and pendingStagingClaims
+// (status.go), shared with the read-only inventory so the two can never
+// disagree about what a pending transaction claims. Retyping the rule instead
+// of sharing it is exactly how the staging half came to be missing here while
+// status already had it. pendingPayloadClaims also derives the two install
+// compensation names, which this caller never looks up -- an over-claim on a
+// distinct prefix, which by the asymmetry above is the harmless direction.
+//
+// One journal read serves both sets. They used to be one set and one read;
+// making it two reads would have doubled the scan and reported a damaged
+// journal twice, the same duplication Status was already fixed for.
+func pendingTxnClaims(st *store.Store) (payloads, staging map[string]bool, err error) {
 	pending, err := PendingTxns(st)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return pendingPayloadClaims(pending), nil
+	return pendingPayloadClaims(pending), pendingStagingClaims(pending), nil
 }
 
 func removeTxnJournalFile(st *store.Store, name string) (bool, error) {
@@ -448,4 +704,31 @@ func removeTxnJournalFile(st *store.Store, name string) (bool, error) {
 		return false, fmt.Errorf("remove transaction journal %s: %w", txnDisplayPath(st, name), err)
 	}
 	return true, nil
+}
+
+// addStagingPayloadRemedy is addRecoveryPayloadRemedy's counterpart for
+// update's own orphaned residue: it names the staging path that failed to
+// reclaim and, like its recovery-side sibling, prescribes nothing about the
+// journal family. The family is not damaged -- only the tree under the
+// staging directory is -- and its revisions carry the one manifest
+// (PreviousPayload) this tree can ever be verified and reclaimed by.
+// addPruneFamilyRemedy's advice, moving the family out of the recovery
+// directory, would destroy that manifest and strand the tree for good.
+//
+// It is worded for the one thing gc actually knows at this point, which is
+// less than it used to claim: the entry at this name failed the manifest
+// check, so it is not the tree the transaction recorded. The earlier wording
+// told the reader to "move that directory out of staging to abandon the copy",
+// which described content fu had just proved was not its own copy at all --
+// most likely the reader's own directory on a name that is, after all, only
+// the skill's name. Both readings now get an instruction that fits them, and
+// neither is told to abandon anything.
+func addStagingPayloadRemedy(st *store.Store, name string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w; the entry at %s is not the tree this transaction recorded, so fu left it exactly as it is and kept the transaction journal intact for the next `fu gc` to retry: if the entry is yours, move it out of %s and the next run finishes this family; if it is meant to be the tree the update replaced, restore it to its recorded content -- that content also remains in the store's git history; leave this transaction's txn-* records where they are, they hold the only manifest that can verify and reclaim this tree",
+		err, filepath.Join(st.StagingDir(), name), st.StagingDir(),
+	)
 }

@@ -461,18 +461,20 @@ func TestStatusInventoriesRecoveryByWhatTheUserCanDo(t *testing.T) {
 }
 
 // TestStatusInventoriesStagingByWhatTheUserCanDo pins the staging half of the
-// same split-by-remedy. It has three buckets where recovery has four, and the
-// missing one is missing for a reason: staging holds no authority SPEC §9
-// promises, so nothing there is kept on purpose. Nothing is collectable in
-// recovery's sense either -- `fu gc` never looks at staging at all -- so that
-// bucket carries a different distinction here: an entry a recovery pass
-// settles, one nothing settles ever, and one whose remedy belongs to whoever
-// put it there.
+// same split-by-remedy. This fixture's nine entries land in three of
+// staging's four buckets -- Blocked, Uncollectable, and the Unmatched bucket
+// recovery has no counterpart for -- and none in Collectable:
+// TestStatusCountsAnOrphanUpdateStagingPayloadAsCollectable pins that one
+// directly, on its own fixture, since building a completed update family
+// alongside these nine plain directories here would test the same thing
+// twice. Among the three buckets this fixture does exercise, the split is: an
+// entry a recovery pass settles, one nothing settles at all, and one whose
+// remedy belongs to whoever put it there.
 //
-// Every cleanup path in staging is an in-process defer (source/scratch.go's
-// constructor cleanup and Close, ownedtree.go's reservation cleanup), which is
-// precisely why a process exit strands these names: no later run enumerates the
-// directory to finish the job.
+// Every cleanup path behind Uncollectable is an in-process defer
+// (source/scratch.go's constructor cleanup and Close, ownedtree.go's
+// reservation cleanup), which is precisely why a process exit strands these
+// names: no later run enumerates the directory to finish the job.
 func TestStatusInventoriesStagingByWhatTheUserCanDo(t *testing.T) {
 	s, _ := setupStore(t)
 	cfg, err := store.LoadConfig(s.ConfigPath())
@@ -1106,6 +1108,186 @@ func TestStatusCountsUnmatchedStagingNames(t *testing.T) {
 	}
 }
 
+// TestStatusCountsAnOrphanUpdateStagingPayloadAsCollectable pins that the
+// residue `fu gc` collects under staging/ must also be visible to the
+// read-only report -- otherwise `fu status` says "nothing to report" over an
+// entry `fu gc` is about to remove, the exact defect the journal-family
+// accounting fixed once already (collectableRecoveryNamesFromJournal's own
+// doc comment tells that story for recovery/; this is the same story for
+// staging/). The fixture is
+// TestPruneReclaimsOrphanUpdateStagingPayloadBeforePruningItsJournal's
+// (gc_test.go): a completed, unpruned "update" family whose PreviousPayload
+// names content actually sitting at staging/<name>. It is built directly here
+// rather than through that test's re-exec crash child, because a report
+// assertion needs the state, not the crash that produces it -- the crash
+// itself is covered where it belongs, by the gc test, through the
+// beforeUpdateReclaim hook (round 2, Minor #1: this comment used to say that
+// hook did not exist, which its own referenced test now contradicts).
+func TestStatusCountsAnOrphanUpdateStagingPayloadAsCollectable(t *testing.T) {
+	s, _ := setupStore(t)
+	cfg, err := store.LoadConfig(s.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := checkedRecoveryStore(t, s)
+
+	stagingPath := filepath.Join(s.StagingDir(), "alpha")
+	writeSkillBody(t, stagingPath, "alpha", "replaced content")
+	previousPayload, err := checked.SnapshotStagedPayload("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	record := &TxnRecord{
+		Op:              "update",
+		Name:            "alpha",
+		Stage:           "published",
+		PreviousPayload: &previousPayload,
+	}
+	if err := WriteTxn(checked, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearTxn(checked, *record); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := Status(s, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (StagingInventory{Collectable: 1}); report.Staging != want {
+		t.Fatalf("an orphaned update staging tree a completed family describes must be reported collectable: got %+v, want %+v", report.Staging, want)
+	}
+	// Read-only means read-only: status must not have touched the tree it is
+	// reporting on.
+	if _, err := os.Lstat(stagingPath); err != nil {
+		t.Fatalf("status must not touch the staging tree it is reporting on, lstat err=%v", err)
+	}
+}
+
+// TestStatusDoesNotCountAnOrdinaryCompletedUpdateAsCollectable pins the
+// negative direction gc's own review caught once already: every
+// completed content-shape update sets PreviousPayload unconditionally, and
+// nothing ever clears it, so the gate alone -- Op == "update" with
+// PreviousPayload set -- is true of nearly every completed update family,
+// including the ordinary uncrashed ones whose own inline reclaim
+// (reclaimExchangedUpdatePayload, update.go) already cleared staging/<name>
+// before Status ever runs. Counting every one of those as collectable would
+// tell the reader to run a command over a name that is not there at all. The
+// fixture is TestPruneSucceedsWhenTheUpdateStagingTreeIsAlreadyReclaimed's
+// (gc_test.go).
+func TestStatusDoesNotCountAnOrdinaryCompletedUpdateAsCollectable(t *testing.T) {
+	s, _ := setupStore(t)
+	cfg, err := store.LoadConfig(s.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := checkedRecoveryStore(t, s)
+
+	stagingPath := filepath.Join(s.StagingDir(), "alpha")
+	writeSkillBody(t, stagingPath, "alpha", "replaced content")
+	previousPayload, err := checked.SnapshotStagedPayload("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The ordinary path: the tree update's own inline reclaim left is already
+	// gone by the time Status runs.
+	if err := os.RemoveAll(stagingPath); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &TxnRecord{
+		Op:              "update",
+		Name:            "alpha",
+		Stage:           "published",
+		PreviousPayload: &previousPayload,
+	}
+	if err := WriteTxn(checked, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearTxn(checked, *record); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := Status(s, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Staging != (StagingInventory{}) {
+		t.Fatalf("an already-reclaimed update family has nothing left to collect: got %+v, want zero value", report.Staging)
+	}
+}
+
+// TestStatusCountsAnUpdateStagingRetiredRootAsCollectable pins the other half
+// of the presence check's OR, load-bearing the same way
+// TestStatusCountsARetiredRootItsManifestDescribesAsCollectable pins it for
+// the rm side: a crash inside `fu gc`'s own previous reclaim attempt can leave
+// the tree parked at the deterministic retired sibling
+// (store.RetiredRecoveryRootName) rather than at the live name, and
+// RemoveOwnedTreeAt resumes from exactly that name on replay. Reporting it as
+// anything but collectable would push a reader toward deleting a resumable
+// intermediate by hand.
+func TestStatusCountsAnUpdateStagingRetiredRootAsCollectable(t *testing.T) {
+	s, _ := setupStore(t)
+	cfg, err := store.LoadConfig(s.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := checkedRecoveryStore(t, s)
+
+	stagingPath := filepath.Join(s.StagingDir(), "alpha")
+	writeSkillBody(t, stagingPath, "alpha", "replaced content")
+	previousPayload, err := checked.SnapshotStagedPayload("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The live name is already gone -- parked at its retired sibling instead,
+	// the state an interrupted `fu gc` reclaim attempt leaves. Built through
+	// the same two steps RemoveOwnedTreeAt performs in that order, empty the
+	// tree then retire the root (gc_test.go builds it the same way, and for
+	// the same reason): a MkdirAll here would give the retired root a fresh
+	// inode, and a real `fu gc` against that state would fail, since
+	// finishRetiredOwnedDirectory revalidates the recorded root identity
+	// (store/retire.go). Status admits the name by name alone, so the test
+	// would still pass -- over a state that cannot arise.
+	liveDir, err := os.Open(stagingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveOwnedContents(liveDir, previousPayload); err != nil {
+		_ = liveDir.Close()
+		t.Fatal(err)
+	}
+	if err := liveDir.Close(); err != nil {
+		t.Fatal(err)
+	}
+	retired := store.RetiredRecoveryRootName("alpha", previousPayload)
+	if err := os.Rename(stagingPath, filepath.Join(s.StagingDir(), retired)); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &TxnRecord{
+		Op:              "update",
+		Name:            "alpha",
+		Stage:           "published",
+		PreviousPayload: &previousPayload,
+	}
+	if err := WriteTxn(checked, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearTxn(checked, *record); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := Status(s, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (StagingInventory{Collectable: 1}); report.Staging != want {
+		t.Fatalf("a retired root the manifest still describes is resumable, so Collectable: got %+v, want %+v", report.Staging, want)
+	}
+}
+
 // TestStatusDoesNotCallMalformedExchangeNamesCollectable pins the inventory to
 // what `fu gc` will really unlink on the record/marker side.
 //
@@ -1590,4 +1772,118 @@ func recoveryInventoryDelta(t *testing.T, s *store.Store, cfg *store.Config, pla
 		Retained:      after.Recovery.Retained - before.Recovery.Retained,
 		Uncollectable: after.Recovery.Uncollectable - before.Recovery.Uncollectable,
 	}, errors.Join(beforeErr, afterErr)
+}
+
+// TestStatusDoesNotCallAForeignStagingEntryCollectable is the read-only half of
+// the same ownership question TestPruneKeepsAStagingNameClaimedByPendingTransaction
+// asks of `fu gc` (gc_test.go). staging/<name> is the bare skill name, so a
+// completed update family naming it proves nothing about whatever is sitting
+// there now: a user's own directory lands on exactly the same name.
+//
+// Reporting that as collectable is a promise `fu gc` cannot keep -- it refuses
+// content it cannot verify against the recorded manifest -- so the reader is
+// told to run a command that exits 1 and repeats the same refusal on every
+// later run. Ownership is decided here the way gc's own removal decides it
+// first: the entry must still resolve to the root identity the manifest states
+// (store.StagingRootMatches). Anything else falls to Unmatched, exactly where
+// the identical directory lands when no family describes the name at all.
+func TestStatusDoesNotCallAForeignStagingEntryCollectable(t *testing.T) {
+	s, _ := setupStore(t)
+	cfg, err := store.LoadConfig(s.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := checkedRecoveryStore(t, s)
+
+	stagingPath := filepath.Join(s.StagingDir(), "alpha")
+	writeSkillBody(t, stagingPath, "alpha", "the tree the update replaced")
+	previousPayload, err := checked.SnapshotStagedPayload("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(stagingPath); err != nil {
+		t.Fatal(err)
+	}
+	record := &TxnRecord{Op: "update", Name: "alpha", Stage: "published", PreviousPayload: &previousPayload}
+	if err := WriteTxn(checked, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearTxn(checked, *record); err != nil {
+		t.Fatal(err)
+	}
+	// Somebody else's directory on the same name, with its own identity.
+	if err := os.MkdirAll(stagingPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingPath, "notes.md"), []byte("mine"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := Status(s, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (StagingInventory{Unmatched: 1}); report.Staging != want {
+		t.Fatalf("an entry fu cannot show is its own must not advertise `fu gc`: got %+v, want %+v", report.Staging, want)
+	}
+}
+
+// TestStatusCallsAClaimedStagingNameBlockedNotCollectable is the status half of
+// TestPruneKeepsAStagingNameClaimedByPendingTransaction's fixture (gc_test.go):
+// a completed, unpruned update family for alpha beside a pending update of the
+// same skill whose staged replacement occupies staging/alpha.
+//
+// The remedy that name has is a recovery pass, which every write command and
+// `fu restore` run -- and which `fu gc` deliberately never does. Reporting it
+// collectable would name the one command that will not settle it, and would
+// contradict gc, which now leaves a claimed name exactly where it is.
+func TestStatusCallsAClaimedStagingNameBlockedNotCollectable(t *testing.T) {
+	s, _ := setupStore(t, "alpha")
+	cfg, err := store.LoadConfig(s.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := checkedRecoveryStore(t, s)
+
+	stagingPath := filepath.Join(s.StagingDir(), "alpha")
+	writeSkillBody(t, stagingPath, "alpha", "the tree an earlier update replaced")
+	settled, err := checked.SnapshotStagedPayload("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(stagingPath); err != nil {
+		t.Fatal(err)
+	}
+	completed := &TxnRecord{Op: "update", Name: "alpha", Stage: "published", PreviousPayload: &settled}
+	if err := WriteTxn(checked, completed); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearTxn(checked, *completed); err != nil {
+		t.Fatal(err)
+	}
+
+	writeSkillBody(t, stagingPath, "alpha", "the replacement a pending update staged")
+	staged, err := checked.SnapshotStagedPayload("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedTree, err := checked.SnapshotSkillPayload("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := &TxnRecord{
+		Op: "update", Name: "alpha", Stage: updateTxnStaged,
+		Payload: &staged, PreviousPayload: &publishedTree,
+	}
+	if err := WriteTxn(checked, pending); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := Status(s, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (StagingInventory{Blocked: 1}); report.Staging != want {
+		t.Fatalf("a staging name a pending transaction claims waits on recovery, not on gc: got %+v, want %+v", report.Staging, want)
+	}
 }

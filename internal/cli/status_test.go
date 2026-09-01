@@ -360,13 +360,16 @@ func TestStatusCommandSaysSoWhenFullyClean(t *testing.T) {
 // recovery) end to end from one report, which no single-section test above
 // exercises.
 // TestStatusCommandReportsStagingWithoutSendingUserToGC pins the staging
-// section's wording and the single way it must differ from the recovery
-// section's. `fu gc` never looks at staging, so the waiting line stops at
-// `fu restore` instead of repeating recovery's "then `fu gc`" -- naming gc here
-// would send a reader to watch a count not move, the exact failure the split
-// into buckets exists to prevent. The uncollectable line carries the same
-// deliberately inactionable wording as recovery's, and for the same reason:
+// section's wording for its two buckets `fu gc` still never reaches: Blocked
+// and Uncollectable. Naming gc for either would send a reader to watch a
+// count not move, the exact failure the split into buckets exists to
+// prevent -- so the waiting line stops at `fu restore` instead of repeating
+// recovery's "then `fu gc`", and the uncollectable line carries the same
+// deliberately inactionable wording as recovery's, for the same reason:
 // nothing here has the ownership evidence that would justify deleting it.
+// This fixture's Collectable is deliberately left at zero;
+// TestStatusCommandReportsStagingCollectableEntriesLikeRecoverys pins the one
+// bucket that does name `fu gc`.
 func TestStatusCommandReportsStagingWithoutSendingUserToGC(t *testing.T) {
 	outcome := engine.StatusOutcome{Report: engine.StatusReport{
 		Staging: engine.StagingInventory{Blocked: 2, Uncollectable: 3},
@@ -396,6 +399,35 @@ func TestStatusCommandReportsStagingWithoutSendingUserToGC(t *testing.T) {
 	for _, verb := range []string{"delete", "remove it", "rm -", "safe to", "clean up", "may remove"} {
 		if strings.Contains(lower, verb) {
 			t.Fatalf("staging wording must not invite deletion (found %q): %q", verb, out)
+		}
+	}
+}
+
+// TestStatusCommandReportsStagingCollectableEntriesLikeRecoverys pins the one
+// staging bucket that does name `fu gc`, worded exactly like recovery's own
+// collectable line. `fu gc` now reclaims the tree an update replaced when it
+// is left orphaned at staging/<name>, so
+// TestStatusCommandReportsStagingWithoutSendingUserToGC's "never" is no
+// longer true of every staging bucket -- only this one names `fu gc`.
+func TestStatusCommandReportsStagingCollectableEntriesLikeRecoverys(t *testing.T) {
+	outcome := engine.StatusOutcome{Report: engine.StatusReport{
+		Staging: engine.StagingInventory{Collectable: 1},
+	}}
+	cmd := newStatusCmd(fakeStatusApplication{outcome: outcome})
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	cmd.SetArgs([]string{})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"staging",
+		"1 collectable (run `fu gc`)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("status output missing %q:\n%s", want, out)
 		}
 	}
 }
@@ -743,6 +775,17 @@ func TestStatusCommandPrintsTheUnmatchedStagingLine(t *testing.T) {
 		if strings.Contains(out, notWant) {
 			t.Fatalf("the staging line must not invite deletion (%q):\n%s", notWant, out)
 		}
+	}
+	// Round 4: the promise has to be conditional. The bucket's default arm
+	// also catches names no command will ever be asked to reuse -- notably a
+	// `.fu-retired-dir-<token>` stranded under staging by the double fault --
+	// so an unconditional "these commands refuse to reuse these names"
+	// promises a refusal that cannot come for them.
+	if !strings.Contains(out, "one on a skill's own name blocks") {
+		t.Fatalf("the staging line must condition its promise on the entry being a skill name:\n%s", out)
+	}
+	if strings.Contains(out, "refuse to reuse these names") {
+		t.Fatalf("the staging line must not promise a refusal for every entry it counts:\n%s", out)
 	}
 }
 

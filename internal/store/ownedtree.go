@@ -1669,6 +1669,76 @@ func (s *Store) RecoveryPayloadSettled(name string, expected OwnedTree) (bool, e
 	return true, nil
 }
 
+// StagingRootMatches reports whether the entry at staging/<name> still resolves
+// to the root identity and mode a manifest states. It is the first comparison
+// RemoveOwnedTreeAt's own all-or-nothing preflight makes
+// (compareOwnedTreeCleanupState), asked on its own so a read-only caller can
+// tell fu's own tree apart from an unrelated directory occupying the same name.
+//
+// It exists because a published staging name carries no ownership at all. Under
+// recovery/ every name fu reclaims by is derived -- removed-<name>-<StartHead>,
+// .fu-retired-dir-<token> -- so a name match is at least evidence about which
+// manifest produced it. staging/<name> is the bare skill name: a user's own
+// directory, an abandoned install's staged tree and a pending transaction's
+// staged content all land on it just as legitimately as the tree an update
+// replaced. Nothing but identity separates them.
+//
+// It is emphatically not an ownership test, and no caller may decide a deletion
+// with it. A true answer means "the object here is the one that manifest was
+// taken from", which is a strictly weaker claim than "the transaction holding
+// that manifest is the one entitled to it". The exchange is a rename and
+// renames preserve inodes, so a rolled-back update leaves a completed family
+// whose manifest names the tree now published at skills/<name>, the next update
+// exchanges that same object out to staging/<name>, and an interruption there
+// leaves it matching the older family's manifest by identity, mode and content
+// alike -- while being the only copy the newer transaction's rollback can
+// exchange back. `fu gc` acted on that once and could wedge a store with it.
+// Ownership is settled by the pending claims (engine's pendingStagingClaims),
+// and this answers a narrower question for a report: is the entry fu's own tree
+// or an unrelated directory that merely occupies the name.
+//
+// It reads inode metadata only; nothing is opened, hashed or parsed, so it says
+// nothing about the tree's contents -- a caller needing that must still let
+// RemoveOwnedTreeAt hash the whole tree. This is the same bargain
+// CollectableConfigArchiveNames strikes for archive names, and it is struck for
+// the same caller: `fu status` reports what gc will act on without ever reading
+// the content it is counting.
+//
+// Errors fold into false, again as CollectableConfigArchiveNames does. The
+// question is "can this be shown to be the manifested tree", and an entry that
+// cannot be stat'd cannot be.
+//
+// Pinned when a write session is open and reached by pathname when it is not,
+// exactly as CollectableConfigArchiveNames reaches the recovery directory;
+// `fu status` takes no lock and opens no session, so the pathname branch is its
+// ordinary route and the worst a swap under it costs a read-only report is a
+// stale count.
+func (s *Store) StagingRootMatches(name string, expected OwnedTree) bool {
+	if !validLogicalEntry(name) {
+		return false
+	}
+	var staging *checkedRoot
+	if s.writeRoots != nil {
+		staging = s.writeRoots.staging
+	}
+	var stat unix.Stat_t
+	var err error
+	if staging != nil {
+		stat, err = statAt(int(staging.dir.Fd()), name)
+		keepDescriptorOwnersAlive(staging)
+	} else {
+		err = unix.Lstat(filepath.Join(s.StagingDir(), name), &stat)
+	}
+	if err != nil {
+		return false
+	}
+	mode, kind, modeErr := modeAndKind(&stat)
+	if modeErr != nil || kind != ownedDirectory {
+		return false
+	}
+	return identityFromStat(&stat) == expected.RootIdentity && uint32(mode) == expected.RootMode
+}
+
 // ReclaimRecoveryPayloadOwned disposes of a transaction payload whose owning
 // transaction has already reached its terminal marker. It is the disposal
 // counterpart of ArchiveRecoveryPayloadOwned: the manifest binds every entry,

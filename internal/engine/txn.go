@@ -37,6 +37,11 @@ type TxnRecord struct {
 	Message        string           `json:"message,omitempty"`
 	ConfigBefore   []byte           `json:"config_before,omitempty"`
 	Payload        *store.OwnedTree `json:"payload,omitempty"`
+	// PreviousPayload records the published tree an update is replacing.
+	// Recovery needs both manifests because the exchange is the transaction's
+	// only pivot: matching one or the other against skills/<name> is how it
+	// learns whether the crash landed before or after that single step.
+	PreviousPayload *store.OwnedTree `json:"previous_payload,omitempty"`
 	// StagingReservation binds a private staged root before its final name is
 	// published. It closes the create-to-journal ownership gap.
 	StagingReservation *store.StagedRootReservation `json:"staging_reservation,omitempty"`

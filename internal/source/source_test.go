@@ -1027,6 +1027,141 @@ func TestPrepareGitSourceTag(t *testing.T) {
 	}
 }
 
+// TestPrepareGitSourceRecordedRefKindIsNotProbed pins that a known ref form is
+// cloned as itself and never fallen back from. The branch-then-tag probe
+// exists for `fu add`, where the user typed a bare name and did not say which
+// form they meant; an installed skill's fu.yaml records ref_kind, and update
+// reconstructs it (sourceFromFields, internal/engine/application.go).
+//
+// Without that, a branch deleted upstream between `fu outdated`'s ls-remote
+// and update's clone falls through to a same-named tag: the clone succeeds,
+// EncodeFields writes ref_kind: tag, and the skill silently becomes a fixed
+// lock `fu outdated` never examines again. The repository below is exactly
+// that state -- a tag named "release" and no branch of that name.
+func TestPrepareGitSourceRecordedRefKindIsNotProbed(t *testing.T) {
+	repo, work, _ := seedWorktree(t, map[string]string{
+		"pdf-tools": "---\nname: pdf-tools\ndescription: d\n---\n",
+	})
+	head, err := repo.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateTag("release", head.Hash(), nil); err != nil {
+		t.Fatal(err)
+	}
+	bare := t.TempDir()
+	if _, err := git.PlainInit(bare, true); err != nil {
+		t.Fatal(err)
+	}
+	pushWorktree(t, work, bare)
+	srcRepo, err := git.PlainOpen(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tagRemote, err := srcRepo.Remote("origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tagRemote.Push(&git.PushOptions{
+		RefSpecs: []config.RefSpec{config.RefSpec("refs/tags/release:refs/tags/release")},
+	}); err != nil {
+		t.Fatalf("push tag: %v", err)
+	}
+	url := "file://" + bare
+
+	branchOnly := Source{Kind: KindGit, URL: url, Ref: "release", RefKind: "branch"}
+	p, err := branchOnly.Prepare(t.TempDir())
+	if err == nil {
+		lock := p.Lock()
+		_ = p.Close()
+		t.Fatalf("a recorded branch must not silently resolve to a same-named tag, got lock %+v", lock)
+	}
+
+	// The tag form of the same name still clones, so the refusal above is
+	// about the recorded kind and not about the ref being unreachable.
+	tagOnly := Source{Kind: KindGit, URL: url, Ref: "release", RefKind: "tag"}
+	tagPrepared, err := tagOnly.Prepare(t.TempDir())
+	if err != nil {
+		t.Fatalf("Prepare with the recorded tag kind: %v", err)
+	}
+	lock := tagPrepared.Lock()
+	if err := tagPrepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if lock.RefKind != "tag" || lock.Ref != "refs/tags/release" {
+		t.Fatalf("lock = %+v, want tag refs/tags/release", lock)
+	}
+}
+
+// cloneSource's switch says that when src.RefKind names a form, that form alone
+// is cloned -- but an unrecognised non-empty value fell out of the switch into
+// the branch-then-tag probe below it, which is exactly the guessing the recorded
+// kind exists to remove. It would also probe an unstripped ref, since
+// shortRecordedRef leaves a kind it does not recognise alone, so the attempt
+// would be for refs/heads/refs/heads/<ref>. Unreachable from fu's own writes
+// today -- sourceFromFields is reached only for rows judgeGitUpdate already
+// proved comparable, which requires ref_kind "branch" -- so this is latent
+// rather than live. It is pinned anyway because the legitimate empty case sits
+// directly beneath it and the two must not share an arm.
+func TestPrepareGitSourceRefusesAnUnrecognizedRefKind(t *testing.T) {
+	repo, work, _ := seedWorktree(t, map[string]string{
+		"pdf-tools": "---\nname: pdf-tools\ndescription: d\n---\n",
+	})
+	head, err := repo.Head()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare := t.TempDir()
+	if _, err := git.PlainInit(bare, true); err != nil {
+		t.Fatal(err)
+	}
+	pushWorktree(t, work, bare)
+	url, branch := "file://"+bare, head.Name().Short()
+
+	unknown := Source{Kind: KindGit, URL: url, Ref: branch, RefKind: "banana"}
+	p, err := unknown.Prepare(t.TempDir())
+	if err == nil {
+		lock := p.Lock()
+		_ = p.Close()
+		t.Fatalf("an unrecognized recorded ref kind must fail closed rather than probe, got lock %+v", lock)
+	}
+	if !strings.Contains(err.Error(), "banana") {
+		t.Fatalf("the refusal must name the kind it did not recognize: %v", err)
+	}
+
+	// The same ref with no recorded kind still probes and clones, so the
+	// refusal above is about the unrecognised value and not about the ref.
+	unset := Source{Kind: KindGit, URL: url, Ref: branch}
+	prepared, err := unset.Prepare(t.TempDir())
+	if err != nil {
+		t.Fatalf("Prepare with no recorded kind must still probe: %v", err)
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The local counterpart to ResolveRemoteRef's empty-URL refusal: defence in
+// depth for a recorded path the engine's own judgeLocalUpdate guard should
+// already have refused. openPreparedRoot opens whatever it is handed, so a
+// relative path resolves against the process's working directory and prepares a
+// source from a directory the record does not name. Every writer produces an
+// absolute path (ParseArg runs filepath.Abs and EvalSymlinks, adopt records
+// EvalSymlinks output under an absolute agent dir), so this refuses nothing fu
+// itself can write.
+func TestPrepareLocalSourceRefusesARelativePath(t *testing.T) {
+	for _, path := range []string{"", "../other-repo", "relprobe"} {
+		p, err := Source{Kind: KindLocal, Path: path}.Prepare(t.TempDir())
+		if err == nil {
+			_ = p.Close()
+			t.Fatalf("a relative recorded path (%q) must be refused, not resolved against the working directory", path)
+		}
+		if !strings.Contains(err.Error(), "absolute") {
+			t.Fatalf("Prepare(%q) = %v, want the refusal to say the path must be absolute", path, err)
+		}
+	}
+}
+
 func TestPrepareGitSourceBranchWithSlash(t *testing.T) {
 	repo, _, _ := seedWorktree(t, map[string]string{
 		"pdf-tools": "---\nname: pdf-tools\ndescription: d\n---\n",

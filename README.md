@@ -26,22 +26,25 @@ move, and every change is a commit.
 
 ## Status
 
-**Thirteen commands ship today:** `init`, `new`, `list`, `show`, `status`,
-`restore`, `revert`, `enable`, `disable`, `add`, `adopt`, `rm`, `gc`.
+**Fifteen commands ship today:** `init`, `new`, `list`, `show`, `status`,
+`restore`, `revert`, `enable`, `disable`, `add`, `adopt`, `rm`, `outdated`,
+`update`, `gc`.
 
 `add` installs a skill from a git URL or a local directory and records the
 locked source; `adopt` takes skills that already live in an agent's directory
 into the store, switching them to fu links; `rm` unregisters a skill and
-removes it from every agent; `gc` safely prunes completed transaction
-journals; `status` reports drift between `fu.yaml` and disk without changing
-the store; `restore` rebuilds agent links from `fu.yaml` and reports any
-uncommitted store worktree content without discarding it; `--hard` discards
-the part of that content which is tracked, and never touches untracked files;
-`revert` rolls the store back a given number of operations,
-converging the store's worktree to an earlier commit's tree and republishing
-that as a new commit.
-Still designed but not built: `update`, `outdated`,
-`clone`, `push`, `pull`, `log`, `commit`,
+removes it from every agent; `outdated` lists which installed skills have a
+newer version available upstream; `update` pulls that version in — for one
+named skill, or every updatable one when none is given — and leaves a skill
+modified since install alone unless told `--force`; `gc` safely prunes
+completed transaction journals; `status` reports drift between `fu.yaml` and
+disk without changing the store; `restore` rebuilds agent links from
+`fu.yaml` and reports any uncommitted store worktree content without
+discarding it; `--hard` discards the part of that content which is tracked,
+and never touches untracked files; `revert` rolls the store back a given
+number of operations, converging the store's worktree to an earlier commit's
+tree and republishing that as a new commit.
+Still designed but not built: `clone`, `push`, `pull`, `log`, `commit`,
 `remote`, `agent`. See [Roadmap](#roadmap).
 
 **macOS and Linux.** fu relies on POSIX directory-relative syscalls and does not
@@ -208,7 +211,9 @@ so a skill is never out of date in one agent and current in another.
 | `fu add [--all] [--ref <ref>] <source>` | Install from a git URL (including SCP forms) or local directory; `--ref` explicitly selects a git branch or tag. A source holding several skills prompts for a comma-separated selection (or `all`); `--all` installs every valid skill without prompting. Submitting an empty selection is an intentional successful cancellation (nothing is installed); input ending before any choice is an error. |
 | `fu adopt [--agent <a>]` | Take existing skill entries into the store, switching them to fu links; an explicitly empty agent value is rejected. |
 | `fu rm <name>` | Unregister a skill and remove it from every agent. |
-| `fu gc` | Safely prune completed transaction journal revisions and markers, and reclaim the bookkeeping a finished `rm` or `fu.yaml` rewrite no longer needs; the originals an `adopt` replaced are never deleted. |
+| `fu outdated` | List installed skills whose recorded source has moved past the version fu.yaml locks. Read-only: a git source is checked with an ls-remote-style query (lists refs, never clones or fetches an object) and a local source by reading its directory directly; neither ever writes to the store. |
+| `fu update [name]` | Pull the newer content in for one named skill, or for every updatable one when `name` is omitted. Refuses to overwrite a skill that was modified since it was installed unless `--force` is given; `--force` requires naming a single skill. |
+| `fu gc` | Safely prune completed transaction journal revisions and markers, and reclaim the bookkeeping a finished `rm`, `update`, or `fu.yaml` rewrite no longer needs; the originals an `adopt` replaced are never deleted. |
 | `fu list` | Show every skill and the full switch matrix. |
 | `fu show <name>` | Show one skill's frontmatter, digest and per-agent state. |
 | `fu status` | Report how `fu.yaml`'s expectations and what's on disk differ, plus the store worktree's state, any unfinished transaction, and what `recovery/` and `staging/` are holding; read-only, and finding a difference is not a failure — it exits 0 with the report. Failing to read the store at all is still an error. Read-only means it writes no store content, takes no lock and creates no agent directory; opening `$FU_HOME` does recreate `staging/` and `recovery/` if they have gone missing, which every command does alike. |
@@ -241,15 +246,19 @@ other three are per-machine bookkeeping.
 
 `recovery/` holds more than the write-ahead journal. `fu gc` prunes completed
 transaction revision families, using a crash-resumable prune record before it
-deletes the first journal file. It also reclaims two things a finished
-operation no longer needs: the copy an `rm` set aside before it removed a
-skill, and the records a `fu.yaml` rewrite wrote to make the swap recoverable.
+deletes the first journal file. It also reclaims two things under `recovery/`
+that a finished operation no longer needs: the copy an `rm` set aside before it
+removed a skill, and the records a `fu.yaml` rewrite wrote to make the swap
+recoverable. (A third kind of residue lives outside this directory — the tree a
+finished `update` replaced, left under `staging/`; the paragraph on `staging/`
+below covers it.)
 Each is normally reclaimed by the command that created it, the moment that
-command's transaction is durably complete, so `fu gc` is there for the ones a
-crash stranded. It only ever deletes a payload it can still check against the
-manifest in that payload's own journal, and never one an unfinished
-transaction may still need. The removed skill itself stays recoverable from
-the store's git history regardless.
+command's transaction is durably complete, so `fu gc` is there for the ones
+that reclaim did not complete — whether a crash interrupted it, or the
+reclaim itself ran and failed. It only ever deletes a payload it can still
+check against the manifest in that payload's own journal, and never one an
+unfinished transaction may still need. The removed skill itself stays
+recoverable from the store's git history regardless.
 
 What `fu gc` still never deletes includes every original an `adopt` replaced.
 So if an adopt took in a directory you wanted back, the content is still on
@@ -280,15 +289,48 @@ settles an interrupted transaction, and then `fu gc`; whichever ones survive
 that, with no command reporting a pending or conflicting transaction, belong to
 no journal fu can still act on.
 
-`staging/` is the other machine-local directory `fu status` accounts for, and
-it works differently: `fu gc` never looks at it at all. Every cleanup path
-there is an in-process one, so a process killed mid-write can strand a name
-that no later run will ever enumerate and collect. `fu status` reports what it
-finds in three groups — entries a recovery pass settles (run any write command,
-or `fu restore`), entries nothing collects yet, and entries fu holds no pending
-record for. Only the last has a remedy, and it is not fu's to perform: those
-names belong to whoever put them there, and they are what makes `fu new` or
-`fu add` refuse to reuse a name.
+`staging/` is the other machine-local directory `fu status` accounts for.
+Almost every cleanup path there is still an in-process one, so a process
+killed mid-write can strand a name that no later run will ever enumerate and
+collect. The one exception is `update`: the tree it replaces is ordinarily
+reclaimed inline, the moment that update finishes, so `fu gc` only finds
+work here when that inline reclaim did not complete — whether a crash
+interrupted it, or the reclaim itself ran and failed. Exactly as it does for
+`recovery/`, it checks the stranded tree against the transaction's own
+recorded manifest before it removes anything, and it leaves the name alone
+whenever any unfinished transaction claims it, whatever is actually sitting
+there. That claim is decided by name alone, deliberately: a `staging/` name is
+just the skill's name, so matching a manifest there proves the tree is a copy
+of what a record describes, never that it belongs to that record — and
+removing a tree an unfinished transaction still needs is the one mistake with
+no way back. The cost is a case `fu gc` will never clean up: if an update's
+inline reclaim is interrupted and an `fu rm` of that same skill is then
+interrupted too, the rm claims the name, and a `fu gc` run before that rm is
+recovered leaves the tree and prunes the manifest that could still prove what
+it is — after which nothing collects it. Both faults have to happen and `fu gc`
+has to land in the window between them: any write command finishes the pending
+rm first, and once it does, nothing claims the name and the next `fu gc`
+collects the tree. The replaced content is still in the store's git history
+either way.
+`fu status` reports what it finds in four groups — that one reclaimable
+update residue, entries a recovery pass settles instead (run any write
+command, or `fu restore`), entries nothing collects yet, and entries fu holds
+no pending record for. A directory of your own on a skill's name goes in the
+last group when the only record naming it is a completed one — `fu status`
+calls an entry reclaimable only when it is still the tree that record
+describes. While an *unfinished* transaction claims the name, it goes in the
+second group instead, waiting on that transaction rather than on you.
+Only the last has a remedy that is not fu's to perform: those names belong
+to whoever put them there, and one on a skill's own name is what makes
+`fu new`, `fu add`, `fu adopt` or `fu update` refuse to reuse it. With one
+exception, which is the double fault just described: what is left there when
+an interrupted update's reclaim is followed by an interrupted `fu rm` was put
+there by fu, and the name it sits on may be a `.fu-retired-dir-*` no command
+would ever reuse. That one is yours to remove by hand if you want the space. On
+the skill's own name it holds the tree the update replaced; on a
+`.fu-retired-dir-*` name it is an empty directory, because removal empties a
+tree before it retires the root. Either way SPEC rule 3 keeps the replaced
+content in the store's git history.
 
 `rollback-*` does not sit idle with the rest of that list: `new`, `add`, and
 `adopt` all produce it (`adopt` only in its `-uncommitted` form), and
@@ -393,7 +435,6 @@ Designed in [DESIGN.md](DESIGN.md), not yet built:
 
 | | |
 |---|---|
-| `update`, `outdated` | Track upstream versions and upgrade against a recorded commit. |
 | `clone`, `push`, `pull` | Move the store between machines. |
 | `log` | Browse history; `git -C ~/.fu/store log` works today. |
 | `commit` | Record edits deliberately. |

@@ -127,12 +127,7 @@ func removeSkill(st *store.Store, agents []agent.Agent, name string, h hooks) (R
 
 func checkRemoveAvailable(st *store.Store, cfg *store.Config, name string) error {
 	if !cfg.HasSkill(name) {
-		for _, invalid := range cfg.InvalidNames() {
-			if invalid.Name == name {
-				return fmt.Errorf("skill name %q fails validation (%s) and is ignored; edit %s to fix or remove it", invalid.Name, invalid.Reason, st.ConfigPath())
-			}
-		}
-		return fmt.Errorf("unknown skill %q", name)
+		return unknownSkillError(st, cfg, name)
 	}
 	return nil
 }

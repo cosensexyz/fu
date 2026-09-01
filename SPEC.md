@@ -120,8 +120,8 @@ v1 以下列七个场景全程可走通为完成标志：
 
 | 命令 | 状态 | 说明 |
 |------|------|------|
-| `fu update [name]` | 规划 | 按来源记录拉取新版本，省略 name 时更新全部可更新项；本地修改过的 skill 默认拒绝覆盖并提示差异，`--force` 强制 |
-| `fu outdated` | 规划 | 列出上游有新版本的 skills |
+| `fu update [name]` | 已交付 | 按来源记录拉取新版本，省略 name 时更新全部可更新项；本地修改过的 skill 默认拒绝覆盖并提示差异，`--force` 强制——但仅对指定 name 生效，省略 name 时 `--force` 为用法错误：批量强制会在命令行不点名任何一个的情况下覆盖多个 skill 的本地修改，故要求用户显式点名要覆盖的对象 |
+| `fu outdated` | 已交付 | 列出上游有新版本的 skills |
 
 **开关**
 
@@ -166,7 +166,7 @@ v1 以下列七个场景全程可走通为完成标志：
 
 | 命令 | 状态 | 说明 |
 |------|------|------|
-| `fu gc` | 已交付 | 安全删除已完成事务的 WAL revision 与终态标记；删除前写入内容寻址的裁剪记录，因此中断后可继续。另回收已完成 rm 家族遗留的孤立载荷（回收排在裁剪其 journal 之前，否则清单随 journal 一并消失）与已完成的配置交换记录、终态与归档。未完成事务、adopt 归档载荷、`adopt-link-*.json` 与其他 recovery 内容均不删除 |
+| `fu gc` | 已交付 | 安全删除已完成事务的 WAL revision 与终态标记；删除前写入内容寻址的裁剪记录，因此中断后可继续。另回收已完成 rm 家族遗留的孤立载荷、已完成 update 家族遗留在 staging 的旧内容（二者的回收均排在裁剪各自 journal 之前，否则清单随 journal 一并消失）与已完成的配置交换记录、终态与归档。未完成事务、adopt 归档载荷、`adopt-link-*.json` 与其他 recovery 内容均不删除 |
 
 ### 5.2 GUI
 
@@ -186,7 +186,7 @@ v1 不实现 GUI，仅交付 CLI。本地 web GUI（`fu web`）列入 roadmap；
 6. **断链与漂移**：链接指向缺失目标（如 store 实体被手工删除）、期望与现实不符等偏差，由 `fu status` 发现；`fu restore` 按期望重建、清理链接，`--hard` 另外把 store 工作区复位到最近一次提交。
 7. **安装校验**：add 与 adopt 时按 Agent Skills 规范校验：SKILL.md 存在；name 与 description 非空且长度合规（≤64 / ≤1024 字符）；name 仅含小写字母数字与连字符、不以连字符首尾、无连续连字符，且与目录名一致；skill 内无越界引用（symlink 逃逸等路径安全检查）。当被扫描的 source 根自身就是一个 skill 时，根目录名是调用方的路径或临时 clone 名，不参与 name↔目录名校验，但其余校验全部照常。不合规拒绝并说明原因。
 8. **生效时机**：各 agent 在会话启动时加载 skills，开关变更于下次新会话生效；fu 不干预运行中的进程，仅在 CLI 输出与 GUI 中如实提示。
-9. **更新基准**：git 来源沿其跟踪 ref 判定与获取新版本；`fu add --ref` 接受 branch 或 tag，不接受 commit hash。ref 缺省时在安装当时解析为默认分支并固定记录，不动态跟随远端变更；tag 来源与已有记录中的 commit-pinned lock 视为固定，不参与 `outdated`。本地目录来源以源路径内容相对**安装基线**的差异判定 `outdated`——store 侧相对基线的差异属"本地修改"（规则 3），二者不混同；local 来源仅在其路径存在的机器上可更新与判定，其他机器上 `status` 如实提示。
+9. **更新基准**：git 来源沿其跟踪 ref 判定与获取新版本；`fu add --ref` 接受 branch 或 tag，不接受 commit hash。ref 缺省时在安装当时解析为默认分支并固定记录，不动态跟随远端变更；tag 来源与已有记录中的 commit-pinned lock 视为固定，不参与 `outdated`。本地目录来源以源路径内容相对**安装基线**的差异判定 `outdated`——store 侧相对基线的差异属"本地修改"（规则 3），二者不混同；local 来源仅在其路径存在的机器上可更新与判定，其他机器上由 `outdated` 如实提示该来源不可达。来源侧的可达性判定统一归 `outdated`，`status` 不做此项核对：`status` 报告的是 fu.yaml 的期望与磁盘现实之间的差异，而来源是否可达取决于本机之外的条件，与该对账无关。
 10. **agent 目录前置检查**：某 agent 的 skills 目录本身是 symlink 时，日常投放（reconcile）拒绝执行并提示，绝不写穿链接改动其目标；`fu adopt` 是唯一例外——它以只读方式扫描链接目标完成收编，随后在 retirement 前持久化链接身份、原路径与原始 target，再归档链接条目本身、原位创建真实目录并投放，目标目录自始至终不被修改。该记录包含未来还原所需 authority；当前没有命令会读取它执行自动还原，不能解读为已有这一能力。
 11. **保留条目**：各适配器可声明保留条目（如 Codex 的 `.system`），fu 永不纳管、永不收编、不在未纳管清单中提示。
 
@@ -219,7 +219,7 @@ How 层面仅约定以下边界，具体方案由实现规划文档承担：
 
 - 业务逻辑全部位于核心库，CLI 只做参数解析与呈现（为将来的 GUI 预留同一调用面）；
 - store 目录布局与 `fu.yaml` 格式保持前向兼容；
-- 只读命令（list、show、status、log、outdated、agent、无参数的 remote）不修改 store 内容与 agent 目录；status 的远端核对仅作网络查询，不落盘；
+- 只读命令（list、show、status、log、outdated、agent、无参数的 remote）不修改 store 内容与 agent 目录；这些命令所做的远端访问一律仅作网络查询、不落盘——`outdated` 按规则 9 查询各 skill 来源的 ref（ls-remote，不取对象），`status` 的远端核对指 **store 自身远端**的领先/落后情形（尚未实现）。规则 9 已把来源侧的可达性判定统一归 `outdated`，故此处不得读作 `status` 会核对来源；
 - 所有破坏性操作均可恢复：已提交的 store 内容以 git 历史兜底，adopt 触及的本机原有条目以 recovery 归档兜底。`restore` 不写 recovery：它重建链接层时退休的断链或拼法过期的旧链接，改名到该 agent skills 目录内的兄弟名后随即删除，不归档；这类链接由 `restore` 依 `fu.yaml` 重建，故无需兜底。唯一不可恢复的是 `fu restore --hard` 丢弃的未提交改动——它们既未进入 git 历史，也不归档，因此不在兜底范围内，这是该选项的明示语义；
 - v1 平台：macOS 与 Linux。
 

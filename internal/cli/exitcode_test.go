@@ -686,3 +686,62 @@ func TestDiagnosticsPrecedeConfirmation(t *testing.T) {
 		})
 	}
 }
+
+// TestExitCodeUpdateForceWithoutAName pins design §7's CLI-layer acceptance
+// for the one usage error `fu update` owns: --force without a skill name is a
+// usage error, not an operation failure, so it must exit 2 (round 2, Minor
+// #11 -- the suite asserted the UsageError type against newUpdateCmd
+// directly, leaving the mapping to 2 pinned only for other commands).
+func TestExitCodeUpdateForceWithoutAName(t *testing.T) {
+	isolateExitCodeEnvironment(t)
+	code, out := runExitCode(t, "update", "--force")
+	if code != 2 {
+		t.Fatalf("--force without a name is a usage error and must exit 2, got %d; output: %s", code, out)
+	}
+	if !strings.Contains(out, "--force needs a skill name") {
+		t.Fatalf("output must say what the usage error was, got %q", out)
+	}
+}
+
+// The zero-target path owns the prologue's failures too. writeCommandPrologue
+// deliberately does not raise ErrOperationFailed for per-agent reconcile
+// failures -- it carries them in the Result and leaves the exit status to "the
+// final/abort boundary" (pipeline.go) -- and `fu update` grew a prologue without
+// growing that boundary on the path where no target exists. applyUpdateTargets
+// holds the only check, and a batch with nothing to update never reaches it.
+//
+// This is the same defect TestExitCodeReconcileFailedAgentIsOperationFailure
+// pins for `fu new`, on the command where it bites hardest: `fu update` against
+// a current store is the most common invocation there is, and the one case where
+// the prologue's reconcile is the only thing that ran. Pre-fix the compiled
+// command printed the self-contradicting pair `nothing to update` and `failed:
+// claude: ...` and exited 0, so a CI script reading $? saw success while claude
+// received nothing at all.
+func TestExitCodeUpdateWithNoTargetsReportsThePrologueReconcileFailure(t *testing.T) {
+	fuHome, home := t.TempDir(), t.TempDir()
+	t.Setenv("FU_HOME", fuHome)
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// claude is detected, but its skills dir is a plain file, so ScanAgent
+	// fails for it with a genuine error -- the fixture the `fu new` sibling
+	// above uses, pointed at the command that now takes a prologue.
+	if err := os.WriteFile(filepath.Join(home, ".claude", "skills"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := runExitCode(t, "init"); code != 0 {
+		t.Fatalf("init: exit=%d out=%q", code, out)
+	}
+
+	code, out := runExitCode(t, "update")
+	if code != 1 {
+		t.Fatalf("a reconcile failure must exit 1 even with nothing to update, got %d; output: %s", code, out)
+	}
+	if !strings.Contains(out, "failed:") {
+		t.Fatalf("the failure diagnostic must still be printed: %q", out)
+	}
+	if strings.Contains(out, "nothing to update") {
+		t.Fatalf("a run that failed must not also claim there was nothing to do: %q", out)
+	}
+}

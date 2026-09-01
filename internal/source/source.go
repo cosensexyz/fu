@@ -38,6 +38,20 @@ type Source struct {
 	URL  string // git: the repository URL as given
 	Ref  string // git: user-given ref text (branch or tag name); "" = default branch
 	Path string // local: absolute, symlink-resolved directory path
+	// RefKind says which form Ref names: "branch" or "tag". Empty means "not
+	// known", and cloneSource then probes branch first and tag second, which
+	// is what `fu add` needs -- a user typing --ref does not say which form
+	// they mean, and go-git's error for a missing branch does not say whether
+	// the name exists as a tag.
+	//
+	// An already-installed skill does know: fu.yaml records ref_kind beside
+	// the ref (EncodeFields below), so update can and must reconstruct it
+	// (sourceFromFields, internal/engine/application.go). Without it, a branch
+	// deleted upstream between `fu outdated`'s ls-remote and the clone would
+	// fall through to a same-named tag, the clone would succeed, EncodeFields
+	// would write ref_kind: tag, and the skill would silently become a fixed
+	// lock that `outdated` never examines again.
+	RefKind string
 }
 
 // fullHashRe matches the 40-hex full commit hashes fu locks. A user-supplied
