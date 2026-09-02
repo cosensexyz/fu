@@ -68,6 +68,7 @@ func shortDigest(digest string) string {
 // pre-sweep state is reachable in principle (the window between a sweep and
 // the preflight that follows it, and a direct call from a test), and the
 // clause that names it says which state it is for.
+//
 // An absent baseline is one of the two it can be handed. judgeLocalModification
 // sets Baseline straight from cfg.Digest and calls anything but the empty string
 // a modification (outdated.go), so a fu.yaml whose `digest:` key was removed by
@@ -365,9 +366,10 @@ func storeCopyMatchesBaseline(st *store.Store, name, baseline string) (matches b
 // repository), and only then takes the write lock. A hand edit landing inside
 // that window is swept into a commit by `run`'s own sweep -- not the
 // prologue's, which ran and released the lock before the clone started -- and
-// then overwritten by this transaction's own SetSourceFields -- so the record the user just wrote
-// is silently reverted, and, for the content shape, the content published
-// comes from the repository they just stopped tracking. This is the class of
+// then overwritten by this transaction's own SetSourceFields -- so the
+// record the user just wrote is silently reverted, and, for the content
+// shape, the content published comes from the repository they just stopped
+// tracking. This is the class of
 // race the in-Mutate repeat exists to stop: the write lock excludes other fu
 // processes, never an external writer.
 //
@@ -745,10 +747,14 @@ func reclaimUpdateStagingPayload(st *store.Store, name string, expected store.Ow
 }
 
 // updateStagingPayloadSettled is store.RecoveryPayloadSettled's staging-side
-// counterpart, and answers the same question for the same caller: `fu gc` has
-// to decide whether a completed update family still has anything on disk that
-// its manifest is the only proof of, in the one run where it cannot read the
-// pending set and so cannot show any name is unclaimed (txn_prune.go).
+// counterpart, and answers the same question for the same caller. `fu gc`
+// asks it from two places (txn_prune.go). In the degraded run where it cannot
+// read the pending set, and so cannot show any name is unclaimed, it decides
+// whether a completed update family still has anything on disk that its
+// manifest is the only proof of. In releaseStagingPayloadProblems, on every
+// run that held a staging reclaim failure, it decides whether that failure
+// was about an entry already gone -- the answer that keeps gc from telling
+// the user to restore something no longer there.
 //
 // "Settled" has to mean settled at both names disposal uses, for the reason
 // RecoveryPayloadSettled's own doc gives: RemoveOwnedTreeAt empties the tree,

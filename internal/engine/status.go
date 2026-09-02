@@ -139,7 +139,7 @@ type RecoveryInventory struct {
 	// bookkeeping gc's own predicates admit.
 	//
 	// "Would be entitled to collect" rather than "will certainly succeed" --
-	// see collectableRecoveryNames for the two degraded states in which gc
+	// see collectableRecoveryNamesFromJournal for the two degraded states in which gc
 	// re-reads more than this derivation does and refuses.
 	Collectable int
 	// Blocked counts entries in those same families that `fu gc` would leave
@@ -162,7 +162,7 @@ type RecoveryInventory struct {
 // Bucketing a listed name is a set membership test in every arm: prefix
 // membership in one of these two tables, or exact membership in a set built
 // before the walk -- pendingPayloadClaims, pendingStagingClaims,
-// collectableRecoveryNames, store.PendingConfigExchangeRecords,
+// collectableRecoveryNamesFromJournal, store.PendingConfigExchangeRecords,
 // store.CollectableConfigExchangeNames. Two sets are built by lstat rather than
 // by derivation alone -- store.CollectableConfigArchiveNames, and the
 // staging/<name> half of collectableRecoveryNamesFromJournal's update residue
@@ -172,7 +172,7 @@ type RecoveryInventory struct {
 //
 // Building those sets is where the reads happen, and they are reads of fu's own
 // journal rather than of the objects it describes. pendingPayloadClaims derives
-// from records PendingTxns already parsed; collectableRecoveryNames scans the
+// from records PendingTxns already parsed; collectableRecoveryNamesFromJournal scans the
 // journal filenames and decodes one revision per completed rm family. Neither
 // opens a payload. That is the line actually being held: the inventory agrees
 // with gc by asking gc's own questions, and still never reads the content it is
@@ -389,7 +389,7 @@ type recoveryCollection struct {
 	scanned bool
 }
 
-// collectableRecoveryNames derives what `fu gc` would actually be entitled to
+// collectableRecoveryNamesFromJournal derives what `fu gc` would actually be entitled to
 // collect on its next run: the payloads a *completed, unpruned* family
 // describes, and the journal files of every family gc has left to prune.
 //
@@ -485,11 +485,13 @@ type recoveryCollection struct {
 // shown to be the manifested tree", whose honest answer under any stat failure
 // is no. There is therefore still no error return -- the scan was the only
 // thing that could fail, and the caller has already faced it.
+//
 // stagingClaims and stagingPresent are the two things the update arm below
 // needs to answer whether `fu gc` will ever prune such a family: which staging
 // names a pending record governs, and which of them are on disk. Both are read
 // once by the caller and shared with the staging walk, so the two accounts
 // cannot come from different listings.
+//
 // claimsKnown says whether the pending set behind stagingClaims could be read
 // at all. When it could not, no payload or staging name is admitted as
 // collectable, because an empty claims set is indistinguishable from "nothing
@@ -506,10 +508,11 @@ type recoveryCollection struct {
 // *declares* a payload manifest at all, whether or not anything is still
 // sitting there. The test below is on the record's shape (Op plus which
 // manifest field is set), never on residue, and the difference is
-// deliberate -- see the arm's own comment. What is still recorded whatever happens is everything
-// that depends on neither: which files were attributed to a family, and which
-// families are damaged, so a damaged journal is still accounted for rather
-// than dropped from the report.
+// deliberate -- see the arm's own comment. What is still recorded whatever
+// happens is everything that depends on neither: which files were attributed
+// to a family, and which families are damaged, so a damaged journal is still
+// accounted for rather than dropped from the report.
+//
 // stagingKnown is the same question asked of stagingPresent, and needs its own
 // answer for the same reason: a listing that failed yields an empty set that
 // reads exactly like a staging directory with nothing in it, and the update arm
@@ -725,7 +728,7 @@ func txnFamilyFiles(journal txnJournal, key txnKey) []string {
 }
 
 // newestTxnRevision decodes the highest-sequence revision of one family and
-// nothing else. It is collectableRecoveryNames's cheap counterpart to
+// nothing else. It is collectableRecoveryNamesFromJournal's cheap counterpart to
 // validateTxnChain, which re-reads and re-hashes every revision in the chain
 // -- the cost model PendingTxns documents as unaffordable on a read path.
 func newestTxnRevision(st *store.Store, revisions []txnRevision) (TxnRecord, error) {
@@ -758,9 +761,6 @@ func newestTxnRevision(st *store.Store, revisions []txnRevision) (TxnRecord, err
 // let the inventory count a removed- payload as collectable while gc was
 // leaving it alone. This form takes the pending slice its caller already read
 // rather than reading the journal a second time.
-// recoveryCollection is everything one journal scan tells the inventory, kept
-// in three sets because the switch below has three different questions to ask
-// of a recovery-directory name.
 func pendingPayloadClaims(pending []TxnRecord) map[string]bool {
 	claims := make(map[string]bool, len(pending)*3)
 	for _, record := range pending {

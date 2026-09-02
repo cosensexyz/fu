@@ -238,8 +238,9 @@ func printStagingSection(out io.Writer, inventory engine.StagingInventory) bool 
 	// opened this report has to find their own command named here.
 	//
 	// So the promise is conditional, and says so (round 4). The bucket's
-	// default arm catches every name that is neither claimed nor recognised
-	// residue, which need not be a public skill name at all -- a
+	// default arm catches every name that is neither claimed, nor a settled
+	// update's own tree, nor recognised residue, which need not be a public
+	// skill name at all -- a
 	// `.fu-retired-dir-<token>` stranded under staging by the double fault
 	// lands here, and no command will ever be asked to reuse that name. The
 	// earlier wording promised a refusal for every entry counted, which for

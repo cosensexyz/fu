@@ -184,7 +184,7 @@ v1 不实现 GUI，仅交付 CLI。本地 web GUI（`fu web`）列入 roadmap；
 4. **agent 检测**：按特征路径探测（`~/.claude/`、`~/.codex/`），检测到即纳管，未检测到的 agent 不投放、不报错。新 agent 的首次投放由下一次任意写操作或 `restore` 完成，只读命令仅提示待投放。
 5. **专有元数据透明传递**：如 Codex 的 `openai.yaml`，随 skill 目录整体投放，fu 不解析、不修改。
 6. **断链与漂移**：链接指向缺失目标（如 store 实体被手工删除）、期望与现实不符等偏差，由 `fu status` 发现；`fu restore` 按期望重建、清理链接，`--hard` 另外把 store 工作区复位到最近一次提交。
-7. **安装校验**：add 与 adopt 时按 Agent Skills 规范校验：SKILL.md 存在；name 与 description 非空且长度合规（≤64 / ≤1024 字符）；name 仅含小写字母数字与连字符、不以连字符首尾、无连续连字符，且与目录名一致；skill 内无越界引用（symlink 逃逸等路径安全检查）。当被扫描的 source 根自身就是一个 skill 时，根目录名是调用方的路径或临时 clone 名，不参与 name↔目录名校验，但其余校验全部照常。不合规拒绝并说明原因。
+7. **安装校验**：add、adopt 与 update 时按 Agent Skills 规范校验：SKILL.md 存在；name 与 description 非空且长度合规（≤64 / ≤1024 字符）；name 仅含小写字母数字与连字符、不以连字符首尾、无连续连字符，且与目录名一致；skill 内无越界引用（symlink 逃逸等路径安全检查）。当被扫描的 source 根自身就是一个 skill 时，根目录名是调用方的路径或临时 clone 名，不参与 name↔目录名校验，但其余校验全部照常。不合规拒绝并说明原因。
 8. **生效时机**：各 agent 在会话启动时加载 skills，开关变更于下次新会话生效；fu 不干预运行中的进程，仅在 CLI 输出与 GUI 中如实提示。
 9. **更新基准**：git 来源沿其跟踪 ref 判定与获取新版本；`fu add --ref` 接受 branch 或 tag，不接受 commit hash。ref 缺省时在安装当时解析为默认分支并固定记录，不动态跟随远端变更；tag 来源与已有记录中的 commit-pinned lock 视为固定，不参与 `outdated`。本地目录来源以源路径内容相对**安装基线**的差异判定 `outdated`——store 侧相对基线的差异属"本地修改"（规则 3），二者不混同；local 来源仅在其路径存在的机器上可更新与判定，其他机器上由 `outdated` 如实提示该来源不可达。来源侧的可达性判定统一归 `outdated`，`status` 不做此项核对：`status` 报告的是 fu.yaml 的期望与磁盘现实之间的差异，而来源是否可达取决于本机之外的条件，与该对账无关。
 10. **agent 目录前置检查**：某 agent 的 skills 目录本身是 symlink 时，日常投放（reconcile）拒绝执行并提示，绝不写穿链接改动其目标；`fu adopt` 是唯一例外——它以只读方式扫描链接目标完成收编，随后在 retirement 前持久化链接身份、原路径与原始 target，再归档链接条目本身、原位创建真实目录并投放，目标目录自始至终不被修改。该记录包含未来还原所需 authority；当前没有命令会读取它执行自动还原，不能解读为已有这一能力。

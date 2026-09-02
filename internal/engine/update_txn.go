@@ -140,10 +140,11 @@ func validateUpdateRecord(r TxnRecord) error {
 // manifest against a staging path means knowing which side of the swap the
 // state is on, and no consumer here assumes one pairing for both: each
 // establishes the side first, and they do not all land on the same answer.
-// txn_prune.go's staging arm and status.go's update arm see only completed
-// families, where the exchange has happened, so staging/<name> is
-// PreviousPayload's. The two in this file read the other way round, and are
-// right to: restoreExchangedUpdate settles the side at skills/<name> first --
+// txn_prune.go's staging arm, status.go's update arm, and
+// finishCommittedUpdate in this file (through reclaimExchangedUpdatePayload)
+// see only completed families, where the exchange has happened, so
+// staging/<name> is PreviousPayload's. The other two in this file read the
+// other way round, and are right to: restoreExchangedUpdate settles the side at skills/<name> first --
 // matching there, never at the staging name, is what tells the two apart -- and
 // by the time it names staging, the pre-exchange arrangement holds again,
 // either because the exchange never ran or because it has just been undone, so

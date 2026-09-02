@@ -142,7 +142,7 @@ agents
   missing link   claude/pdf-tools
   unmanaged      codex/scratch-notes
 recovery
-  1 waiting on an unfinished write (run `fu restore`, then `fu gc`)
+  1 waiting on an unfinished write (run `fu restore`, which settles it or says what needs repairing, then `fu gc`)
 ```
 
 `fu restore` repairs the link layer and reports the store worktree rather
@@ -226,8 +226,9 @@ so a skill is never out of date in one agent and current in another.
 
 Exit codes: `0` success, `1` the operation failed, `2` you used the command
 wrongly — the wrong number of arguments, an unknown flag, a malformed flag
-value (`--agent ""`, an empty `--ref`), or a malformed positional argument
-(`fu revert abc`, `fu revert 0`).
+value (`--agent ""`, an empty `--ref`), a malformed positional argument
+(`fu revert abc`, `fu revert 0`), or a flag and positional combination the
+command rejects (`fu update --force` without a name).
 
 ## Where things live
 

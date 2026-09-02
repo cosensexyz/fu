@@ -307,8 +307,10 @@ func pruneCompletedTransactionsLocked(st *store.Store, hooks pruneHooks) (PruneO
 	// reclaimUpdateStagingPayload refuses a Name that is not a public skill name
 	// before it opens staging (update.go), and RemoveOwnedTreeAt refuses an
 	// invalid manifest the same way -- both leave the two candidate names
-	// untouched and so answer "settled", and releasing on that answer alone
-	// dropped them. Dropped, gc reports "nothing to prune" and exits 0 while the
+	// untouched. updateStagingPayloadSettled validates the name itself and
+	// reports the first class as an error rather than "settled"; the second
+	// still answers "settled", and releasing on that answer alone dropped
+	// it. Dropped, gc reports "nothing to prune" and exits 0 while the
 	// family is skipped run after run and `fu status` goes on counting its files
 	// collectable: the "run a command and watch a count not move" incoherence
 	// this change exists to end, and the one PruneOutcome's own doc says cannot
