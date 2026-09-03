@@ -3207,8 +3207,10 @@ func TestRevertRebuildsLinksFromThePostRevertConfig(t *testing.T) {
 // TestRevertCountsOperationsNotRawCommits pins what "n operations back" means
 // when history already holds an external sweep commit.
 //
-// SPEC:177 lists the operations revert counts -- add, rm, adopt, new, update,
-// enable, disable, revert -- and an external sweep is not among them; it is
+// SPEC §5.3 lists the operations revert counts -- read them from
+// operationVerbs (internal/store/git.go) rather than from here, since a
+// restated copy goes stale on the next SPEC edit and three of them did
+// (review 2026-09-03, Minor). An external sweep is not among them; it is
 // the bookkeeping entry a write command makes *before* its own operation. The
 // skip adjustment in RevertOperations already agreed with that reading, but it
 // only compensated for the sweep this very call performs. A sweep sitting in

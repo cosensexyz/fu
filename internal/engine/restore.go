@@ -329,12 +329,16 @@ type RevertOutcome struct {
 // That is resolved where the counting happens rather than here.
 // store.Store.Revert walks first-parent history counting operations, not
 // commits (resolveOperationsBack), and what counts as an operation is decided
-// by a whitelist rather than by skipping known bookkeeping: isOperationMessage
-// admits exactly the eight verbs SPEC §5.3 enumerates. Three things therefore
-// do not count -- a sweep's "external: manual modifications", a recovery
-// compensation together with the operation it cancels (the pair nets to zero,
-// so neither is one the user completed), and "init: store", which is not in
-// SPEC's list and could never be a revert target anyway.
+// by a whitelist rather than by skipping known bookkeeping: IsOperationMessage
+// admits exactly the verbs SPEC §5.3 enumerates. Neither the verbs nor their
+// number are restated here: §5.3 warns that nothing auto-verifies the list,
+// and a hand-copied restatement is the drift that warning is about -- one
+// SPEC edit went on to leave three such copies stale (review 2026-09-03,
+// Minor). Three things therefore do not count -- a sweep's "external: manual
+// modifications", a recovery compensation together with the operation it
+// cancels (the pair nets to zero, so neither is one the user completed), and
+// "init: store", which is not in SPEC's list and could never be a revert
+// target anyway.
 //
 // The direction matters and the earlier single-entry blacklist had it wrong.
 // Under a blacklist an unrecognised message silently becomes a user operation,

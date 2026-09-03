@@ -61,9 +61,10 @@ type PreparedCommit struct {
 	changed     []string
 	fingerprint string
 	// candidateIndex belongs only to the in-memory staging repository. The
-	// public baseline is retained solely for a conditional post-commit sync;
-	// preparation and withdrawal never write either snapshot to the public
-	// index.
+	// public baseline is retained solely for the conditional sync, which runs
+	// at whichever of CommitPrepared's two exits is taken -- after publishing
+	// a commit, and at the no-change return that writes none; preparation and
+	// withdrawal never write either snapshot to the public index.
 	candidateIndex *indexformat.Index
 	publicBaseline *indexformat.Index
 	syncPublic     bool
@@ -99,8 +100,14 @@ func (p PreparedCommit) TreeFingerprint() string { return p.fingerprint }
 // Commit stages everything and records one commit. An empty worktree
 // (nothing changed) is not an error.
 //
-// The branch HEAD pointed at before staging is captured and updated with a
-// compare-and-swap, so a concurrent direct-git commit cannot be overwritten.
+// The branch ref is captured inside CommitPrepared, at publish time rather
+// than before staging, and updated with a compare-and-swap, so a concurrent
+// direct-git commit cannot be overwritten. Note what that ordering does not
+// buy: a direct-git commit landing between prepare and publish becomes the
+// captured "before" ref, so the CAS succeeds and the racer's commit becomes
+// the parent of a tree frozen without its changes. DESIGN's known-gap list
+// books that window; the scoped preparer widens it, because its out-of-prefix
+// entries come from the prepare-time index rather than being re-read.
 // The commit tree is built from PreparedCommit's immutable entries rather
 // than rereading the mutable index after validation. Fu's lock serializes fu
 // processes, but these two checks also protect the supported direct-Git path.
@@ -168,6 +175,108 @@ func (s *Store) prepareCommit(baseline *indexformat.Index) (PreparedCommit, erro
 	if err := s.stageAll(private, wt); err != nil {
 		return PreparedCommit{}, err
 	}
+	return s.freezePrepared(private, wt, baseline)
+}
+
+// changedPathsFromStatus projects a worktree status into the HEAD-to-index
+// changed set a PreparedCommit carries: store-relative slash paths, sorted.
+//
+// Unmodified is skipped outright. Untracked is skipped only when the path is
+// also absent from HEAD's tree, because go-git's Staging conflates two
+// different states under that one value. Worktree.status runs two loops: the
+// HEAD-to-index loop sets Staging = Deleted for a path in HEAD and absent
+// from the index, and the index-to-worktree loop then *overwrites* it, since
+// it sets Staging = Untracked for every name present in the worktree and
+// absent from the index. So Untracked means "absent from the index" and
+// nothing more -- absent from HEAD too, and it is a genuinely new file the
+// candidate never staged, rightly outside a HEAD-to-index changed set; but
+// present in HEAD, and it is a real HEAD-to-index deletion, exactly what
+// `git rm --cached <path>` leaves behind with the file still on disk.
+//
+// Both halves of that rule are load-bearing, and each was a Critical when it
+// was missing. Skipping nothing (the original) made `fu commit <name>` fail
+// outright, blaming a file git had never heard of, whenever a stray
+// .DS_Store or any brand-new file sat elsewhere in the store (final review,
+// finding 1). Skipping every Untracked path (the first fix) dropped the
+// `git rm --cached` deletion instead: PrepareCommitUnder's containment
+// assertion never saw it, so the scoped candidate silently committed a tree
+// with that path gone -- `git rm --cached fu.yaml` followed by `fu commit
+// alpha` exited 0 and left every fu command reporting "store not
+// initialized", store identity being fu.yaml tracked at HEAD.
+//
+// prepareCommit reaches neither: stageAll force-adds every index-absent file
+// first, so the index-to-worktree loop yields no Insert and Staging is never
+// Untracked there. HEAD is read only once an Untracked path actually turns
+// up, so the full-store projection is what it has always been and does not
+// even open HEAD. Shared by both freezers so the two cannot drift.
+func (s *Store) changedPathsFromStatus(status git.Status) ([]string, error) {
+	var head map[string]bool
+	changed := make([]string, 0, len(status))
+	for name, state := range status {
+		if state.Staging == git.Unmodified {
+			continue
+		}
+		if state.Staging == git.Untracked {
+			if head == nil {
+				var err error
+				if head, err = s.headTreePaths(); err != nil {
+					return nil, err
+				}
+			}
+			if !head[filepath.ToSlash(name)] {
+				continue
+			}
+		}
+		changed = append(changed, filepath.ToSlash(name))
+	}
+	sort.Strings(changed)
+	return changed, nil
+}
+
+// headTreePaths is the set of non-directory paths HEAD's tree records. An
+// unborn branch has no tree, and yields an empty (non-nil) set so callers can
+// memoize the result by nilness.
+func (s *Store) headTreePaths() (map[string]bool, error) {
+	paths := make(map[string]bool)
+	head, err := s.Repo.Head()
+	if errors.Is(err, plumbing.ErrReferenceNotFound) {
+		return paths, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read HEAD to project the changed paths: %w", err)
+	}
+	commit, err := s.Repo.CommitObject(head.Hash())
+	if err != nil {
+		return nil, fmt.Errorf("read commit %s to project the changed paths: %w", head.Hash(), err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		return nil, fmt.Errorf("read the tree of commit %s: %w", head.Hash(), err)
+	}
+	// A tree walker rather than Tree.Files(), which loads every blob it
+	// yields; only the names are wanted here.
+	walker := object.NewTreeWalker(tree, true, nil)
+	defer walker.Close()
+	for {
+		name, entry, err := walker.Next()
+		if errors.Is(err, io.EOF) {
+			return paths, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("walk the tree of commit %s: %w", head.Hash(), err)
+		}
+		if entry.Mode == filemode.Dir {
+			continue
+		}
+		paths[name] = true
+	}
+}
+
+// freezePrepared turns a fully staged private worktree into the immutable
+// candidate CommitPrepared writes: entries, the HEAD-to-index changed set,
+// the tree fingerprint, and the public baseline retained for the conditional
+// sync CommitPrepared performs at both of its exits.
+func (s *Store) freezePrepared(private *git.Repository, wt *git.Worktree, baseline *indexformat.Index) (PreparedCommit, error) {
 	idx, err := private.Storer.Index()
 	if err != nil {
 		return PreparedCommit{}, err
@@ -180,13 +289,10 @@ func (s *Store) prepareCommit(baseline *indexformat.Index) (PreparedCommit, erro
 	if err != nil {
 		return PreparedCommit{}, err
 	}
-	changed := make([]string, 0, len(status))
-	for name, state := range status {
-		if state.Staging != git.Unmodified {
-			changed = append(changed, filepath.ToSlash(name))
-		}
+	changed, err := s.changedPathsFromStatus(status)
+	if err != nil {
+		return PreparedCommit{}, err
 	}
-	sort.Strings(changed)
 	return PreparedCommit{
 		entries:        entries,
 		changed:        changed,
@@ -197,11 +303,44 @@ func (s *Store) prepareCommit(baseline *indexformat.Index) (PreparedCommit, erro
 	}, nil
 }
 
-// preparePublicIndexSnapshot freezes exactly what a direct Git user staged,
+// CommitStagedSnapshot records whatever a direct Git user has staged as one
+// ExternalCommitMessage commit, and reports what it did. A snapshot holding
+// no change writes nothing and reports a zero outcome.
+//
+// This is the first of Sweep's two layers, extracted because it has a second
+// caller: a store-wide `fu commit` records the same layer first, for the same
+// reason Sweep does -- so a staged-only version stays recoverable in history
+// rather than being collapsed into the worktree state that came after it.
+// Both callers then commit their own second layer under their own message.
+// Expressed once here rather than twice, because which git primitives that
+// takes is this package's knowledge, not its callers'.
+//
+// The outcome is returned whether or not the error is nil: CommitPrepared's
+// two post-publish checks can fail after the branch update already landed,
+// and a durable commit must never be reported as though nothing happened.
+//
+// It does not run checkNoAbsoluteSymlinks, and deliberately leaves that to
+// the caller. Sweep gets it from the IsDirty call that gates it; a caller
+// invoking this directly does not, so with an absolute symlink present the
+// external layer lands and the refusal arrives from the next preparer
+// instead. The blob recorded is faithful either way -- the layers are
+// separately valid commits -- so this is ordering, not corruption.
+func (s *Store) CommitStagedSnapshot() (CommitOutcome, error) {
+	staged, err := s.PrepareStagedSnapshot()
+	if err != nil {
+		return CommitOutcome{}, err
+	}
+	if len(staged.changed) == 0 {
+		return CommitOutcome{}, nil
+	}
+	return s.CommitPrepared(ExternalCommitMessage, staged)
+}
+
+// PrepareStagedSnapshot freezes exactly what a direct Git user staged,
 // without consulting or rewriting the worktree side of the public index. Sweep
 // commits this snapshot before separately recording later worktree bytes, so a
 // staged-only version remains recoverable in history.
-func (s *Store) preparePublicIndexSnapshot() (PreparedCommit, error) {
+func (s *Store) PrepareStagedSnapshot() (PreparedCommit, error) {
 	baseline, err := s.capturePublicIndex()
 	if err != nil {
 		return PreparedCommit{}, err
@@ -218,13 +357,10 @@ func (s *Store) preparePublicIndexSnapshot() (PreparedCommit, error) {
 	if err != nil {
 		return PreparedCommit{}, err
 	}
-	changed := make([]string, 0, len(status))
-	for name, state := range status {
-		if state.Staging != git.Unmodified {
-			changed = append(changed, filepath.ToSlash(name))
-		}
+	changed, err := s.changedPathsFromStatus(status)
+	if err != nil {
+		return PreparedCommit{}, err
 	}
-	sort.Strings(changed)
 	return PreparedCommit{
 		entries:        entries,
 		changed:        changed,
@@ -282,7 +418,9 @@ func (s *Store) indexMatchesHEAD(index *indexformat.Index) bool {
 }
 
 // withIndexLock holds .git/index.lock while Fu captures a public baseline or
-// conditionally synchronizes that still-unchanged baseline after publication.
+// conditionally synchronizes that still-unchanged baseline -- after
+// publishing a commit, or at the return that finds the tree unmoved and
+// writes none.
 //
 // A check followed by SetIndex is not a compare-and-swap, and the index is
 // public: the supported direct-Git path can write it between the two. index.lock
@@ -399,9 +537,24 @@ func (s *Store) commitPreparedWithHook(msg string, prepared PreparedCommit, befo
 		return CommitOutcome{}, fmt.Errorf("build prepared Git tree: %w", err)
 	}
 	parents := []plumbing.Hash(nil)
+	// Both no-change returns still sync the public index, and that is the
+	// whole point rather than tidiness. A candidate can leave the tree exactly
+	// where it was while still superseding index entries -- stage a version,
+	// edit the worktree back to the committed bytes, and the scoped candidate
+	// equals HEAD though the index does not. Returning early without syncing
+	// left those entries stale for good: `fu status` reported the skill
+	// pending and `fu commit <name>` answered "nothing to commit" forever
+	// (review 2026-09-02 round 2, Important -- the residue of round 1's
+	// Critical, which was wired only into the publish path below).
+	//
+	// Safe for the store-wide preparer too: its syncPublic is only true when
+	// the baseline already equalled HEAD, so on this branch the candidate it
+	// installs is the baseline unchanged -- measurably a byte-identical
+	// rewrite, not a stat refresh, which an earlier wording claimed (review
+	// 2026-09-03, Minor).
 	if refState.before == nil {
 		if len(prepared.entries) == 0 {
-			return CommitOutcome{}, nil
+			return CommitOutcome{}, s.syncPreparedPublicIndex(prepared)
 		}
 	} else {
 		parent, err := s.Repo.CommitObject(refState.before.Hash())
@@ -409,7 +562,7 @@ func (s *Store) commitPreparedWithHook(msg string, prepared PreparedCommit, befo
 			return CommitOutcome{}, fmt.Errorf("read commit parent %s: %w", refState.before.Hash(), err)
 		}
 		if parent.TreeHash == treeHash {
-			return CommitOutcome{}, nil
+			return CommitOutcome{}, s.syncPreparedPublicIndex(prepared)
 		}
 		parents = []plumbing.Hash{refState.before.Hash()}
 	}
@@ -900,6 +1053,26 @@ func (s *Store) stageAll(repo *git.Repository, wt *git.Worktree) error {
 	if err := wt.AddWithOptions(&git.AddOptions{All: true}); err != nil {
 		return s.explainStagingFailure(err)
 	}
+	return s.stageUntracked(repo, wt, nil)
+}
+
+// stageUntracked force-adds every file the index does not already carry, so
+// content .gitignore hides is recorded too. A nil include takes the whole
+// store; otherwise only the paths it admits are staged.
+//
+// The force-add is the load-bearing part: an ignored file never appears in
+// go-git's status, so an All-based add can never reach it, and SkipStatus is
+// what bypasses that status consultation. PrepareCommitUnder (commit_scope.go)
+// carried its own copy of this walk, differing only by the prefix filter now
+// passed as include -- so a fix to how ignored content is staged had to land
+// in two places or silently diverge between `fu commit <name>` and every
+// other write command.
+//
+// The walk stays store-wide even when include narrows the result. Rooting it
+// at each prefix instead would save a few directory visits on a store holding
+// tens of skills, and would change how a missing prefix directory and a
+// nested .git are handled -- a worse trade than it looks.
+func (s *Store) stageUntracked(repo *git.Repository, wt *git.Worktree, include func(rel string) bool) error {
 	idx, err := repo.Storer.Index()
 	if err != nil {
 		return err
@@ -911,8 +1084,8 @@ func (s *Store) stageAll(repo *git.Repository, wt *git.Worktree) error {
 		tracked[e.Name] = true
 	}
 	if err := s.walkStoreFiles(func(_ fs.FS, _, rel string, _ fs.DirEntry) error {
-		if tracked[rel] {
-			return nil // already tracked by the All-based add above
+		if tracked[rel] || (include != nil && !include(rel)) {
+			return nil // already tracked, or outside what the caller asked for
 		}
 		return wt.AddWithOptions(&git.AddOptions{Path: rel, SkipStatus: true})
 	}); err != nil {
@@ -950,11 +1123,15 @@ func (s *Store) explainStagingFailure(err error) error {
 	if !errors.Is(err, fs.ErrPermission) {
 		return err
 	}
+	// Neither sentence may say "every write command": `fu commit <name>`
+	// reads only its own prefix, and it is a command that can reach this
+	// message -- a chmod 000 file inside the named skill renders it (review
+	// 2026-09-03, Minor). "The paths it records" is true of both forms.
 	if target == "" {
-		return fmt.Errorf("%w; every write command records the whole store, so it must be able to read every file under %s",
+		return fmt.Errorf("%w; a write command records the store's contents, so it must be able to read every file it records under %s",
 			err, s.Dir())
 	}
-	return fmt.Errorf("%w; fu records the whole store on every write command, so make %s readable or move it out of the store",
+	return fmt.Errorf("%w; fu must read every file it records, so make %s readable or move it out of the store",
 		err, target)
 }
 
@@ -1160,6 +1337,9 @@ type LogEntry struct {
 	Hash    string
 	Message string
 	When    time.Time
+	// Ordinal is the commit's position among SPEC §5.3's operations, newest
+	// first, or 0 for a commit that is not one (see WalkOperations).
+	Ordinal int
 }
 
 // IsDirty reports whether HEAD, the public index, and the worktree differ,
@@ -1220,10 +1400,15 @@ const RecoveryCompensationPrefix = "recover: roll back interrupted "
 //
 // One of the two drift directions is guarded and the other is not, and the
 // unguarded one is *removal* (review round 27, recommendation). Adding a
-// verb-producing command without adding it here is caught:
-// TestOperationVerbsCoverEveryMessageProducingCommand drives the engine's real
-// commands and puts the messages they actually produce through
-// IsOperationMessage, so a new verb fails it. Deleting a line from this map
+// verb-producing command without adding it here is caught by
+// TestEveryOperationCommitThisPackageWritesIsCountable (internal/engine's
+// txn_test.go), which drives every real command in that package and puts the
+// messages they actually produce through IsOperationMessage, so a new verb
+// fails it. Note which test that is: the same-named
+// TestOperationVerbsCoverEveryMessageProducingCommand in this package is a
+// hand-maintained list of message strings, so it restates this map rather
+// than checking it, and adding a verb to both leaves the coupling unproven
+// (review 2026-09-02, Important). Deleting a line from this map
 // fails nothing -- the test only asks that every message produced is counted,
 // and a command whose verb is gone simply stops producing a counted one. The
 // damage is silent and lands on `fu revert n`: that operation vanishes from
@@ -1239,6 +1424,7 @@ var operationVerbs = map[string]bool{
 	"enable":  true,
 	"disable": true,
 	"revert":  true,
+	"commit":  true,
 }
 
 // IsOperationMessage reports whether a commit message names one of SPEC §5.3's
@@ -1270,14 +1456,8 @@ func (s *Store) Sweep() error {
 	if !dirty {
 		return nil
 	}
-	staged, err := s.preparePublicIndexSnapshot()
-	if err != nil {
+	if _, err := s.CommitStagedSnapshot(); err != nil {
 		return err
-	}
-	if len(staged.changed) != 0 {
-		if _, err := s.CommitPrepared(ExternalCommitMessage, staged); err != nil {
-			return err
-		}
 	}
 	dirty, err = s.IsDirty()
 	if err != nil || !dirty {
@@ -1287,29 +1467,24 @@ func (s *Store) Sweep() error {
 	return err
 }
 
-// Log returns up to n commits, newest first. If n is non-positive, returns
-// an empty slice with no error. Returns all available commits if history
-// contains fewer than n entries. Returns an error if iteration fails.
+// Log returns up to n commits along first-parent history, newest first, each
+// numbered the way `fu revert n` counts them. A non-positive n returns nil
+// with no error, and a history shorter than n returns all of it. A walk that
+// fails part-way returns the entries gathered so far alongside the error, so
+// a caller that wants only whole results must check the error first.
 func (s *Store) Log(n int) ([]LogEntry, error) {
-	iter, err := s.Repo.Log(&git.LogOptions{})
-	if err != nil {
-		return nil, err
+	if n <= 0 {
+		return nil, nil
 	}
-	defer iter.Close()
 	var out []LogEntry
-	for len(out) < n {
-		c, err := iter.Next()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break // history exhausted
-			}
-			return nil, err // real error (corrupt object, I/O failure, etc.)
-		}
+	err := s.WalkOperations(func(e OperationEntry) (bool, error) {
 		out = append(out, LogEntry{
-			Hash:    c.Hash.String()[:7],
-			Message: c.Message,
-			When:    c.Author.When,
+			Hash:    e.Hash.String()[:7],
+			Message: e.Message,
+			When:    e.When,
+			Ordinal: e.Ordinal,
 		})
-	}
-	return out, nil
+		return len(out) < n, nil
+	})
+	return out, err
 }

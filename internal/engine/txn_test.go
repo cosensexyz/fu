@@ -957,6 +957,20 @@ func TestEveryOperationCommitThisPackageWritesIsCountable(t *testing.T) {
 	if _, err := SetAgentSwitch(s, agents, "alpha", "claude", true); err != nil {
 		t.Fatal(err)
 	}
+	// commit, the verb this branch added. Driven through the real entry point
+	// for the reason update and add already are: adding a verb to
+	// operationVerbs and to a hand-maintained list of strings leaves the
+	// coupling restated rather than checked, and this is the only test that
+	// checks it (review 2026-09-02, Important). It needs an edit of its own
+	// because CommitOperations deliberately does not sweep -- it records what
+	// is pending under the skill it names and nothing else -- so this must
+	// come before the hand edit below, which is left pending on purpose.
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "kitten", "NOTES.md"), []byte("recorded"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CommitOperations(s, agents, CommitScope{Name: "kitten"}); err != nil {
+		t.Fatal(err)
+	}
 	// A hand edit, so a sweep's own "external" commit is in history too and the
 	// classification below has to admit it without counting it.
 	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "alpha", "NOTES.md"), []byte("mine"), 0o644); err != nil {
@@ -994,7 +1008,7 @@ func TestEveryOperationCommitThisPackageWritesIsCountable(t *testing.T) {
 	// And the fixture really did drive the producers, so a future edit that
 	// quietly stops exercising one is visible rather than silently narrowing
 	// what the loop above can catch.
-	for _, want := range []string{"new", "enable", "disable", "adopt", "rm", "revert", "update", "add"} {
+	for _, want := range []string{"new", "enable", "disable", "adopt", "rm", "revert", "update", "add", "commit"} {
 		if !verbs[want] {
 			t.Errorf("the fixture must exercise the %q producer; observed %v", want, verbs)
 		}

@@ -136,4 +136,45 @@ func TestBinarySmoke(t *testing.T) {
 	if out, code := run(); code != 0 || !strings.Contains(out, "skill manager") {
 		t.Fatalf("bare fu must exit 0 and print help: exit=%d out=%q", code, out)
 	}
+
+	// Scenarios 7 and 5 (SPEC), folded into the binary smoke test now that
+	// commit and log are registered on the real command tree: the store
+	// created by "new writer" above holds no pending manual edits, so log
+	// must show it and commit must have nothing left to record.
+	if out, code := run("log", "-n", "5"); code != 0 || !strings.Contains(out, "OPERATION") {
+		t.Fatalf("fu log: exit %d\n%s", code, out)
+	}
+	if out, code := run("commit"); code != 0 || !strings.Contains(out, "nothing to commit") {
+		t.Fatalf("fu commit on a clean store: exit %d\n%s", code, out)
+	}
+
+	// A real edit through the real binary, so a successful commit and the
+	// table log actually renders are both covered end to end rather than only
+	// against fakes (review 2026-09-02, Important). The commit must name the
+	// skill and the path, and log must then number it 1 -- the number
+	// `fu revert 1` would act on.
+	edited := filepath.Join(fuHome, "store", "skills", "writer", "SKILL.md")
+	if err := os.WriteFile(edited, []byte("---\nname: writer\ndescription: edited by the smoke test\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, code := run("commit", "writer", "-m", "smoke edit")
+	if code != 0 || !strings.Contains(out, `recorded "commit: writer"`) || !strings.Contains(out, "skills/writer/SKILL.md") {
+		t.Fatalf("fu commit writer: exit %d\n%s", code, out)
+	}
+	out, code = run("log", "-n", "3")
+	if code != 0 {
+		t.Fatalf("fu log after a commit: exit %d\n%s", code, out)
+	}
+	for _, want := range []string{"commit: writer", "smoke edit"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("fu log must render %q:\n%s", want, out)
+		}
+	}
+	rows := strings.SplitN(out, "\n", 3)
+	if len(rows) < 2 {
+		t.Fatalf("fu log must emit a header and at least one row:\n%s", out)
+	}
+	if !strings.HasPrefix(rows[1], "1 ") {
+		t.Fatalf("the newest operation must be numbered 1, got row %q", rows[1])
+	}
 }

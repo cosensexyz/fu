@@ -4,7 +4,6 @@ package store
 import (
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/go-git/go-git/v5/plumbing"
 )
@@ -132,12 +131,15 @@ func (s *Store) Revert(n int) ([]string, error) {
 // before the last n operations, walking first-parent history and counting only
 // the commits that are operations.
 //
-// What counts is decided by SPEC §5.3's own list -- add, rm, adopt, new,
-// update, enable, disable, revert -- through IsOperationMessage (git.go). It
-// is a whitelist rather than a list of exclusions, and that is the point: an
-// earlier version excluded only the sweep's ExternalCommitMessage, so every
-// other message fu writes on its own account silently became a user
-// operation. The recovery pass's compensation commit did exactly that, and
+// What counts is decided by SPEC §5.3's own list, through IsOperationMessage
+// (git.go). The verbs are not restated here: this comment named eight of them
+// and went stale the moment the list gained `commit`, which is exactly the
+// drift §5.3 warns about (review 2026-09-03, Minor). operationVerbs is the
+// one place to read them. It is a whitelist rather than a list of exclusions,
+// and that is the point: an earlier version excluded only the sweep's
+// ExternalCommitMessage, so every other message fu writes on its own account
+// silently became a user operation. The recovery pass's compensation commit
+// did exactly that, and
 // because RevertOperations recovers before it sweeps, `fu revert 1` after a
 // crash wrote that compensation itself and then reverted it -- restoring the
 // content fu had just rolled back and leaving the user's real last operation
@@ -146,11 +148,15 @@ func (s *Store) Revert(n int) ([]string, error) {
 //
 // A rolled-back operation and its compensation are discounted as a pair, not
 // just the compensation. The compensation names the operation it cancels
-// (RecoveryCompensationPrefix, git.go), so the walk can recognise the other
-// half when it reaches it; the two together net to zero, and an operation that
-// was interrupted and undone is not one the user ever completed. Matching by
-// message rather than by adjacency keeps this right when a sweep lands between
-// them.
+// (RecoveryCompensationPrefix, git.go), so WalkOperations can recognise the
+// other half when it reaches it; the two together net to zero, and an
+// operation that was interrupted and undone is not one the user ever
+// completed. Why that pairing is matched by message rather than by adjacency
+// is stated once, at WalkOperations (operations.go) -- the single place that
+// decides what counts as an operation. This comment used to restate it and
+// had it backwards, claiming the matching is what makes a sweep between the
+// pair safe when validateRecoveryCommit already forbids anything landing
+// there (review 2026-09-03 round 4, Minor).
 //
 // HEAD~n could not tell any of this apart. Counting operations here also
 // subsumes the caller's old skip adjustment, which compensated only for the
@@ -162,41 +168,32 @@ func (s *Store) Revert(n int) ([]string, error) {
 // before the operations being undone: taking the parent keeps that edit in the
 // resulting tree, which is what the skip adjustment already did and what a
 // user undoing operations expects of content no operation touched.
+//
+// The counting itself is WalkOperations's job now; this function only reads
+// the ordinal it hands back and stops the walk once it reaches n.
 func (s *Store) resolveOperationsBack(n int) (plumbing.Hash, error) {
-	head, err := s.Repo.Head()
-	if err != nil {
-		return plumbing.ZeroHash, err
-	}
-	commit, err := s.Repo.CommitObject(head.Hash())
-	if err != nil {
-		return plumbing.ZeroHash, err
-	}
-	// Messages of operations that a compensation commit already seen in this
-	// walk cancels. A multiset, because the same operation message can be
-	// interrupted and compensated more than once over a store's life.
-	cancelled := map[string]int{}
+	target := plumbing.ZeroHash
 	operations, walked := 0, 0
-	for {
+	err := s.WalkOperations(func(e OperationEntry) (bool, error) {
 		walked++
-		switch {
-		case strings.HasPrefix(commit.Message, RecoveryCompensationPrefix):
-			cancelled[strings.TrimPrefix(commit.Message, RecoveryCompensationPrefix)]++
-		case cancelled[commit.Message] > 0:
-			cancelled[commit.Message]--
-		case IsOperationMessage(commit.Message):
-			operations++
+		if e.Ordinal != 0 {
+			operations = e.Ordinal
 		}
-		if len(commit.ParentHashes) == 0 {
-			return plumbing.ZeroHash, fmt.Errorf(
-				"the store holds %d operation(s) in %d commit(s) of history", operations, walked)
+		if e.Ordinal != 0 && e.Ordinal == n {
+			// The target is this operation's own first parent, not the
+			// (n+1)-th operation; a root commit has none, so the walk ends
+			// here and the shortfall is reported below.
+			target = e.FirstParent
+			return false, nil
 		}
-		parent, err := s.Repo.CommitObject(commit.ParentHashes[0])
-		if err != nil {
-			return plumbing.ZeroHash, err
-		}
-		if operations == n {
-			return parent.Hash, nil
-		}
-		commit = parent
+		return true, nil
+	})
+	if err != nil {
+		return plumbing.ZeroHash, err
 	}
+	if target.IsZero() {
+		return plumbing.ZeroHash, fmt.Errorf(
+			"the store holds %d operation(s) in %d commit(s) of history", operations, walked)
+	}
+	return target, nil
 }

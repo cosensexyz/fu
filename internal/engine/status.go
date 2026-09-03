@@ -139,8 +139,8 @@ type RecoveryInventory struct {
 	// bookkeeping gc's own predicates admit.
 	//
 	// "Would be entitled to collect" rather than "will certainly succeed" --
-	// see collectableRecoveryNamesFromJournal for the two degraded states in which gc
-	// re-reads more than this derivation does and refuses.
+	// see collectableRecoveryNamesFromJournal for the two degraded states in
+	// which gc re-reads more than this derivation does and refuses.
 	Collectable int
 	// Blocked counts entries in those same families that `fu gc` would leave
 	// exactly where they are, because they wait on a recovery pass instead:
@@ -172,11 +172,11 @@ type RecoveryInventory struct {
 //
 // Building those sets is where the reads happen, and they are reads of fu's own
 // journal rather than of the objects it describes. pendingPayloadClaims derives
-// from records PendingTxns already parsed; collectableRecoveryNamesFromJournal scans the
-// journal filenames and decodes one revision per completed rm family. Neither
-// opens a payload. That is the line actually being held: the inventory agrees
-// with gc by asking gc's own questions, and still never reads the content it is
-// counting.
+// from records PendingTxns already parsed; collectableRecoveryNamesFromJournal
+// scans the journal filenames and decodes one revision per completed rm
+// family. Neither opens a payload. That is the line actually being held: the
+// inventory agrees with gc by asking gc's own questions, and still never
+// reads the content it is counting.
 var (
 	// retainedPrefixes name the authority SPEC §9 promises for restoring an
 	// adopted entry in place. gc never deletes these, by design.
@@ -389,9 +389,10 @@ type recoveryCollection struct {
 	scanned bool
 }
 
-// collectableRecoveryNamesFromJournal derives what `fu gc` would actually be entitled to
-// collect on its next run: the payloads a *completed, unpruned* family
-// describes, and the journal files of every family gc has left to prune.
+// collectableRecoveryNamesFromJournal derives what `fu gc` would actually be
+// entitled to collect on its next run: the payloads a *completed, unpruned*
+// family describes, and the journal files of every family gc has left to
+// prune.
 //
 // This is the other half of pendingPayloadClaims below. That one answers "what
 // must gc not collect"; this one answers "what can it". Both questions have to
@@ -728,8 +729,8 @@ func txnFamilyFiles(journal txnJournal, key txnKey) []string {
 }
 
 // newestTxnRevision decodes the highest-sequence revision of one family and
-// nothing else. It is collectableRecoveryNamesFromJournal's cheap counterpart to
-// validateTxnChain, which re-reads and re-hashes every revision in the chain
+// nothing else. It is collectableRecoveryNamesFromJournal's cheap counterpart
+// to validateTxnChain, which re-reads and re-hashes every revision in the chain
 // -- the cost model PendingTxns documents as unaffordable on a read path.
 func newestTxnRevision(st *store.Store, revisions []txnRevision) (TxnRecord, error) {
 	if len(revisions) == 0 {

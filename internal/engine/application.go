@@ -484,6 +484,16 @@ func (a *Application) Revert(n int) (RevertOutcome, error) {
 	return RevertOperations(st, a.detectedAgents(), n)
 }
 
+// Commit runs `fu commit`: name limits it to one skill, empty records the
+// whole store; message is the -m body.
+func (a *Application) Commit(name, message string) (CommitOutcome, error) {
+	st, err := a.openStore()
+	if err != nil {
+		return CommitOutcome{}, err
+	}
+	return CommitOperations(st, a.detectedAgents(), CommitScope{Name: name, Message: message})
+}
+
 // UpdateSkip names one skill a batch update declined to touch, and why. The
 // only Reason a batch itself produces today is "locally modified" (SPEC rule
 // 3); it is a struct rather than a bare name so the CLI never has to

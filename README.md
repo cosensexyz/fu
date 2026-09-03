@@ -26,9 +26,9 @@ move, and every change is a commit.
 
 ## Status
 
-**Fifteen commands ship today:** `init`, `new`, `list`, `show`, `status`,
-`restore`, `revert`, `enable`, `disable`, `add`, `adopt`, `rm`, `outdated`,
-`update`, `gc`.
+**Seventeen commands ship today:** `init`, `new`, `list`, `show`, `status`,
+`restore`, `revert`, `commit`, `log`, `enable`, `disable`, `add`, `adopt`,
+`rm`, `outdated`, `update`, `gc`.
 
 `add` installs a skill from a git URL or a local directory and records the
 locked source; `adopt` takes skills that already live in an agent's directory
@@ -44,8 +44,11 @@ discarding it; `--hard` discards the part of that content which is tracked,
 and never touches untracked files; `revert` rolls the store back a given
 number of operations, converging the store's worktree to an earlier commit's
 tree and republishing that as a new commit.
-Still designed but not built: `clone`, `push`, `pull`, `log`, `commit`,
-`remote`, `agent`. See [Roadmap](#roadmap).
+`commit` records hand edits deliberately — one skill, or the whole store —
+under a generated subject line, with `-m` as the body; `log` lists history
+with each revertible operation numbered the way `fu revert n` counts.
+Still designed but not built: `clone`, `push`, `pull`, `remote`, `agent`.
+See [Roadmap](#roadmap).
 
 **macOS and Linux.** fu relies on POSIX directory-relative syscalls and does not
 build on Windows.
@@ -153,7 +156,7 @@ $ fu restore
 restored agent links
 the store worktree was left alone; these changes are not committed:
   skills/pdf-tools/SKILL.md
-record them with a write command, which commits pending hand edits first, or discard them with `fu restore --hard`
+record them with `fu commit`, or with any write command other than `fu restore` and `fu gc`, which sweep nothing; or discard them with `fu restore --hard`
 ```
 
 `fu revert` undoes operations. A pending hand edit is committed first, so
@@ -219,6 +222,8 @@ so a skill is never out of date in one agent and current in another.
 | `fu status` | Report how `fu.yaml`'s expectations and what's on disk differ, plus the store worktree's state, any unfinished transaction, and what `recovery/` and `staging/` are holding; read-only, and finding a difference is not a failure — it exits 0 with the report. Failing to read the store at all is still an error. Read-only means it writes no store content, takes no lock and creates no agent directory; opening `$FU_HOME` does recreate `staging/` and `recovery/` if they have gone missing, which every command does alike. |
 | `fu restore [--hard]` | Rebuild agent links from `fu.yaml`; an uncommitted store worktree is reported and never touched. `--hard` also resets the tracked part of it back to the last commit — those edits are then gone for good, in neither git history nor `recovery/`. Untracked files are outside its reach and are reported either way — but note that a `.gitignore`d file is only untracked until fu first records it: sweeps commit ignored content deliberately, and once committed such a file is tracked and `--hard` resets it like any other. |
 | `fu revert <n>` | Roll the store back `n` operations: any pending hand edit is committed first, then the store worktree converges to the tree from `n` operations ago and that becomes a new commit. |
+| `fu commit [name] [-m <message>]` | Record pending hand edits as one operation. With a name, only `skills/<name>/` is recorded and everything else stays pending; without one, the whole store is. The name must be a skill `fu.yaml` already registers. Naming a skill while paths outside it are staged with `git` and differ from the last commit is refused outright, with those paths named — they would be recorded by a commit whose subject names one skill. Unstage them in the store, or drop the name. With a name the worktree wins: a version you staged inside that skill and then edited further is superseded and does not enter history. That matches `git commit <path>` wherever a commit is actually written — but the two invert when the tree does not move. Stage a draft, edit the file back to the committed bytes, and real git exits 1 with `nothing to commit, working tree clean` and keeps your staged draft; fu prints the shorter `nothing to commit`, exits 0, and syncs the index onto the worktree, so the draft is gone. It is the one thing `fu commit` can destroy, and it is deliberate: without that sync the skill would report as pending forever. The subject line is generated (`commit: <name>`, or `commit: <skills>[, fu.yaml][, store]`, collapsing to `N skills` past five); `-m` becomes the body. Without a name, anything already staged with git directly is recorded first as `external: manual modifications`; if that consumes the whole difference, fu reports that commit and says `-m` went unused, rather than claiming there was nothing to commit. Nothing pending prints `nothing to commit` and exits 0 — with a name, that means nothing pending under that skill. Read that as "nothing to record" rather than "nothing happened": the index convergence above runs on exactly this path. Either form records indiscriminately within its range, untracked and `.gitignore`d files included, the same projection a sweep uses — a name narrows the range, not the projection. |
+| `fu log [-n <count>]` | Show first-parent history, newest first, 20 entries by default. Each revertible operation carries the number `fu revert n` would use; sweeps, `init`, and a recovery compensation together with the operation it cancels are listed without one, as is any commit whose verb fu does not recognise — a plain `git commit` of your own, for instance. Read-only. |
 | `fu enable <name> [--agent <a>]` | Turn a skill on, globally or for one agent. |
 | `fu disable <name> [--agent <a>]` | Turn a skill off, globally or for one agent. |
 
@@ -376,14 +381,23 @@ per agent, and you would not get it back by toggling the global switch again.
 The override disappears when you write it to match the global value yourself.
 
 **Hand-editing the store is expected.** Edit `~/.fu/store/skills/<name>/`
-directly whenever you like. The next fu *write* command notices and commits it
-as an `external: manual modifications` commit before doing its own work, so
-nothing you wrote is silently swallowed into an unrelated change. That sweep
-is deliberately indiscriminate: it records untracked files, and `.gitignore`d
-ones too, so nothing you left in the store can be lost by a later fu operation
-that knew nothing about it. Read-only commands (`list`, `show`, `status`) take
-no lock and do not sweep, so an edit stays uncommitted until you next run a
-write command.
+directly whenever you like. Most fu *write* commands notice and commit it as
+an `external: manual modifications` commit before doing their own work, so
+nothing you wrote is silently swallowed into an unrelated change. That sweep is
+deliberately indiscriminate: it records untracked files, and `.gitignore`d ones
+too, so nothing you left in the store can be lost by a later fu operation that
+knew nothing about it.
+
+Three commands are outside that rule. `fu commit` records your edit under its
+own `commit:` subject rather than sweeping it under an unrelated one, and with
+a name it records only that skill, so an edit elsewhere stays pending and a
+later `fu restore --hard` would discard it. Being outside the rule changes
+*which* paths are recorded, not *how*: within whatever range it was given,
+`fu commit` is as indiscriminate as any sweep — untracked and `.gitignore`d
+files land in the commit too, and are tracked from then on. `fu restore` and
+`fu gc` do not sweep at all. Read-only commands (`list`, `show`, `status`,
+`log`, `outdated`) take no lock and do not sweep either, so an edit stays
+uncommitted until you next run a command that records it.
 
 **`fu restore --hard` discards instead of reporting.** Left at its default,
 `restore` only reports an uncommitted change in the store's own worktree, the
@@ -402,10 +416,10 @@ git refuses when local changes could conflict with the change it is
 reverting. fu's revert cannot conflict with anything, because it converges
 the worktree straight to a past commit's tree instead of applying a patch —
 so instead of refusing, it commits any pending hand edit to its own
-`external: manual modifications` commit first, the same rule every write
-command already follows, and then proceeds. That edit is not lost — it is
-its own commit in the store's git history (`fu log` is not built yet, but
-`git -C ~/.fu/store log` shows it) — but it does not reappear in the
+`external: manual modifications` commit first, the same rule the sweeping
+write commands already follow, and then proceeds. That edit is not lost — it is
+its own commit in the store's git history (`fu log` shows it, without a
+number, since a sweep is not an operation) — but it does not reappear in the
 worktree after the revert; only the reverted operation's target content
 does.
 
@@ -437,8 +451,6 @@ Designed in [DESIGN.md](DESIGN.md), not yet built:
 | | |
 |---|---|
 | `clone`, `push`, `pull` | Move the store between machines. |
-| `log` | Browse history; `git -C ~/.fu/store log` works today. |
-| `commit` | Record edits deliberately. |
 | `remote`, `agent` | Configure the store's remote, and inspect or configure agent adapters. |
 
 [SPEC.md](SPEC.md) states the product in full; [DESIGN.md](DESIGN.md) is the

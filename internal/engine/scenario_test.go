@@ -4,16 +4,18 @@ package engine
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cosensexyz/fu/internal/agent"
 	"github.com/cosensexyz/fu/internal/store"
 )
 
-// Walks the SPEC scenarios this file covers: create (7), toggle (2), and the
-// store layer of mistake recovery (5). Scenarios 1 and 6 are exercised
-// functionally by add_test.go, adopt_test.go and adopt_whole_test.go rather
-// than here; folding them into this walkthrough is tracked in DESIGN §8.
+// Walks the SPEC scenarios this file covers: create and record (7), toggle
+// (2), and mistake recovery (5) through revert and log. Scenarios 1 and 6 are
+// exercised functionally by add_test.go, adopt_test.go and
+// adopt_whole_test.go rather than here; folding them into this walkthrough is
+// tracked in DESIGN §8.
 func TestScenarioWalkthrough(t *testing.T) {
 	s, _ := setupStore(t)
 	claudeDir, codexDir := t.TempDir(), t.TempDir()
@@ -66,6 +68,54 @@ func TestScenarioWalkthrough(t *testing.T) {
 	}
 	if _, err := os.Readlink(filepath.Join(codexDir, "writer")); err != nil {
 		t.Fatal("revert + reconcile must restore the codex link")
+	}
+
+	// Scenario 5's remaining step: the revert is itself the newest operation.
+	entries, err = s.Log(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries[0].Ordinal != 1 || !strings.HasPrefix(entries[0].Message, "revert: ") {
+		t.Fatalf("log must number the revert as operation 1: %+v", entries[0])
+	}
+}
+
+// Scenario 7 end to end: author a skill, edit it, record the edit
+// deliberately with commit, and see it numbered in the log as the operation
+// `fu revert 1` would undo.
+func TestScenarioAuthorEditCommitAndLog(t *testing.T) {
+	s, _ := setupStore(t)
+	dir := t.TempDir()
+	agents := []agent.Agent{fakeAgent{"claude", dir}}
+	if _, err := NewSkill(s, agents, "writer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "writer", "SKILL.md"), []byte("draft two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := CommitOperations(s, agents, CommitScope{Name: "writer", Message: "second draft"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.Written {
+		t.Fatalf("commit must record the edit: %+v", outcome)
+	}
+	entries, err := s.Log(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries[0].Message != "commit: writer\n\nsecond draft" || entries[0].Ordinal != 1 {
+		t.Fatalf("head = %+v", entries[0])
+	}
+	if entries[1].Message != "new: writer" || entries[1].Ordinal != 2 {
+		t.Fatalf("second = %+v", entries[1])
+	}
+	if entries[2].Message != "init: store" || entries[2].Ordinal != 0 {
+		t.Fatalf("third = %+v", entries[2])
+	}
+	// The link layer is untouched by a content-only operation.
+	if _, err := os.Readlink(filepath.Join(dir, "writer")); err != nil {
+		t.Fatal("claude keeps the link after a commit")
 	}
 }
 

@@ -26,7 +26,7 @@ func NewRootCmd() *cobra.Command {
 	})
 	root.AddCommand(newInitCmd(app), newNewCmd(app))
 	root.AddCommand(newToggleCmd(app, "enable", true), newToggleCmd(app, "disable", false))
-	root.AddCommand(newListCmd(app), newShowCmd(app), newStatusCmd(app), newOutdatedCmd(app), newUpdateCmd(app), newRestoreCmd(app), newRevertCmd(app))
+	root.AddCommand(newListCmd(app), newShowCmd(app), newStatusCmd(app), newOutdatedCmd(app), newUpdateCmd(app), newRestoreCmd(app), newRevertCmd(app), newCommitCmd(app), newLogCmd(app))
 	root.AddCommand(newAddCmd(app), newRmCmd(app), newAdoptCmd(app), newGCCmd(app))
 	return root
 }

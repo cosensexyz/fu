@@ -419,7 +419,7 @@ func TestReadOnlyDiagnosticsGoToStderrOnly(t *testing.T) {
 		cfgPath := seedStore(t, "version: 1", func(raw string) string {
 			return strings.Replace(raw, "version: 1", "version: 99", 1)
 		})
-		for _, args := range [][]string{{"list"}, {"show", "alpha"}} {
+		for _, args := range [][]string{{"list"}, {"show", "alpha"}, {"log"}} {
 			stdout, stderr, err := runCmdSplit(t, args...)
 			if err != nil {
 				t.Fatalf("%v: a too-new version must not fail a read-only command: %v", args, err)
@@ -455,7 +455,7 @@ func TestReadOnlyDiagnosticsGoToStderrOnly(t *testing.T) {
 				seedStore(t, "version: 1", func(raw string) string {
 					return strings.Replace(raw, "version: 1", version, 1)
 				})
-				for _, args := range [][]string{{"list"}, {"show", "alpha"}} {
+				for _, args := range [][]string{{"list"}, {"show", "alpha"}, {"log"}} {
 					_, stderr, err := runCmdSplit(t, args...)
 					if err != nil {
 						t.Fatalf("%v: %v", args, err)
@@ -474,7 +474,7 @@ func TestReadOnlyDiagnosticsGoToStderrOnly(t *testing.T) {
 			return strings.Replace(raw, "skills:\n  alpha:",
 				"skills:\n  Beta:\n    digest: sha256:bad\n    enabled: true\n  alpha:", 1)
 		})
-		for _, args := range [][]string{{"list"}, {"show", "alpha"}} {
+		for _, args := range [][]string{{"list"}, {"show", "alpha"}, {"log"}} {
 			stdout, stderr, err := runCmdSplit(t, args...)
 			if err != nil {
 				t.Fatalf("%v: one invalid name must not fail a read-only command: %v", args, err)

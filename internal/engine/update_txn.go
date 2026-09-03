@@ -144,13 +144,13 @@ func validateUpdateRecord(r TxnRecord) error {
 // finishCommittedUpdate in this file (through reclaimExchangedUpdatePayload)
 // see only completed families, where the exchange has happened, so
 // staging/<name> is PreviousPayload's. The other two in this file read the
-// other way round, and are right to: restoreExchangedUpdate settles the side at skills/<name> first --
-// matching there, never at the staging name, is what tells the two apart -- and
-// by the time it names staging, the pre-exchange arrangement holds again,
-// either because the exchange never ran or because it has just been undone, so
-// what it discards there is Payload's tree. discardUpdateStagingResidue reads
-// Payload for the same reason from the other end: it runs on a record whose
-// exchange demonstrably never happened.
+// other way round, and are right to: restoreExchangedUpdate settles the side
+// at skills/<name> first -- matching there, never at the staging name, is what
+// tells the two apart -- and by the time it names staging, the pre-exchange
+// arrangement holds again, either because the exchange never ran or because
+// it has just been undone, so what it discards there is Payload's tree.
+// discardUpdateStagingResidue reads Payload for the same reason from the
+// other end: it runs on a record whose exchange demonstrably never happened.
 //
 // Naming an object rather than a location is what makes matching a manifest a
 // decision procedure rather than a guess -- and it is why the exchange side is

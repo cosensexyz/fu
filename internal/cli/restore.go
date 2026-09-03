@@ -83,7 +83,20 @@ func printRefusedPaths(errOut io.Writer, refused []string) {
 	for _, path := range refused {
 		fmt.Fprintf(errOut, "  %s\n", path)
 	}
-	fmt.Fprintln(errOut, "record them with a write command, which commits pending hand edits first, or discard them with `fu restore --hard`")
+	// Names `fu commit` first now that one exists for exactly this: the
+	// generic "a write command" predates it and left the user to work out
+	// which command would do it (review 2026-09-02, Minor). The two
+	// exceptions are named because this message prints from one of them:
+	// `fu restore` and `fu gc` are write commands that do not sweep, so
+	// "any other write command" was advice the reader could follow and get
+	// nowhere (review 2026-09-03, Minor).
+	//
+	// README quotes this line verbatim in a transcript, and the quote went
+	// stale the moment the wording changed. Rather than assert here what
+	// README says -- which this file cannot check and got wrong once
+	// already -- TestReadmeTranscriptsQuoteRealCliOutput holds the two
+	// together mechanically.
+	fmt.Fprintln(errOut, "record them with `fu commit`, or with any write command other than `fu restore` and `fu gc`, which sweep nothing; or discard them with `fu restore --hard`")
 }
 
 // printKeptPaths reports the uncommitted content no invocation of this command
@@ -110,5 +123,5 @@ func printKeptPaths(errOut io.Writer, left []string) {
 	// these exactly as it records a tracked edit. An earlier version said to
 	// handle them "by hand", which was simply false -- and withheld from this
 	// group the very remedy printed four lines above it.
-	fmt.Fprintln(errOut, "record them with a write command, which commits them too, or delete them yourself; `--hard` will not")
+	fmt.Fprintln(errOut, "record them with `fu commit`, or with any write command other than `fu restore` and `fu gc`, which sweep nothing; or delete them yourself, since `--hard` will not")
 }

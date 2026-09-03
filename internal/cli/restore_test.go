@@ -114,9 +114,10 @@ func TestRestoreCommandReportsConflictsWithoutFailing(t *testing.T) {
 
 // TestRestoreCommandReportsRefusedPaths covers the RunE branch for a restore
 // blocked by uncommitted store content: every refused path must reach
-// stderr, along with what the user can do instead -- record it with a write
-// command (which commits pending hand edits first, SPEC §5.3) or discard the
-// change with `fu restore --hard`. This test's outcome carries no Reset, the
+// stderr, along with what the user can do instead -- record it with
+// `fu commit`, or with any write command other than `fu restore` and `fu gc`,
+// which sweep nothing (SPEC §5.3); or discard the change with
+// `fu restore --hard`. This test's outcome carries no Reset, the
 // shape a fake Application produces when the caller ran plain `restore`
 // (hard=false): the wording changed from "handle it directly with git" to
 // naming `--hard` once this task gave that option a real implementation, so
@@ -143,7 +144,13 @@ func TestRestoreCommandReportsRefusedPaths(t *testing.T) {
 		"the store worktree was left alone; these changes are not committed:",
 		"  skills/alpha/SKILL.md\n",
 		"  skills/alpha/NOTES.md\n",
-		"record them with a write command",
+		// Names the command that does this, not just "a write command":
+		// `fu commit` did not exist when this message was written (review
+		// 2026-09-02, Minor).
+		"record them with `fu commit`",
+		// And names the two write commands that would not do it, since this
+		// message prints from one of them (review 2026-09-03, Minor).
+		"any write command other than `fu restore` and `fu gc`",
 		"discard them with `fu restore --hard`",
 	} {
 		if !strings.Contains(errOut, want) {
@@ -316,7 +323,7 @@ func TestRestoreCommandSeparatesUntrackedContentFromWhatHardCanDiscard(t *testin
 	}
 	for _, want := range []string{
 		"skills/alpha/SKILL.md",
-		"record them with a write command",
+		"record them with `fu commit`",
 	} {
 		if !strings.Contains(errOut, want) {
 			t.Fatalf("stderr missing %q, got %q", want, errOut)
@@ -344,7 +351,7 @@ func TestRestoreCommandHardAccountsForContentItDeliberatelyKept(t *testing.T) {
 		t.Fatal(err)
 	}
 	errOut := stderr.String()
-	for _, want := range []string{"skills/alpha/scratch.md", "record them with a write command"} {
+	for _, want := range []string{"skills/alpha/scratch.md", "record them with `fu commit`"} {
 		if !strings.Contains(errOut, want) {
 			t.Fatalf("--hard must account for what it kept, missing %q in %q", want, errOut)
 		}

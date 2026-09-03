@@ -1545,12 +1545,16 @@ func TestSessionProjectionCommitsEveryEntryKind(t *testing.T) {
 	}
 }
 
-// TestOperationVerbsCoverEveryMessageProducingCommand guards the coupling
-// resolveOperationsBack now depends on: a whitelist is only safe while it
-// actually lists every operation. A new write command whose verb is missing
-// here would be silently skipped by `fu revert n`, which would then reach one
-// operation too far back -- the same class of silent wrongness the blacklist
-// produced in the other direction.
+// TestOperationVerbsCoverEveryMessageProducingCommand states the coupling
+// resolveOperationsBack depends on, but does not guard it: this is a
+// hand-maintained list of message strings, so it restates operationVerbs
+// rather than checking it. The guard is
+// TestEveryOperationCommitThisPackageWritesIsCountable in internal/engine,
+// which drives the real commands (review 2026-09-02, Important). A whitelist
+// is only safe while it actually lists every operation. A new write command
+// whose verb is missing here would be silently skipped by `fu revert n`,
+// which would then reach one operation too far back -- the same class of
+// silent wrongness the blacklist produced in the other direction.
 //
 // The verbs are checked against the message forms the engine builds
 // (ops.go "new: "/"<verb>: "/"<verb>: <name> --agent <a>", add.go "add: ",
@@ -1569,6 +1573,8 @@ func TestOperationVerbsCoverEveryMessageProducingCommand(t *testing.T) {
 		"enable: alpha --agent claude",
 		"disable: alpha --agent codex",
 		"revert: back 2 operation(s) to abc1234",
+		"commit: alpha",
+		"commit: alpha, beta, fu.yaml\n\nwhy the edit was made",
 	} {
 		if !IsOperationMessage(msg) {
 			t.Errorf("%q must count as an operation (SPEC §5.3)", msg)
