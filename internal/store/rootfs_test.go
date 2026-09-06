@@ -3,6 +3,7 @@ package store
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,114 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestOpenReadOnlyRootFilePreservesAbsentControlFileIdentityError(t *testing.T) {
+	dir := t.TempDir()
+	root, err := openPinnedTop(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.close()
+	display := filepath.Join(dir, "packed-refs")
+	file, err := openReadOnlyRootFileWithCapture(root, "packed-refs", display, os.O_RDONLY, 0, entryIdentityAt)
+	if file != nil {
+		_ = file.Close()
+		t.Fatal("opening an absent control file returned a file")
+	}
+	if !os.IsNotExist(err) {
+		t.Fatalf("absent control-file error = %v, want os.IsNotExist", err)
+	}
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) || pathErr.Op != "identify" || pathErr.Path != display {
+		t.Fatalf("absent control-file error = %#v, want identify PathError for %s", err, display)
+	}
+}
+
+func TestRootFilesystemPreservesTransientControlFileIdentityError(t *testing.T) {
+	dir := t.TempDir()
+	root, err := openPinnedTop(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.close()
+	fsys, err := newRootFilesystem(root, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("control file changed during identity capture")
+	fsys.readOnlyIdentityCapture = func(int, string) (FileIdentity, unix.Stat_t, error) {
+		return FileIdentity{}, unix.Stat_t{}, errors.Join(ErrOwnedTreeChanged, cause)
+	}
+
+	file, err := fsys.Open("packed-refs")
+	if file != nil {
+		_ = file.Close()
+		t.Fatal("transiently changed control file returned a file")
+	}
+	if !errors.Is(err, ErrOwnedTreeChanged) || !errors.Is(err, cause) {
+		t.Fatalf("control-file identity error = %v, want ownership sentinel and capture cause", err)
+	}
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) || pathErr.Op != "identify" || pathErr.Path != "packed-refs" {
+		t.Fatalf("control-file identity error = %#v, want identify PathError", err)
+	}
+}
+
+func TestRootFilesystemChrootPreservesReadOnlyIdentityCapture(t *testing.T) {
+	dir := t.TempDir()
+	root, err := openPinnedTop(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.close()
+	fsys, err := newRootFilesystem(root, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("chrooted control-file capture")
+	calls := 0
+	fsys.readOnlyIdentityCapture = func(int, string) (FileIdentity, unix.Stat_t, error) {
+		calls++
+		return FileIdentity{}, unix.Stat_t{}, cause
+	}
+	chrooted, err := fsys.Chroot(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := chrooted.Open("packed-refs")
+	if file != nil {
+		_ = file.Close()
+		t.Fatal("failed capture returned a file")
+	}
+	if !errors.Is(err, cause) || calls != 1 {
+		t.Fatalf("chrooted open = %v with %d capture calls, want injected error once", err, calls)
+	}
+}
+
+func BenchmarkOpenReadOnlyRootFile(b *testing.B) {
+	dir := b.TempDir()
+	path := filepath.Join(dir, "packed-refs")
+	if err := os.WriteFile(path, []byte("# pack-refs with: peeled fully-peeled sorted\n"), 0o644); err != nil {
+		b.Fatal(err)
+	}
+	root, err := openPinnedTop(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer root.close()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		file, err := openReadOnlyRootFileWithCapture(root, "packed-refs", path, os.O_RDONLY, 0, entryIdentityAt)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
 
 // A writable open must never land on a symlink's target, even when that target
 // stays inside the pinned root. os.Root guarantees containment, not no-follow:

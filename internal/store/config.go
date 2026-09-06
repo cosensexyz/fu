@@ -467,6 +467,9 @@ type configExchangeHooks struct {
 	beforeExchange func()
 	afterExchange  func()
 	afterRestore   func()
+	openDisplaced  func(int, string) (*os.File, FileIdentity, unix.Stat_t, error)
+	captureCurrent func(int, string) (FileIdentity, unix.Stat_t, error)
+	readCurrent    func(int, string, int64) ([]byte, error)
 }
 
 func (s *Store) installConfigExpecting(expect, data []byte, hooks configExchangeHooks) error {
@@ -484,26 +487,26 @@ func (s *Store) installConfigExpecting(expect, data []byte, hooks configExchange
 // openConfigCandidate creates a fresh private inode under a unique name. It is
 // not moved to the fixed active name until its identity and byte digests have
 // been durably recorded, eliminating an unowned crash window.
-func openConfigCandidate(scratch *checkedRoot) (*os.File, unix.Stat_t, string, error) {
+func openConfigCandidate(scratch *checkedRoot) (*os.File, FileIdentity, string, error) {
 	file, name, err := createTempAt(scratch.dir, configCandidatePrefix)
 	if err != nil {
-		return nil, unix.Stat_t{}, "", err
+		return nil, FileIdentity{}, "", err
 	}
-	var opened unix.Stat_t
-	if err := unix.Fstat(int(file.Fd()), &opened); err != nil {
+	identity, opened, err := openIdentity(int(file.Fd()))
+	if err != nil {
 		_ = file.Close()
-		return nil, unix.Stat_t{}, "", err
+		return nil, FileIdentity{}, "", err
 	}
 	if err := requireRegularStat(name, &opened); err != nil {
 		_ = file.Close()
-		return nil, unix.Stat_t{}, "", err
+		return nil, FileIdentity{}, "", err
 	}
 	if opened.Size != 0 {
 		_ = file.Close()
-		return nil, unix.Stat_t{}, "", fmt.Errorf(
+		return nil, FileIdentity{}, "", fmt.Errorf(
 			"%s/%s was nonempty immediately after exclusive creation", scratch.display, name)
 	}
-	return file, opened, name, nil
+	return file, identity, name, nil
 }
 
 func configArchiveName(identity FileIdentity) string {
@@ -523,28 +526,45 @@ func configArchiveName(identity FileIdentity) string {
 // was. An inode with hard links or open descriptors elsewhere loses a pathname
 // and nothing else.
 func archiveNamedConfigEntry(source *checkedRoot, sourceName string, archive *checkedRoot, expected FileIdentity) error {
+	return archiveNamedConfigEntryWithOps(source, sourceName, archive, expected, entryIdentityAt, renameNoReplace)
+}
+
+type configEntryIdentityCapture func(int, string) (FileIdentity, unix.Stat_t, error)
+type configEntryRename func(int, string, int, string) error
+
+func archiveNamedConfigEntryWithOps(
+	source *checkedRoot,
+	sourceName string,
+	archive *checkedRoot,
+	expected FileIdentity,
+	capture configEntryIdentityCapture,
+	rename configEntryRename,
+) error {
 	defer keepDescriptorOwnersAlive(source, archive)
 	if !validLogicalEntry(sourceName) {
 		return fmt.Errorf("archive config entry: invalid source name %q", sourceName)
 	}
 	sourceFD := int(source.dir.Fd())
 	archiveFD := int(archive.dir.Fd())
-	current, err := statAt(sourceFD, sourceName)
+	currentIdentity, _, err := capture(sourceFD, sourceName)
 	if err != nil {
 		return fmt.Errorf("inspect config exchange entry before archiving: %w", err)
 	}
-	if identityFromStat(&current) != expected {
+	if !currentIdentity.Same(expected) {
 		return fmt.Errorf("config exchange entry changed identity before it could be archived")
 	}
 	name := configArchiveName(expected)
-	if err := renameNoReplace(sourceFD, sourceName, archiveFD, name); err != nil {
+	if err := rename(sourceFD, sourceName, archiveFD, name); err != nil {
 		return fmt.Errorf("archive config exchange entry as %s/%s: %w", archive.display, name, err)
 	}
-	archived, err := statAt(archiveFD, name)
+	archivedIdentity, _, err := capture(archiveFD, name)
 	if err != nil {
 		return fmt.Errorf("inspect archived config exchange entry %s/%s: %w", archive.display, name, err)
 	}
-	if identityFromStat(&archived) != expected {
+	// Admission against a persisted identity may be lenient for a handle-free
+	// record. Revalidation after the rename must instead use the strong identity
+	// captured immediately before it, or a reused inode can admit a replacement.
+	if !archivedIdentity.Same(currentIdentity) {
 		return fmt.Errorf("archived config exchange entry %s/%s has an unexpected identity; it is preserved", archive.display, name)
 	}
 	return nil
@@ -565,7 +585,7 @@ func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *che
 		return &os.PathError{Op: "fstatat", Path: scratchPath, Err: err}
 	}
 
-	staged, stagedStat, candidateName, err := openConfigCandidate(scratch)
+	staged, stagedIdentity, candidateName, err := openConfigCandidate(scratch)
 	if err != nil {
 		return err
 	}
@@ -573,18 +593,16 @@ func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *che
 	// Held open from here to the end. The descriptor binds validation to the
 	// generated inode; terminal retirement uses a no-replace rename followed by
 	// identity revalidation and never mutates the inode itself.
-	stagedIdentity := identityFromStat(&stagedStat)
 	if err := fillRegularFile(staged, data, perm); err != nil {
 		return err
 	}
 	// What fu.yaml is about to become is not enough; the exchange also has to
 	// know what it currently is, because the object it displaces is the only
 	// evidence the file held the expected bytes at the instant of the swap.
-	previousStat, err := statAt(targetFD, name)
+	previousIdentity, _, err := entryIdentityAt(targetFD, name)
 	if err != nil {
-		return &os.PathError{Op: "fstatat", Path: targetPath, Err: err}
+		return configEntryCaptureError(targetPath, err)
 	}
-	previousIdentity := identityFromStat(&previousStat)
 	record := configExchangeRecord{
 		Version:      configExchangeRecordVersion,
 		Candidate:    candidateName,
@@ -600,9 +618,11 @@ func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *che
 	if hooks.afterRecord != nil {
 		hooks.afterRecord()
 	}
-	if current, statErr := statAt(scratchFD, candidateName); statErr != nil || identityFromStat(&current) != stagedIdentity {
-		return fmt.Errorf("%w (%s/%s changed before its recorded candidate could be published; it is preserved)",
-			ErrConfigChangedExternally, scratch.display, candidateName)
+	if currentIdentity, _, statErr := entryIdentityAt(scratchFD, candidateName); statErr != nil || !currentIdentity.Same(stagedIdentity) {
+		return configIdentityMismatch(
+			fmt.Sprintf("%s/%s changed before its recorded candidate could be published; it is preserved", scratch.display, candidateName),
+			statErr,
+		)
 	}
 	if err := renameNoReplace(scratchFD, candidateName, scratchFD, configSwapName); err != nil {
 		publishErr := fmt.Errorf("publish recorded config candidate at %s: %w", scratchPath, err)
@@ -621,9 +641,11 @@ func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *che
 	// through a descriptor, but the exchange addresses a name, and a
 	// replacement arriving in between would be installed as fu.yaml -- fu
 	// publishing content it never generated.
-	if current, statErr := statAt(scratchFD, configSwapName); statErr != nil || identityFromStat(&current) != stagedIdentity {
-		return fmt.Errorf("%w (%s was replaced before it could be published; it is preserved and %s is untouched)",
-			ErrConfigChangedExternally, scratchPath, targetPath)
+	if currentIdentity, _, statErr := entryIdentityAt(scratchFD, configSwapName); statErr != nil || !currentIdentity.Same(stagedIdentity) {
+		return configIdentityMismatch(
+			fmt.Sprintf("%s was replaced before it could be published; it is preserved and %s is untouched", scratchPath, targetPath),
+			statErr,
+		)
 	}
 	if err := renameExchange(targetFD, name, scratchFD, configSwapName); err != nil {
 		return fmt.Errorf("exchange %s with its replacement: %w", targetPath, err)
@@ -634,14 +656,20 @@ func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *che
 
 	// The one and only resolution of the scratch name after the swap. From here
 	// the displaced object is the descriptor, not the name.
-	displaced, displacedStat, err := openRegularFileAt(scratchFD, configSwapName)
+	openDisplaced := openRegularFileAt
+	if hooks.openDisplaced != nil {
+		openDisplaced = hooks.openDisplaced
+	}
+	displaced, displacedIdentity, displacedStat, err := openDisplaced(scratchFD, configSwapName)
 	if err != nil {
-		return fmt.Errorf("%w (the displaced %s is parked at %s but could not be inspected: %v)",
-			ErrConfigChangedExternally, targetPath, scratchPath, err)
+		return configIdentityMismatch(
+			fmt.Sprintf("the displaced %s is parked at %s but could not be inspected", targetPath, scratchPath),
+			err,
+		)
 	}
 	defer displaced.Close()
 	previousBytes, err := readAllRegularFile(displaced, configSwapName, displacedStat, MaxConfigBytes)
-	if err == nil && identityFromStat(&displacedStat) == previousIdentity && bytes.Equal(previousBytes, expect) {
+	if err == nil && displacedIdentity.Same(previousIdentity) && bytes.Equal(previousBytes, expect) {
 		// The precondition held. The superseded inode is archived rather than
 		// modified: a path outside fu may be a hard link to it, and an external
 		// process may still hold a descriptor for it after the exchange, so it
@@ -670,8 +698,16 @@ func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *che
 	// process can write fu.yaml directly anyway, so it gains nothing -- while
 	// refusing to restore would demote an ordinary concurrent writer's config
 	// on every occurrence.
-	current, statErr := statAt(targetFD, name)
-	installed, readCurrentErr := readRegularFileAt(targetFD, name, MaxConfigBytes)
+	captureCurrent := entryIdentityAt
+	if hooks.captureCurrent != nil {
+		captureCurrent = hooks.captureCurrent
+	}
+	readCurrent := readRegularFileAt
+	if hooks.readCurrent != nil {
+		readCurrent = hooks.readCurrent
+	}
+	currentIdentity, _, statErr := captureCurrent(targetFD, name)
+	installed, readCurrentErr := readCurrent(targetFD, name, MaxConfigBytes)
 	// Identity and content both, because they catch different writers: an
 	// atomic replace leaves a new inode, while a plain rewrite truncates fu's
 	// own file in place and leaves the identity untouched. When either says the
@@ -679,9 +715,11 @@ func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *che
 	// is -- restoring over it would be the same overwrite this whole protocol
 	// exists to prevent -- and the displaced version stays parked for the next
 	// install to report.
-	if statErr != nil || readCurrentErr != nil || identityFromStat(&current) != stagedIdentity || !bytes.Equal(installed, data) {
-		return fmt.Errorf("%w (a third version was installed at %s while the exchange was in progress; it is left in place and the displaced version is parked at %s)",
-			ErrConfigChangedExternally, targetPath, scratchPath)
+	if statErr != nil || readCurrentErr != nil || !currentIdentity.Same(stagedIdentity) || !bytes.Equal(installed, data) {
+		return configIdentityMismatch(
+			fmt.Sprintf("a third version was installed at %s while the exchange was in progress; it is left in place and the displaced version is parked at %s", targetPath, scratchPath),
+			errors.Join(statErr, readCurrentErr),
+		)
 	}
 	if swapErr := renameExchange(scratchFD, configSwapName, targetFD, name); swapErr != nil {
 		return fmt.Errorf("%w (the displaced %s is parked at %s because restoring it failed: %v)",
@@ -705,6 +743,22 @@ func exchangeCheckedFile(target *checkedRoot, name string, scratch, archive *che
 		return fmt.Errorf("%w: %v", ErrConfigChangedExternally, err)
 	}
 	return ErrConfigChangedExternally
+}
+
+func configEntryCaptureError(path string, err error) error {
+	pathErr := identityPathError(path, err)
+	if errors.Is(err, ErrOwnedTreeChanged) {
+		return fmt.Errorf("%w: %w", ErrConfigChangedExternally, pathErr)
+	}
+	return pathErr
+}
+
+func configIdentityMismatch(message string, cause error) error {
+	mismatch := fmt.Errorf("%w (%s)", ErrConfigChangedExternally, message)
+	if cause != nil {
+		return errors.Join(mismatch, cause)
+	}
+	return mismatch
 }
 
 // fillRegularFile replaces an already-open file's contents without going back

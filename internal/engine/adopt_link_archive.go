@@ -33,14 +33,15 @@ var adoptLinkArchiveNamePattern = regexp.MustCompile(`^adopt-link-[0-9a-f]{64}\.
 // removed by adopt. Its content-addressed file remains after transaction GC so
 // a future restore command can reconstruct the entry without dereferencing it.
 type adoptLinkArchiveRecord struct {
-	Version      int                `json:"version"`
-	Kind         string             `json:"kind"`
-	Agent        string             `json:"agent"`
-	Skill        string             `json:"skill"`
-	OriginalPath string             `json:"original_path"`
-	RawTarget    string             `json:"raw_target"`
-	Mode         uint32             `json:"mode"`
-	Identity     store.FileIdentity `json:"identity"`
+	Version      int    `json:"version"`
+	Kind         string `json:"kind"`
+	Agent        string `json:"agent"`
+	Skill        string `json:"skill"`
+	OriginalPath string `json:"original_path"`
+	RawTarget    string `json:"raw_target"`
+	Mode         uint32 `json:"mode"`
+	// Identity is handle-free for reproducible archives, not strict ownership proof.
+	Identity store.FileIdentity `json:"identity"`
 }
 
 func newAdoptLinkArchiveRecord(kind, agentName, skillName, originalPath, rawTarget string, mode uint32, identity store.FileIdentity) adoptLinkArchiveRecord {
@@ -69,7 +70,7 @@ func (r adoptLinkArchiveRecord) validate() error {
 	if r.RawTarget == "" {
 		return errors.New("adopt link archive has an empty raw target")
 	}
-	if !adoptIdentityValid(r.Identity) {
+	if !r.Identity.Valid() {
 		return errors.New("adopt link archive has an invalid identity")
 	}
 	if os.FileMode(r.Mode).Type() != fs.ModeSymlink {
@@ -79,6 +80,9 @@ func (r adoptLinkArchiveRecord) validate() error {
 }
 
 func marshalAdoptLinkArchive(record adoptLinkArchiveRecord) ([]byte, string, error) {
+	// The archive name and bytes must remain reproducible by binaries that
+	// predate file handles. Identity comparison is not part of validation here.
+	record.Identity.Handle = ""
 	if err := record.validate(); err != nil {
 		return nil, "", err
 	}

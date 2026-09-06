@@ -26,8 +26,9 @@ type ownedScratch struct {
 	parentPath string
 	name       string
 	path       string
-	parentID   scratchIdentity
+	parentID   store.FileIdentity
 	identity   scratchIdentity
+	parentIDAt func(int) (store.FileIdentity, unix.Stat_t, error)
 	quarantine string
 	closed     bool
 }
@@ -38,8 +39,9 @@ type scratchCleanupHooks struct {
 }
 
 type scratchCreateHooks struct {
-	afterMkdir     func(parentFD int, name string) error
-	inspectCreated func(parentFD int, name string, stat *unix.Stat_t) error
+	afterMkdir            func(parentFD int, name string) error
+	inspectCreated        func(parentFD int, name string, stat *unix.Stat_t) error
+	captureParentIdentity func(int) (store.FileIdentity, unix.Stat_t, error)
 }
 
 func keepScratchDescriptorOwnersAlive(owners ...any) {
@@ -57,7 +59,7 @@ func newOwnedScratchWithHooks(stagingDir string, hooks scratchCreateHooks) (_ *o
 }
 
 func newOwnedScratchChecked(stagingDir string, expected store.FileIdentity) (_ *ownedScratch, retErr error) {
-	if expected.Inode == 0 {
+	if !expected.Valid() {
 		return nil, errors.New("validated staging directory identity is missing")
 	}
 	return newOwnedScratchWithIdentityHooks(stagingDir, expected, scratchCreateHooks{})
@@ -82,14 +84,18 @@ func newOwnedScratchWithIdentityHooks(stagingDir string, expected store.FileIden
 			_ = parent.Close()
 		}
 	}()
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(parentFD, &parentStat); err != nil {
+	captureParentIdentity := store.OpenIdentity
+	if hooks.captureParentIdentity != nil {
+		captureParentIdentity = hooks.captureParentIdentity
+	}
+	parentIdentity, _, err := captureParentIdentity(parentFD)
+	if err != nil {
 		return nil, err
 	}
-	parentIdentity := sourceScratchIdentity(&parentStat)
-	if expected.Inode != 0 && (parentIdentity.device != expected.Device || parentIdentity.inode != expected.Inode) {
+	if expected.Valid() && !parentIdentity.Same(expected) {
 		return nil, fmt.Errorf("%s no longer names the validated staging directory", parentPath)
 	}
+	parentID := parentIdentity
 
 	name, err := newScratchName(".fu-src-")
 	if err != nil {
@@ -167,13 +173,16 @@ func newOwnedScratchWithIdentityHooks(stagingDir string, expected store.FileIden
 	if err != nil {
 		return nil, err
 	}
+	// Both descriptors stay open across these observations and the pairing.
+	// Removing either pathname cannot free its still-referenced inode for reuse.
 	if !os.SameFile(rootInfo, dirInfo) {
 		return nil, errors.New("source scratch directory was replaced while opening it")
 	}
 	created = false
 	return &ownedScratch{
 		parent: parent, rootDir: rootDir, root: root,
-		parentPath: parentPath, name: name, path: path, parentID: parentIdentity, identity: identity,
+		parentPath: parentPath, name: name, path: path, parentID: parentID, identity: identity,
+		parentIDAt: captureParentIdentity,
 	}, nil
 }
 
@@ -339,11 +348,11 @@ func (s *ownedScratch) validateParentPath() error {
 		return fmt.Errorf("source scratch parent %s cannot be verified: %w", s.parentPath, err)
 	}
 	defer unix.Close(fd)
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
+	identity, _, err := s.parentIDAt(fd)
+	if err != nil {
 		return err
 	}
-	if sourceScratchIdentity(&stat) != s.parentID {
+	if !identity.Same(s.parentID) {
 		return fmt.Errorf("source scratch parent %s was replaced; preserving scratch content", s.parentPath)
 	}
 	return nil

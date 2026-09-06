@@ -101,7 +101,8 @@ func validateConfigExchangeRecord(name string, record configExchangeRecord) erro
 	if name != wantName {
 		return fmt.Errorf("config exchange record %s names candidate %q belonging to %s", name, record.Candidate, wantName)
 	}
-	if !record.Previous.valid() || !record.Staged.valid() || record.Previous == record.Staged {
+	if !record.Previous.Valid() || !record.Staged.Valid() ||
+		(record.Previous.Device == record.Staged.Device && record.Previous.Inode == record.Staged.Inode) {
 		return fmt.Errorf("config exchange record %s has invalid file identities", name)
 	}
 	if err := validateConfigExchangeDigest(record.ExpectDigest); err != nil {
@@ -144,7 +145,7 @@ func writeConfigExchangeRecord(archive *checkedRoot, record configExchangeRecord
 
 func inspectConfigObject(root *checkedRoot, name string) (configObjectState, error) {
 	defer keepDescriptorOwnersAlive(root)
-	file, stat, err := openRegularFileAt(int(root.dir.Fd()), name)
+	file, identity, stat, err := openRegularFileAt(int(root.dir.Fd()), name)
 	if errors.Is(err, unix.ENOENT) {
 		return configObjectState{}, nil
 	}
@@ -165,13 +166,13 @@ func inspectConfigObject(root *checkedRoot, name string) (configObjectState, err
 	}
 	return configObjectState{
 		exists:   true,
-		identity: identityFromStat(&stat),
+		identity: identity,
 		digest:   digestConfigExchangeBytes(raw),
 	}, nil
 }
 
 func configObjectMatches(state configObjectState, identity FileIdentity, digest string) bool {
-	return state.exists && state.identity == identity && state.digest == digest
+	return state.exists && state.identity.Same(identity) && state.digest == digest
 }
 
 func completeConfigExchange(archive *checkedRoot, record configExchangeRecord, raw []byte, outcome string) error {
@@ -295,7 +296,7 @@ func reclaimConfigExchangeFile(archive *checkedRoot, name string, expected FileI
 	if !validLogicalEntry(name) {
 		return fmt.Errorf("reclaim config exchange entry: invalid name %q", name)
 	}
-	if !expected.valid() {
+	if !expected.Valid() {
 		return fmt.Errorf("reclaim config exchange entry %q: invalid expected identity", name)
 	}
 	return retireOwnedLeafAt(archive.dir, name, ".fu-retired-entry-", expected, unix.S_IFREG)
@@ -340,7 +341,7 @@ func reclaimConfigExchangeOwnName(archive *checkedRoot, name string) bool {
 	if !validLogicalEntry(name) {
 		return false
 	}
-	stat, err := statAt(int(archive.dir.Fd()), name)
+	identity, stat, err := entryIdentityAt(int(archive.dir.Fd()), name)
 	admitted := err == nil && requireRegularStat(name, &stat) == nil
 	if reclaimConfigExchangeOwnNameHook != nil {
 		reclaimConfigExchangeOwnNameHook(name, admitted)
@@ -348,19 +349,18 @@ func reclaimConfigExchangeOwnName(archive *checkedRoot, name string) bool {
 	if !admitted {
 		return false
 	}
-	return reclaimConfigExchangeFile(archive, name, identityFromStat(&stat)) == nil
+	return reclaimConfigExchangeFile(archive, name, identity) == nil
 }
 
 // reclaimConfigExchangeStatedArchive removes an archive name only while it
 // still resolves to the identity that name states. `fu gc` reaches it with an
 // identity decoded from the name itself, which is all a sweep by prefix ever
 // has to go on; the exchange path reaches it with the identity its own record
-// binds, which that name restates. Either way the retirement rename plus
-// revalidation is what proves the statement true before anything is unlinked.
-// The stat here decides nothing that proof does not decide again; it keeps an
-// object the name plainly does not describe -- an unrelated occupant of a
-// regenerated name, which the exchange path can produce and does preserve --
-// from being walked through a window where an interruption would leave it
+// binds, which that name restates. The retirement rename plus revalidation
+// proves the captured identity before anything is unlinked. The stat here also
+// keeps an object the name plainly does not describe -- an unrelated occupant
+// of a regenerated name, which the exchange path can produce and does preserve
+// -- from being walked through a window where an interruption would leave it
 // parked under an unpredictable name no evidence anywhere leads back to.
 // reclaimConfigExchangeStatedArchiveHook observes whether the pre-flight
 // identity check above admitted or rejected a name. It is nil in production
@@ -378,16 +378,29 @@ func reclaimConfigExchangeOwnName(archive *checkedRoot, name string) bool {
 var reclaimConfigExchangeStatedArchiveHook func(name string, admitted bool)
 
 func reclaimConfigExchangeStatedArchive(archive *checkedRoot, name string, stated FileIdentity) bool {
+	return reclaimConfigExchangeStatedArchiveWithOps(archive, name, stated, entryIdentityAt, reclaimConfigExchangeFile)
+}
+
+type configArchiveIdentityCapture func(int, string) (FileIdentity, unix.Stat_t, error)
+type configArchiveReclaimer func(*checkedRoot, string, FileIdentity) error
+
+func reclaimConfigExchangeStatedArchiveWithOps(
+	archive *checkedRoot,
+	name string,
+	stated FileIdentity,
+	capture configArchiveIdentityCapture,
+	reclaim configArchiveReclaimer,
+) bool {
 	defer keepDescriptorOwnersAlive(archive)
-	stat, err := statAt(int(archive.dir.Fd()), name)
-	admitted := err == nil && identityFromStat(&stat) == stated && requireRegularStat(name, &stat) == nil
+	identity, stat, err := capture(int(archive.dir.Fd()), name)
+	admitted := err == nil && identity.Same(stated) && requireRegularStat(name, &stat) == nil
 	if reclaimConfigExchangeStatedArchiveHook != nil {
 		reclaimConfigExchangeStatedArchiveHook(name, admitted)
 	}
 	if !admitted {
 		return false
 	}
-	return reclaimConfigExchangeFile(archive, name, stated) == nil
+	return reclaim(archive, name, identity) == nil
 }
 
 func readPendingConfigExchangeRecords(archive *checkedRoot) ([]struct {
@@ -490,38 +503,39 @@ func recoverConfigExchange(target, scratch, archive *checkedRoot, record configE
 	}
 
 	if configObjectMatches(candidate, record.Staged, record.DataDigest) {
-		if err := archiveNamedConfigEntry(scratch, record.Candidate, archive, record.Staged); err != nil {
+		if err := archiveNamedConfigEntry(scratch, record.Candidate, archive, candidate.identity); err != nil {
 			return fmt.Errorf("archive unpublished config candidate during recovery: %w", err)
 		}
 		return completeConfigExchange(archive, record, raw, "withdrawn-before-publication")
 	}
 	if configObjectMatches(active, record.Staged, record.DataDigest) &&
-		current.exists && current.identity == record.Previous {
+		current.exists && current.identity.Same(record.Previous) {
 		outcome := configExchangeWithdrawalOutcome(current, record)
-		if err := archiveNamedConfigEntry(scratch, configSwapName, archive, record.Staged); err != nil {
+		if err := archiveNamedConfigEntry(scratch, configSwapName, archive, active.identity); err != nil {
 			return fmt.Errorf("archive unpublished config exchange during recovery: %w", err)
 		}
 		return completeConfigExchange(archive, record, raw, outcome)
 	}
 	if configObjectMatches(active, record.Previous, record.ExpectDigest) &&
 		configObjectMatches(current, record.Staged, record.DataDigest) {
-		if err := archiveNamedConfigEntry(scratch, configSwapName, archive, record.Previous); err != nil {
+		if err := archiveNamedConfigEntry(scratch, configSwapName, archive, active.identity); err != nil {
 			return fmt.Errorf("finish interrupted config exchange: %w", err)
 		}
 		return completeConfigExchange(archive, record, raw, "installed")
 	}
-	if active.exists && active.identity == record.Previous &&
+	if active.exists && active.identity.Same(record.Previous) &&
 		configObjectMatches(current, record.Staged, record.DataDigest) {
-		if err := revalidateConfigExchangePair(target, scratch, record.Staged, record.Previous); err != nil {
+		targetBefore, scratchBefore, err := revalidateConfigExchangePair(target, scratch, record.Staged, record.Previous)
+		if err != nil {
 			return err
 		}
 		if err := renameExchange(int(target.dir.Fd()), "fu.yaml", int(scratch.dir.Fd()), configSwapName); err != nil {
 			return fmt.Errorf("restore displaced config during exchange recovery: %w", err)
 		}
-		if err := revalidateConfigExchangePair(target, scratch, record.Previous, record.Staged); err != nil {
+		if _, _, err := revalidateConfigExchangePair(target, scratch, scratchBefore, targetBefore); err != nil {
 			return fmt.Errorf("config exchange recovery changed state while restoring: %w", err)
 		}
-		if err := archiveNamedConfigEntry(scratch, configSwapName, archive, record.Staged); err != nil {
+		if err := archiveNamedConfigEntry(scratch, configSwapName, archive, targetBefore); err != nil {
 			return fmt.Errorf("archive withdrawn config after recovery: %w", err)
 		}
 		return completeConfigExchange(archive, record, raw, "withdrawn-after-precondition-mismatch")
@@ -531,7 +545,7 @@ func recoverConfigExchange(target, scratch, archive *checkedRoot, record configE
 		return completeConfigExchange(archive, record, raw, "installed")
 	}
 	if configObjectMatches(stagedArchive, record.Staged, record.DataDigest) &&
-		current.exists && current.identity == record.Previous && !candidate.exists && !active.exists {
+		current.exists && current.identity.Same(record.Previous) && !candidate.exists && !active.exists {
 		return completeConfigExchange(archive, record, raw, "withdrawn")
 	}
 	return configExchangeConflictError(target, scratch, archive, record)
@@ -573,20 +587,31 @@ func configExchangeConflictError(target, scratch, archive *checkedRoot, record c
 	return fmt.Errorf("config exchange cannot be recovered safely because recorded objects changed or occupy conflicting locations; preserve these versions, compare them, move changed or conflicting entries aside, then retry: %s", strings.Join(paths, ", "))
 }
 
-func revalidateConfigExchangePair(target, scratch *checkedRoot, targetIdentity, scratchIdentity FileIdentity) error {
+func revalidateConfigExchangePair(target, scratch *checkedRoot, targetIdentity, scratchIdentity FileIdentity) (FileIdentity, FileIdentity, error) {
+	return revalidateConfigExchangePairWithCapture(target, scratch, targetIdentity, scratchIdentity, captureConfigExchangeIdentity)
+}
+
+type configExchangeIdentityCapture func(*checkedRoot, string) (FileIdentity, error)
+
+func captureConfigExchangeIdentity(root *checkedRoot, name string) (FileIdentity, error) {
+	identity, _, err := entryIdentityAt(int(root.dir.Fd()), name)
+	return identity, err
+}
+
+func revalidateConfigExchangePairWithCapture(target, scratch *checkedRoot, targetIdentity, scratchIdentity FileIdentity, capture configExchangeIdentityCapture) (FileIdentity, FileIdentity, error) {
 	defer keepDescriptorOwnersAlive(target, scratch)
-	targetStat, err := statAt(int(target.dir.Fd()), "fu.yaml")
+	targetActual, err := capture(target, "fu.yaml")
 	if err != nil {
-		return err
+		return FileIdentity{}, FileIdentity{}, err
 	}
-	scratchStat, err := statAt(int(scratch.dir.Fd()), configSwapName)
+	scratchActual, err := capture(scratch, configSwapName)
 	if err != nil {
-		return err
+		return FileIdentity{}, FileIdentity{}, err
 	}
-	if identityFromStat(&targetStat) != targetIdentity || identityFromStat(&scratchStat) != scratchIdentity {
-		return errors.New("config exchange names changed identity during recovery")
+	if !targetActual.Same(targetIdentity) || !scratchActual.Same(scratchIdentity) {
+		return FileIdentity{}, FileIdentity{}, errors.New("config exchange names changed identity during recovery")
 	}
-	return nil
+	return targetActual, scratchActual, nil
 }
 
 // ReclaimCompletedConfigExchanges collects the config exchange bookkeeping a
@@ -716,14 +741,15 @@ func (s *Store) CollectableConfigArchiveNames(names []string) map[string]bool {
 		if !ok {
 			continue
 		}
+		var identity FileIdentity
 		var stat unix.Stat_t
 		var err error
 		if archive != nil {
-			stat, err = statAt(int(archive.dir.Fd()), name)
+			identity, stat, err = entryIdentityAt(int(archive.dir.Fd()), name)
 		} else {
-			err = unix.Lstat(filepath.Join(s.RecoveryDir(), name), &stat)
+			identity, stat, err = entryIdentityAt(unixAtFDCWD, filepath.Join(s.RecoveryDir(), name))
 		}
-		if err != nil || identityFromStat(&stat) != stated || requireRegularStat(name, &stat) != nil {
+		if err != nil || !identity.Same(stated) || requireRegularStat(name, &stat) != nil {
 			continue
 		}
 		out[name] = true
@@ -950,5 +976,5 @@ func parseConfigArchiveName(name string) (FileIdentity, bool) {
 		return FileIdentity{}, false
 	}
 	identity := FileIdentity{Device: device, Inode: inode}
-	return identity, identity.valid() && configArchiveName(identity) == name
+	return identity, identity.Valid() && configArchiveName(identity) == name
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/cosensexyz/fu/internal/agent"
 	"github.com/cosensexyz/fu/internal/store"
+	"golang.org/x/sys/unix"
 )
 
 func TestAdoptRealDirSingleAgent(t *testing.T) {
@@ -2254,5 +2255,104 @@ func TestAdoptReportsInvalidCandidates(t *testing.T) {
 	}
 	if !strings.Contains(res.Failed[0].Err.Error(), "must match directory name") {
 		t.Fatalf("the report must give the reason: %v", res.Failed[0].Err)
+	}
+}
+
+func TestAdoptRetainsLiveRetirementIdentityUntilRemoval(t *testing.T) {
+	for _, kind := range []string{"directory", "symlink"} {
+		for _, boundary := range []string{"resumed", "retired", "copied", "already-retired-planned", "already-retired-journaled"} {
+			if kind == "symlink" && boundary != "retired" {
+				continue
+			}
+			t.Run(kind+"/"+boundary, func(t *testing.T) {
+				s, _ := setupStore(t)
+				agentDir := t.TempDir()
+				if kind == "directory" {
+					writeSkillTree(t, agentDir, "alpha", "---\nname: alpha\ndescription: d\n---\n")
+				} else {
+					target := writeSkillTree(t, t.TempDir(), "alpha", "---\nname: alpha\ndescription: d\n---\n")
+					if err := os.Symlink(target, filepath.Join(agentDir, "alpha")); err != nil {
+						t.Fatal(err)
+					}
+				}
+				changed := false
+				captures := 0
+				capturesAfterChange := 0
+				h := hooks{entryIdentityAt: func(fd int, name string) (store.FileIdentity, unix.Stat_t, error) {
+					id, stat, err := store.EntryIdentityAt(fd, name)
+					if err != nil {
+						return id, stat, err
+					}
+					captures++
+					if changed {
+						capturesAfterChange++
+						id.Handle = "test:replacement"
+					} else if id.Handle == "" {
+						id.Handle = "test:original"
+					}
+					return id, stat, nil
+				}}
+				change := func() error { changed = true; return nil }
+				if boundary == "resumed" {
+					h.afterAdoptRetiredJournal = change
+				} else if boundary == "retired" || strings.HasPrefix(boundary, "already-retired-") {
+					h.afterAdoptRetire = change
+				} else {
+					h.afterAdoptArchiveCopy = change
+				}
+				// Resume a planned WAL with legacy, handle-less admission evidence.
+				stop := errors.New("stop before retirement")
+				_, err := adopt(s, []agent.Agent{fakeAgent{"claude", agentDir}}, "", hooks{beforeAdoptRetire: func() error { return stop }})
+				if err == nil {
+					t.Fatal("initial adopt must stop before retirement")
+				}
+				records, err := PendingTxns(s)
+				if err != nil || len(records) != 1 || records[0].Archive == nil {
+					t.Fatalf("planned WAL = %+v, %v", records, err)
+				}
+				record := records[0]
+				record.Archive.OriginalIdentity.Handle = ""
+				for i := range record.AdoptTargets {
+					record.AdoptTargets[i].EntryIdentity.Handle = ""
+				}
+				if strings.HasPrefix(boundary, "already-retired-") {
+					if err := os.Rename(filepath.Join(agentDir, "alpha"), filepath.Join(agentDir, record.Archive.Retired)); err != nil {
+						t.Fatal(err)
+					}
+					if boundary == "already-retired-journaled" {
+						record.Archive.Stage = "retired"
+					}
+				}
+				session, err := s.BeginWrite()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer session.Close()
+				if err := WriteTxn(session.Store, &record); err != nil {
+					t.Fatal(err)
+				}
+				err = switchAdoptEntryWithHooks(session.Store, fakeAgent{"claude", agentDir}, "alpha", &record, h)
+				if !errors.Is(err, ErrTxnConflict) {
+					t.Fatalf("replacement after %s must retain a conflict, got %v", boundary, err)
+				}
+				if capturesAfterChange != 1 {
+					t.Fatalf("must stop at the first changed observation; captured it %d times", capturesAfterChange)
+				}
+				if !changed || captures < 2 {
+					t.Fatalf("boundary=%v captures=%d: live identity path was not exercised", changed, captures)
+				}
+				pending, err := PendingTxns(s)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(pending) != 1 || pending[0].Archive == nil {
+					t.Fatalf("retired original requires an open WAL: %+v", pending)
+				}
+				retired := filepath.Join(agentDir, pending[0].Archive.Retired)
+				if _, err := os.Lstat(retired); err != nil {
+					t.Fatalf("replacement must remain at the retired name: %v", err)
+				}
+			})
+		}
 	}
 }

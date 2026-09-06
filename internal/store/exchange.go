@@ -16,17 +16,10 @@ import (
 // a broken link. One exchange has no such window: the name resolves to a
 // complete skill before and after, and never to anything in between.
 //
-// Both manifests are validated first. A manifest proves what an object is,
-// so validating both is what distinguishes fu's own two trees from anything
-// an outside writer substituted for either. That check is point-in-time: a
-// same-UID writer could still replace content at either name between the
-// second validation and renameExchange's own pathname re-resolution, and
-// this function cannot close that window without ceasing to be one call.
-// Nothing downstream trusts the window held, though -- update's
-// crash-recovery rollback undoes a completed exchange by calling this same
-// function again with staged and published swapped, so content corrupted
-// during the window is caught by that call's own validation rather than
-// compounded by it.
+// Both manifests admit the inputs before the exchange. The resulting live
+// observations then prove each object under its destination name. A failed
+// post-exchange proof retains a conflict and leaves both objects in place for
+// recovery; it never swaps unknown replacements back or reports success.
 //
 // The exchange itself never creates: RENAME_SWAP/RENAME_EXCHANGE require
 // both names to already exist and fail if either is missing. That is a
@@ -34,6 +27,10 @@ import (
 // function's own callers, since a vanished side already fails validation
 // below before renameExchange is ever reached.
 func (s *Store) ExchangeStagedWithSkillOwned(name string, staged, published OwnedTree) error {
+	return s.exchangeStagedWithSkillOwnedWithOps(name, staged, published, snapshotOwnedTree, renameExchange)
+}
+
+func (s *Store) exchangeStagedWithSkillOwnedWithOps(name string, staged, published OwnedTree, snapshot ownedTreeSnapshotFunc, exchange func(int, string, int, string) error) error {
 	defer keepDescriptorOwnersAlive(s)
 	// Both roots are descriptors pinned at BeginWrite, checked first so every
 	// later step in this function runs against the directories whose identity
@@ -46,16 +43,40 @@ func (s *Store) ExchangeStagedWithSkillOwned(name string, staged, published Owne
 	if !validPublicLogicalEntry(name) {
 		return fmt.Errorf("exchange staged and published tree requires a public single-component name outside the .fu- namespace: %q", name)
 	}
-	if err := s.ValidateSkillOwned(name, published); err != nil {
+	observe := func(root *checkedRoot, expected OwnedTree) (OwnedTree, error) {
+		if err := validateTransactionOwnedTreeManifest(expected); err != nil {
+			return OwnedTree{}, err
+		}
+		actual, err := snapshot(root, name)
+		if err != nil {
+			return OwnedTree{}, classifyOwnedSnapshotError("exchange tree", name, err)
+		}
+		if err := compareOwnedTreeExact(actual, expected); err != nil {
+			return OwnedTree{}, err
+		}
+		return actual, nil
+	}
+	observedPublished, err := observe(s.writeRoots.skills, published)
+	if err != nil {
 		return fmt.Errorf("validate the published skill %q before exchanging it: %w", name, err)
 	}
-	if err := s.ValidateStagedOwned(name, staged); err != nil {
+	observedStaged, err := observe(s.writeRoots.staging, staged)
+	if err != nil {
 		return fmt.Errorf("validate the staged replacement for %q before exchanging it: %w", name, err)
 	}
 	skillsFD := int(s.writeRoots.skills.dir.Fd())
 	stagingFD := int(s.writeRoots.staging.dir.Fd())
-	if err := renameExchange(skillsFD, name, stagingFD, name); err != nil {
+	if err := exchange(skillsFD, name, stagingFD, name); err != nil {
 		return fmt.Errorf("exchange staged and published %q: %w", name, err)
 	}
-	return nil
+	// The records only admitted the inputs. Prove both moved objects against
+	// the observations captured before this exchange, including live handles.
+	// On failure leave both names in place for the retained WAL to describe;
+	// another exchange would move an object whose ownership is now unknown.
+	_, skillsErr := observe(s.writeRoots.skills, observedStaged)
+	_, stagingErr := observe(s.writeRoots.staging, observedPublished)
+	return errors.Join(
+		classifyPostRenameOwnedSnapshotError("exchanged skill", name, skillsErr),
+		classifyPostRenameOwnedSnapshotError("exchanged staging tree", name, stagingErr),
+	)
 }

@@ -136,7 +136,7 @@ func validateAdoptTxn(record TxnRecord) error {
 	}
 	if record.Archive != nil {
 		archive := record.Archive
-		if archive.Agent == "" || archive.Retired == "" || !adoptIdentityValid(archive.OriginalIdentity) {
+		if archive.Agent == "" || archive.Retired == "" || !archive.OriginalIdentity.Valid() {
 			return fmt.Errorf("adopt transaction has an incomplete archive record: %+v", record.Archive)
 		}
 		switch archive.Stage {

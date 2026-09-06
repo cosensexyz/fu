@@ -35,6 +35,45 @@ func TestCloneSourceHonorsCanceledContext(t *testing.T) {
 	}
 }
 
+func TestOwnedScratchChecksTheExpectedParentHandle(t *testing.T) {
+	parent := t.TempDir()
+	expected := store.FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"}
+	_, err := newOwnedScratchWithIdentityHooks(parent, expected, scratchCreateHooks{
+		captureParentIdentity: func(int) (store.FileIdentity, unix.Stat_t, error) {
+			return store.FileIdentity{Device: 1, Inode: 2, Handle: "1:bb"}, unix.Stat_t{}, nil
+		},
+	})
+	if err == nil {
+		t.Fatal("a staging parent with a different handle must be rejected")
+	}
+	if !strings.Contains(err.Error(), "no longer names the validated staging directory") {
+		t.Fatalf("handle mismatch error = %v", err)
+	}
+}
+
+func TestOwnedScratchRechecksTheParentHandleBeforeCleanup(t *testing.T) {
+	parent := t.TempDir()
+	handle := "1:aa"
+	scratch, err := newOwnedScratchWithIdentityHooks(parent, store.FileIdentity{}, scratchCreateHooks{
+		captureParentIdentity: func(fd int) (store.FileIdentity, unix.Stat_t, error) {
+			identity, stat, err := store.OpenIdentity(fd)
+			identity.Handle = handle
+			return identity, stat, err
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle = "1:bb"
+	if err := scratch.validateParentPath(); err == nil {
+		t.Fatal("a parent with the same device and inode but a different handle must be rejected")
+	}
+	handle = "1:aa"
+	if err := scratch.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCloneSourceStopsAtAggregateByteLimit(t *testing.T) {
 	url, _ := makeGitSourceRepo(t, map[string]string{
 		"large": strings.Repeat("0123456789abcdef", 1<<17),

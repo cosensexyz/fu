@@ -440,9 +440,36 @@ An error after the Git commit is durable is still a non-zero exit, but it is not
 reported as though nothing happened: fu prints the committed mutation and names
 whether post-commit work or WAL recovery remains pending.
 
+**On Linux, fu uses kernel file handles for the store's owned-tree,
+atomic-write, retirement, config-exchange, adopt-switch, and sealed go-git
+control-file-read ownership checks.**
+Device and inode numbers are not enough there: ext4 hands a freed inode number
+to the next file created, so an entry deleted and recreated under the same name
+can otherwise look identical. Where the filesystem exports file handles, fu
+records the handle too, which changes on reallocation; Linux CI exercises this
+on an inode-reusing filesystem rather than treating a filesystem name as proof.
+Remaining comparisons against device-and-inode snapshots whose objects were
+not kept open are catalogued under the "Known gaps" entries in
+[DESIGN.md](DESIGN.md). On filesystems that do not
+export handles (verified here for default overlayfs), or on a kernel or sandbox
+that answers `name_to_handle_at` with `ENOSYS`, handle-backed checks fall back
+to device and inode and cannot guarantee that they will distinguish a
+same-name replacement between two checks. Other file-handle lookup failures
+stop the strict identity path instead of silently weakening it: sandbox or
+seccomp denial is normally shown as "operation not permitted" and requires
+permitting `name_to_handle_at`; "permission denied" instead means that
+directory search permissions must be corrected. Status and GC accounting
+conservatively omit staged or archived candidates whose identity cannot be
+captured. Cleanup of a config-exchange temporary also preserves the entry
+when identity capture fails. macOS needs none of
+this: APFS never reuses an inode number.
+
 **`store/` is an ordinary git repository.** If you prefer, use `git` in it
 directly. fu is built to tolerate that rather than to own the repository
-exclusively.
+exclusively. If another Git process replaces a control file such as
+`packed-refs` during fu's sealed read, fu may safely fail that command with a
+transient "filesystem entry changed externally" or "regular file changed while
+being opened" error; retry after the other Git process finishes.
 
 ## Roadmap
 

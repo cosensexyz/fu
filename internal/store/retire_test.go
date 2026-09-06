@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cosensexyz/fu/internal/testenv"
 	"golang.org/x/sys/unix"
 )
 
@@ -66,15 +67,15 @@ func TestRetirementPrimitivesDirectly(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer parent.Close()
-		var stat unix.Stat_t
-		if err := unix.Fstatat(int(parent.Fd()), "link", &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		identity, stat, err := entryIdentityAt(int(parent.Fd()), "link")
+		if err != nil {
 			t.Fatal(err)
 		}
 		mode, _, err := modeAndKind(&stat)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := RemoveOwnedSymlinkAt(parent, "link", identityFromStat(&stat), uint32(mode), "target"); err != nil {
+		if err := RemoveOwnedSymlinkAt(parent, "link", identity, uint32(mode), "target"); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := os.Lstat(filepath.Join(dir, "link")); !os.IsNotExist(err) {
@@ -133,6 +134,7 @@ func TestRetirementRenameConflictIsOwnedTreeChange(t *testing.T) {
 
 func TestWriteFileAtomicNoReplaceRejectsTemporaryReplacementBeforeRename(t *testing.T) {
 	dir := t.TempDir()
+	skipUnlessReplacementDetectable(t, dir)
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -141,15 +143,39 @@ func TestWriteFileAtomicNoReplaceRejectsTemporaryReplacementBeforeRename(t *test
 
 	const foreign = "foreign temporary replacement"
 	var tempName string
+	parent, err := root.Open(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	var before, after FileIdentity
 	err = writeFileAtomicNoReplaceRoot(root, "record", []byte("owned record"), 0o644, atomicWriteHooks{
 		beforeRename: func(name string) error {
 			tempName = name
-			if err := root.Remove(name); err != nil {
+			before, _, err = entryIdentityAt(int(parent.Fd()), name)
+			if err != nil {
 				return err
 			}
-			return os.WriteFile(filepath.Join(dir, name), []byte(foreign), 0o600)
+			after = captureSameNameReplacement(t, before, func() FileIdentity {
+				if err := root.Remove(name); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(foreign), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				identity, _, err := entryIdentityAt(int(parent.Fd()), name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return identity
+			})
+			return nil
 		},
 	})
+	if testenv.FileHandlesRequired() &&
+		(before.Device != after.Device || before.Inode != after.Inode || before.Handle == "" || after.Handle == "" || before.Handle == after.Handle) {
+		t.Fatalf("atomic replacement did not reuse the inode with a new handle: before=%+v after=%+v", before, after)
+	}
 	if err == nil {
 		t.Fatal("temporary replacement must be rejected")
 	}
@@ -654,5 +680,133 @@ func TestWriteFileAtomicNoReplaceCloseFailurePrecedesPublication(t *testing.T) {
 	}
 	if _, statErr := os.Lstat(filepath.Join(dir, "record")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("a close failure must happen before publication, record err=%v", statErr)
+	}
+}
+
+func TestAtomicIdentityMismatchPreservesCaptureError(t *testing.T) {
+	cause := unix.EPERM
+	err := atomicIdentityMismatch("atomic temporary changed", cause)
+	if !errors.Is(err, ErrOwnedTreeChanged) || !errors.Is(err, cause) {
+		t.Fatalf("mismatch error = %v, want ownership sentinel and capture cause", err)
+	}
+}
+
+func TestRetiredDirectoryIdentityMismatchPreservesCaptureError(t *testing.T) {
+	cause := errors.New("file-handle lookup denied")
+	err := retiredDirectoryIdentityMismatch("entry", cause, nil)
+	if !errors.Is(err, ErrOwnedTreeChanged) || !errors.Is(err, cause) {
+		t.Fatalf("retired-directory mismatch = %v, want ownership sentinel and capture cause", err)
+	}
+}
+
+func TestRetiredLeafIdentityMismatchPreservesCaptureError(t *testing.T) {
+	cause := unix.EPERM
+	err := retiredLeafIdentityMismatch("entry", cause)
+	if !errors.Is(err, ErrOwnedTreeChanged) || !errors.Is(err, cause) {
+		t.Fatalf("retired-leaf mismatch = %v, want ownership sentinel and capture cause", err)
+	}
+}
+
+func TestRetireOwnedLeafClassifiesPreRenameCaptureFailure(t *testing.T) {
+	dir := t.TempDir()
+	parent, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	cause := unix.EPERM
+	err = retireOwnedLeafAtWithCapture(parent, "leaf", ".retired-", FileIdentity{Device: 1, Inode: 2}, unix.S_IFREG,
+		func(int, string) (FileIdentity, unix.Stat_t, error) {
+			return FileIdentity{}, unix.Stat_t{}, cause
+		})
+	if !errors.Is(err, ErrOwnedTreeChanged) || !errors.Is(err, cause) ||
+		!strings.Contains(err.Error(), `inspect owned leaf "leaf" before retirement`) {
+		t.Fatalf("pre-rename leaf capture error = %v", err)
+	}
+}
+
+func TestRetireOwnedEntryRevalidatesAgainstTheObservedIdentity(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "leaf"), []byte("owned"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	recorded := OwnedTreeEntry{Path: "leaf", Kind: ownedFile, Mode: 0o644, Identity: FileIdentity{Device: 1, Inode: 2}, Digest: "sha256:owned"}
+	identityCaptures := 0
+	fullSnapshots := 0
+	err = retireOwnedEntryAtWithOps(parent, "leaf", ".fu-retired-entry-", recorded,
+		func(int, string) (FileIdentity, unix.Stat_t, error) {
+			identityCaptures++
+			return FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"}, unix.Stat_t{Mode: unix.S_IFREG | 0o644}, nil
+		},
+		func(int, string, string) (OwnedTreeEntry, error) {
+			fullSnapshots++
+			observed := recorded
+			observed.Identity.Handle = "1:bb"
+			return observed, nil
+		},
+		RenameNoReplaceAt,
+	)
+	if !errors.Is(err, ErrOwnedTreeChanged) {
+		t.Fatalf("post-rename handle change must conflict, got %v", err)
+	}
+	if identityCaptures != 1 || fullSnapshots != 1 {
+		t.Fatalf("captures = %d identity and %d full snapshots, want 1 and 1", identityCaptures, fullSnapshots)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "leaf")); err != nil {
+		t.Fatalf("mismatched retirement must restore the live name: %v", err)
+	}
+}
+
+func TestRetireOwnedEntryLabelsPreRenameCaptureFailureAsLive(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "leaf"), []byte("owned"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	recorded := OwnedTreeEntry{Path: "leaf", Kind: ownedFile, Mode: 0o644, Identity: FileIdentity{Device: 1, Inode: 2}, Digest: "sha256:owned"}
+	cause := unix.EPERM
+	err = retireOwnedEntryAtWithOps(parent, "leaf", ".fu-retired-entry-", recorded,
+		func(int, string) (FileIdentity, unix.Stat_t, error) {
+			return FileIdentity{}, unix.Stat_t{}, cause
+		},
+		func(int, string, string) (OwnedTreeEntry, error) {
+			t.Fatal("full snapshot must not run after a live identity capture failure")
+			return OwnedTreeEntry{}, nil
+		},
+		RenameNoReplaceAt,
+	)
+	if !errors.Is(err, ErrOwnedTreeChanged) || !errors.Is(err, cause) || !strings.Contains(err.Error(), `inspect owned entry "leaf" before retirement`) {
+		t.Fatalf("pre-rename capture error = %v", err)
+	}
+}
+
+func TestRetireOwnedDirectoryClassifiesPreRenameCaptureFailureAsOwnershipChange(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	cause := unix.EPERM
+	err = retireOwnedDirectoryAtPathWithCapture(parent, "child", "nested/child", ".fu-retired-dir-",
+		FileIdentity{Device: 1, Inode: 2}, 0o755,
+		func(int, string) (FileIdentity, unix.Stat_t, error) {
+			return FileIdentity{}, unix.Stat_t{}, cause
+		})
+	if !errors.Is(err, ErrOwnedTreeChanged) || !errors.Is(err, cause) ||
+		!strings.Contains(err.Error(), `inspect owned directory "nested/child" before retirement`) {
+		t.Fatalf("pre-rename directory capture error = %v", err)
 	}
 }

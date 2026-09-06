@@ -21,10 +21,13 @@ import (
 // instance retains its primary descriptor and optional mounted descriptors;
 // Chroot only narrows the virtual relative base.
 type rootFilesystem struct {
-	checked *checkedRoot
-	base    string
-	mounts  map[string]*checkedRoot
+	checked                 *checkedRoot
+	base                    string
+	mounts                  map[string]*checkedRoot
+	readOnlyIdentityCapture rootFileIdentityCapture // Test seam; nil selects the production capture primitive.
 }
+
+type rootFileIdentityCapture func(int, string) (FileIdentity, unix.Stat_t, error)
 
 func newRootFilesystem(root *checkedRoot, base string) (*rootFilesystem, error) {
 	fsys := &rootFilesystem{checked: root}
@@ -139,7 +142,7 @@ func (f *rootFilesystem) OpenFile(name string, flag int, perm os.FileMode) (bill
 	if readOnlyRootOpen(flag) {
 		// readOnlyRootOpen already excludes O_CREATE, so a read never has a
 		// directory to create on the way.
-		return openReadOnlyRootFile(root, p, name, flag, perm)
+		return openReadOnlyRootFileWithCapture(root, p, name, flag, perm, f.readOnlyIdentityCapture)
 	}
 	return openWritableRootFile(root, p, name, flag, perm)
 }
@@ -399,14 +402,30 @@ func openWritableRootFile(root *checkedRoot, path, display string, flag int, per
 // logical path and the opened object the same thing; the identity comparison
 // then does what it always claimed to, catching a replacement between the stat
 // and the open. O_NONBLOCK is what keeps a FIFO at this name from blocking.
-func openReadOnlyRootFile(root *checkedRoot, path, display string, flag int, perm os.FileMode) (billy.File, error) {
+//
+// The default capture deliberately retains the shared sealed-capture contract:
+// changes observed during capture are retryable errors, even when a subsequent
+// descriptor comparison could accept a consistent replacement. This keeps
+// capture and error semantics uniform with the ownership paths at the cost of
+// extra syscalls, tracked by BenchmarkOpenReadOnlyRootFile. The comparison with
+// the opened descriptor proves the read's identity across the later open.
+func openReadOnlyRootFileWithCapture(
+	root *checkedRoot,
+	path, display string,
+	flag int,
+	perm os.FileMode,
+	capture rootFileIdentityCapture,
+) (billy.File, error) {
 	defer keepDescriptorOwnersAlive(root)
+	if capture == nil {
+		capture = entryIdentityAt
+	}
 	dir, base, err := openCheckedParent(root, path, false)
 	if err != nil {
 		return nil, err
 	}
 	parentFD := int(dir.Fd())
-	observed, statErr := statAt(parentFD, base)
+	observedIdentity, _, statErr := capture(parentFD, base)
 	fd := -1
 	var openErr error
 	if statErr == nil {
@@ -414,7 +433,7 @@ func openReadOnlyRootFile(root *checkedRoot, path, display string, flag int, per
 	}
 	closeErr := dir.Close()
 	if statErr != nil {
-		return nil, &os.PathError{Op: "fstatat", Path: display, Err: statErr}
+		return nil, identityPathError(display, statErr)
 	}
 	if openErr != nil {
 		return nil, &os.PathError{Op: "openat", Path: display, Err: openErr}
@@ -423,8 +442,8 @@ func openReadOnlyRootFile(root *checkedRoot, path, display string, flag int, per
 		_ = unix.Close(fd)
 		return nil, closeErr
 	}
-	var opened unix.Stat_t
-	if err := unix.Fstat(fd, &opened); err != nil {
+	openedIdentity, opened, err := openIdentity(fd)
+	if err != nil {
 		_ = unix.Close(fd)
 		return nil, &os.PathError{Op: "fstat", Path: display, Err: err}
 	}
@@ -432,7 +451,7 @@ func openReadOnlyRootFile(root *checkedRoot, path, display string, flag int, per
 		_ = unix.Close(fd)
 		return nil, err
 	}
-	if identityFromStat(&observed) != identityFromStat(&opened) {
+	if !observedIdentity.Same(openedIdentity) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("%w: %q changed identity while go-git opened it", errRegularFileChanged, display)
 	}
@@ -797,7 +816,12 @@ func (f *rootFilesystem) Chroot(name string) (billy.Filesystem, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &rootFilesystem{checked: f.checked, base: p, mounts: f.mounts}, nil
+	return &rootFilesystem{
+		checked:                 f.checked,
+		base:                    p,
+		mounts:                  f.mounts,
+		readOnlyIdentityCapture: f.readOnlyIdentityCapture,
+	}, nil
 }
 
 func (f *rootFilesystem) Root() string { return f.base }

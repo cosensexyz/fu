@@ -4,6 +4,7 @@ package store
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,91 @@ func TestLoadConfigRefusesFIFOWithoutBlocking(t *testing.T) {
 		case <-time.After(3 * time.Second):
 		}
 		t.Fatal("LoadConfig blocked while opening a FIFO")
+	}
+}
+
+func TestConfigEntryCaptureErrorClassifiesAReplacement(t *testing.T) {
+	cause := fmt.Errorf("%w: replaced during capture", ErrOwnedTreeChanged)
+	err := configEntryCaptureError("/store/fu.yaml", cause)
+	if !errors.Is(err, ErrConfigChangedExternally) || !errors.Is(err, cause) {
+		t.Fatalf("capture error = %v, want config-change sentinel preserving cause", err)
+	}
+}
+
+func TestConfigIdentityMismatchPreservesCaptureError(t *testing.T) {
+	cause := errors.New("file-handle lookup denied")
+	err := configIdentityMismatch("candidate validation failed", cause)
+	if !errors.Is(err, ErrConfigChangedExternally) || !errors.Is(err, cause) {
+		t.Fatalf("config mismatch = %v, want config sentinel and original cause", err)
+	}
+}
+
+func TestConfigExchangePreservesDisplacedCaptureError(t *testing.T) {
+	checked := checkedWriteSession(t)
+	storeRoot := mustStoreRoot(t, checked)
+	before, err := ReadConfigFileRoot(storeRoot, "fu.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := unix.EPERM
+	err = checked.installConfigExpecting(before, append(before, []byte("\n# installed\n")...), configExchangeHooks{
+		openDisplaced: func(int, string) (*os.File, FileIdentity, unix.Stat_t, error) {
+			return nil, FileIdentity{}, unix.Stat_t{}, cause
+		},
+	})
+	if !errors.Is(err, ErrConfigChangedExternally) || !errors.Is(err, cause) {
+		t.Fatalf("post-exchange capture error = %v, want config-change sentinel preserving %v", err, cause)
+	}
+}
+
+func TestConfigExchangePreservesCurrentIdentityAndReadErrors(t *testing.T) {
+	checked := checkedWriteSession(t)
+	firstCause := unix.EPERM
+	secondCause := unix.EACCES
+	err := checked.installConfigExpecting([]byte("config bytes that were never present\n"), []byte("version: 1\nskills: {}\n# installed\n"), configExchangeHooks{
+		captureCurrent: func(int, string) (FileIdentity, unix.Stat_t, error) {
+			return FileIdentity{}, unix.Stat_t{}, firstCause
+		},
+		readCurrent: func(int, string, int64) ([]byte, error) {
+			return nil, secondCause
+		},
+	})
+	if !errors.Is(err, ErrConfigChangedExternally) || !errors.Is(err, firstCause) || !errors.Is(err, secondCause) {
+		t.Fatalf("post-exchange validation error = %v, want config-change sentinel preserving %v and %v", err, firstCause, secondCause)
+	}
+}
+
+func TestArchiveNamedConfigEntryRevalidatesAgainstObservedIdentity(t *testing.T) {
+	sourceDir := t.TempDir()
+	archiveDir := t.TempDir()
+	sourceFile, err := os.Open(sourceDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceFile.Close()
+	archiveFile, err := os.Open(archiveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archiveFile.Close()
+	source := &checkedRoot{dir: sourceFile, display: sourceDir}
+	archive := &checkedRoot{dir: archiveFile, display: archiveDir}
+	expected := FileIdentity{Device: 1, Inode: 2}
+	observed := FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"}
+	replacement := FileIdentity{Device: 1, Inode: 2, Handle: "1:bb"}
+	captures := []FileIdentity{observed, replacement}
+
+	err = archiveNamedConfigEntryWithOps(
+		source, "candidate", archive, expected,
+		func(int, string) (FileIdentity, unix.Stat_t, error) {
+			identity := captures[0]
+			captures = captures[1:]
+			return identity, unix.Stat_t{}, nil
+		},
+		func(int, string, int, string) error { return nil },
+	)
+	if err == nil {
+		t.Fatal("a post-rename handle change must fail revalidation against the observed identity")
 	}
 }
 
@@ -1452,6 +1538,30 @@ func soleConfigSwapArtifact(t *testing.T, dir string) string {
 	return filepath.Join(dir, found[0])
 }
 
+func configCandidateArtifacts(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), configCandidatePrefix) {
+			found = append(found, entry.Name())
+		}
+	}
+	return found
+}
+
+func soleConfigCandidateArtifact(t *testing.T, dir string) string {
+	t.Helper()
+	found := configCandidateArtifacts(t, dir)
+	if len(found) != 1 {
+		t.Fatalf("expected exactly one candidate artifact in %s, found %v", dir, found)
+	}
+	return filepath.Join(dir, found[0])
+}
+
 // The parked object is the proof that fu.yaml held the expected bytes at the
 // instant of the swap. Comparing only its bytes cannot establish that: a
 // separately created file carrying the same bytes satisfies the comparison
@@ -1539,6 +1649,62 @@ func TestConfigExchangeRefusesAScratchReplacedBeforeTheSwap(t *testing.T) {
 	}
 }
 
+// The recorded candidate name is unproven on the way in too: between writing
+// fu's bytes into it and publishing it, a replacement under that exact name
+// must still be refused. This targets the afterRecord window with no direct
+// coverage before, and plants the replacement by deleting the candidate and
+// creating a new object under the identical name rather than writing
+// elsewhere and renaming into place -- the shape that would land on a reused
+// inode number if one were available.
+//
+// It does not, however: fu holds the candidate open (staged) for the whole
+// exchange, and an open descriptor keeps its inode from being freed, so the
+// delete above cannot make that inode's number available for reuse the way it
+// can for a target nobody holds open. The replacement is confirmed to land on
+// a fresh inode every run. This test therefore pins the same refusal every
+// sibling in this file pins; TestConfigExchangeRestoresATargetReplacedUnderItsNameWithMatchingBytes
+// below is the one that reaches a target with no descriptor pinning it, where
+// this shape can and does land on a reused inode on ext4.
+func TestConfigExchangeRefusesACandidateReplacedUnderItsRecordedName(t *testing.T) {
+	checked := checkedWriteSession(t)
+	storeRoot := mustStoreRoot(t, checked)
+	before, err := ReadConfigFileRoot(storeRoot, "fu.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := []byte("version: 1\nskills: {}\n# content fu never generated\n")
+
+	var candidate string
+	err = checked.installConfigExpecting(before, append(before, []byte("\n# fu\n")...), configExchangeHooks{
+		afterRecord: func() {
+			candidate = soleConfigCandidateArtifact(t, checked.StagingDir())
+			if err := os.Remove(candidate); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(candidate, foreign, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+	})
+	if !errors.Is(err, ErrConfigChangedExternally) {
+		t.Fatalf("a candidate replaced under its own recorded name must conflict, got %v", err)
+	}
+	got, readErr := os.ReadFile(filepath.Join(checked.Dir(), "fu.yaml"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(got, before) {
+		t.Fatalf("fu.yaml was replaced with an object fu did not write:\ngot  %q\nwant %q", got, before)
+	}
+	if candidate != "" {
+		if kept, err := os.ReadFile(candidate); err != nil {
+			t.Fatalf("the planted replacement must survive: %v", err)
+		} else if !bytes.Equal(kept, foreign) {
+			t.Fatalf("planted candidate replacement changed: got %q want %q", kept, foreign)
+		}
+	}
+}
+
 // The exchange's whole purpose is to report what fu.yaml held at the instant of
 // the swap. When that turns out not to be the expected bytes, the pre-swap
 // state has to come back: an external writer who replaced fu.yaml between the
@@ -1574,6 +1740,76 @@ func TestConfigExchangeRestoresAnExternalConfigInstalledBeforeTheSwap(t *testing
 	}
 	if !bytes.Equal(got, external) {
 		t.Fatalf("the external config must stay canonical:\ngot  %q\nwant %q", got, external)
+	}
+}
+
+// The sibling above replaces fu.yaml with different bytes, so the byte
+// comparison alone already catches it; this one isolates the identity
+// comparison by replacing fu.yaml with byte-identical content instead. It is
+// also the one target this file compares that fu never holds open before the
+// swap -- fu only stats fu.yaml, so deleting it here genuinely frees the
+// inode, unlike every staged-side identity in this file, which stays pinned
+// by a descriptor fu holds until the exchange finishes. On a filesystem that
+// hands a freed inode number to the very next entry created in the same
+// directory -- ext4 does, immediately -- the replacement can carry the same
+// device and inode the original fu.yaml had. With the bytes equal too,
+// nothing but the file handle tells the two apart, and a bare device+inode
+// identity would wrongly treat the precondition as proven: it would archive
+// the replacement as if it were the true previous config and publish fu's
+// write as installed, silently discarding a concurrent external writer's
+// file instead of restoring it.
+func TestConfigExchangeRestoresATargetReplacedUnderItsNameWithMatchingBytes(t *testing.T) {
+	checked := checkedWriteSession(t)
+	skipUnlessReplacementDetectable(t, checked.Dir())
+	storeRoot := mustStoreRoot(t, checked)
+	before, err := ReadConfigFileRoot(storeRoot, "fu.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(checked.Dir(), "fu.yaml")
+	beforeIdentity, _, err := entryIdentityAt(unixAtFDCWD, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var afterIdentity FileIdentity
+	err = checked.installConfigExpecting(before, append(before, []byte("\n# fu\n")...), configExchangeHooks{
+		beforeExchange: func() {
+			afterIdentity = captureSameNameReplacement(t, beforeIdentity, func() FileIdentity {
+				if err := os.Remove(target); err != nil {
+					t.Fatal(err)
+				}
+				// Recreated under the identical name with byte-identical content,
+				// not written elsewhere and renamed into place: only this shape can
+				// land on the same freed inode number.
+				if err := os.WriteFile(target, before, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				identity, _, identityErr := entryIdentityAt(unixAtFDCWD, target)
+				if identityErr != nil {
+					t.Fatal(identityErr)
+				}
+				return identity
+			})
+		},
+	})
+	// TestLinuxHandleDistinguishesAReusedInode establishes the idiom: on an
+	// ext4 run where the freed inode is not handed back, this test would pass
+	// for the device+inode reason alone with the handle path never exercised.
+	// Logging which reason applied here lets an ext4 run's -v output confirm
+	// the handle was actually the discriminator, not just the reused-inode
+	// case that happened not to occur this time.
+	t.Logf("fu.yaml replacement reused the inode: %v (before=%+v after=%+v)",
+		beforeIdentity.Inode == afterIdentity.Inode, beforeIdentity, afterIdentity)
+	if !errors.Is(err, ErrConfigChangedExternally) {
+		t.Fatalf("a target replaced under its own name before the swap must conflict, got %v", err)
+	}
+	got, readErr := os.ReadFile(filepath.Join(checked.Dir(), "fu.yaml"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(got, before) {
+		t.Fatalf("the replaced config must stay canonical:\ngot  %q\nwant %q", got, before)
 	}
 }
 

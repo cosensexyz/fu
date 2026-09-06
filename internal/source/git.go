@@ -246,7 +246,7 @@ func (s Source) Prepare(stagingDir string) (*Prepared, error) {
 // PrepareChecked prepares a source while requiring git scratch to be created
 // in the exact staging directory validated by Store.Open.
 func (s Source) PrepareChecked(stagingDir string, stagingIdentity store.FileIdentity) (*Prepared, error) {
-	if s.Kind == KindGit && stagingIdentity.Inode == 0 {
+	if s.Kind == KindGit && !stagingIdentity.Valid() {
 		return nil, errors.New("validated staging directory identity is missing")
 	}
 	return s.prepare(stagingDir, stagingIdentity)
@@ -257,7 +257,7 @@ func (s Source) prepare(stagingDir string, stagingIdentity store.FileIdentity) (
 	case KindGit:
 		var scratch *ownedScratch
 		var err error
-		if stagingIdentity.Inode == 0 {
+		if !stagingIdentity.Valid() {
 			scratch, err = newOwnedScratch(stagingDir)
 		} else {
 			scratch, err = newOwnedScratchChecked(stagingDir, stagingIdentity)
@@ -321,6 +321,8 @@ func openPreparedRoot(path string) (*os.Root, error) {
 		_ = dir.Close()
 		return nil, err
 	}
+	// Both descriptors stay open across these observations and the pairing.
+	// Removing either pathname cannot free its still-referenced inode for reuse.
 	if !os.SameFile(rootInfo, dirInfo) {
 		_ = root.Close()
 		_ = dir.Close()

@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func pendingActiveConfigExchange(t *testing.T) (*Store, configExchangeRecord, []byte) {
@@ -40,6 +43,24 @@ func pendingActiveConfigExchange(t *testing.T) (*Store, configExchangeRecord, []
 		t.Fatal(err)
 	}
 	return checked, record, raw
+}
+
+func TestValidateConfigExchangeRecordRejectsSharedDeviceAndInode(t *testing.T) {
+	record := configExchangeRecord{
+		Version:      configExchangeRecordVersion,
+		Candidate:    configCandidatePrefix + "0123456789abcdef",
+		Previous:     FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"},
+		Staged:       FileIdentity{Device: 1, Inode: 2, Handle: "1:bb"},
+		ExpectDigest: digestConfigExchangeBytes([]byte("before")),
+		DataDigest:   digestConfigExchangeBytes([]byte("after")),
+	}
+	name, err := configExchangeRecordName(record.Candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateConfigExchangeRecord(name, record); err == nil {
+		t.Fatal("identities sharing device and inode must be rejected even when their handles differ")
+	}
 }
 
 // configExchangeResidue lists every recovery/ entry that belongs to a config
@@ -92,6 +113,33 @@ func TestConfigExchangeActiveStagedConvergesAfterMismatchedPreviousIsRestored(t 
 	}
 	if residue := configExchangeResidue(t, checked.RecoveryDir()); len(residue) != 0 {
 		t.Fatalf("a recovered exchange must leave no residue once its terminal marker is durable, found %v", residue)
+	}
+}
+
+func TestConfigExchangeRecoversARecordWithoutHandleFields(t *testing.T) {
+	checked, record, _ := pendingActiveConfigExchange(t)
+	record.Previous.Handle = ""
+	record.Staged.Handle = ""
+	legacyRaw, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(legacyRaw, []byte(`"handle"`)) {
+		t.Fatalf("legacy fixture unexpectedly contains a handle field: %s", legacyRaw)
+	}
+	recordName, err := configExchangeRecordName(record.Candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checked.RecoveryDir(), recordName), legacyRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := checked.RecoverConfigExchanges(); err != nil {
+		t.Fatalf("recover handle-free config exchange record: %v", err)
+	}
+	if residue := configExchangeResidue(t, checked.RecoveryDir()); len(residue) != 0 {
+		t.Fatalf("legacy record recovery left residue: %v", residue)
 	}
 }
 
@@ -639,6 +687,54 @@ func TestReclaimConfigExchangeRejectsAnArchiveNameBeforeRetiringIt(t *testing.T)
 	}
 	if admitted {
 		t.Fatalf("%s states an identity it does not hold and must be rejected before any rename", name)
+	}
+}
+
+func TestReclaimConfigExchangeUsesObservedIdentityForRetirement(t *testing.T) {
+	s := checkedWriteSession(t)
+	stated := FileIdentity{Device: 1, Inode: 2}
+	observed := FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"}
+	var retiredWith FileIdentity
+
+	admitted := reclaimConfigExchangeStatedArchiveWithOps(
+		s.writeRoots.recovery,
+		"archive",
+		stated,
+		func(int, string) (FileIdentity, unix.Stat_t, error) {
+			return observed, unix.Stat_t{Mode: unix.S_IFREG}, nil
+		},
+		func(_ *checkedRoot, _ string, identity FileIdentity) error {
+			retiredWith = identity
+			return nil
+		},
+	)
+	if !admitted {
+		t.Fatal("an archive matching its stated device and inode must be admitted")
+	}
+	if retiredWith != observed {
+		t.Fatalf("retirement identity = %+v, want observed identity %+v", retiredWith, observed)
+	}
+}
+
+func TestRevalidateConfigExchangePairReturnsObservedIdentities(t *testing.T) {
+	recordedTarget := FileIdentity{Device: 1, Inode: 2}
+	recordedScratch := FileIdentity{Device: 1, Inode: 3}
+	observedTarget := FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"}
+	observedScratch := FileIdentity{Device: 1, Inode: 3, Handle: "1:bb"}
+	target, scratch, err := revalidateConfigExchangePairWithCapture(
+		&checkedRoot{}, &checkedRoot{}, recordedTarget, recordedScratch,
+		func(_ *checkedRoot, name string) (FileIdentity, error) {
+			if name == "fu.yaml" {
+				return observedTarget, nil
+			}
+			return observedScratch, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != observedTarget || scratch != observedScratch {
+		t.Fatalf("observed pair = (%+v, %+v), want (%+v, %+v)", target, scratch, observedTarget, observedScratch)
 	}
 }
 

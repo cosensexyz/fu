@@ -3,10 +3,21 @@ name: test
 on: [push, pull_request]
 jobs:
   test:
+    name: test (${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            require_file_handles: '1'
+          - os: macos-latest
+            require_file_handles: ''
     runs-on: ${{ matrix.os }}
+    env:
+      # If ubuntu-latest moves its temporary directory away from ext4/XFS,
+      # point TMPDIR at one of those filesystems or provision a loop-mounted
+      # ext4 test directory; silently accepting tmpfs makes this regression
+      # coverage vacuous.
+      FU_REQUIRE_FILE_HANDLES: ${{ matrix.require_file_handles }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -17,5 +28,10 @@ jobs:
       # suite has run 327s on hardware faster than these runners), so a genuine
       # hang is reported as a timeout rather than inheriting a default that may
       # be too tight on a slow runner.
-      - run: go test ./... -race -count=1 -timeout 30m
-      - run: make fmt-check
+      - id: race-tests
+        run: go test ./... -race -count=1 -timeout 30m
+      - name: Show the Linux file-handle regression diagnostic
+        if: (success() || failure()) && runner.os == 'Linux'
+        run: go test ./internal/store -run '^TestConfigExchangeRestoresATargetReplacedUnderItsNameWithMatchingBytes$' -bench '^BenchmarkOpenReadOnlyRootFile$' -benchtime=100x -count=1 -v
+      - if: success() || failure()
+        run: make fmt-check

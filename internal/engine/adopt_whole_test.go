@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -9,9 +10,445 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/cosensexyz/fu/internal/agent"
 	"github.com/cosensexyz/fu/internal/store"
+	"github.com/cosensexyz/fu/internal/testenv"
 )
+
+func TestMarshalAdoptLinkArchiveIgnoresIdentityHandle(t *testing.T) {
+	withHandle := newAdoptLinkArchiveRecord(
+		adoptLinkArchiveEntry,
+		"claude",
+		"alpha",
+		filepath.Join(t.TempDir(), "alpha"),
+		"../target",
+		uint32(os.ModeSymlink),
+		store.FileIdentity{Device: 1, Inode: 2, Handle: "1:aabb"},
+	)
+	withoutHandle := withHandle
+	withoutHandle.Identity.Handle = ""
+
+	withRaw, withName, err := marshalAdoptLinkArchive(withHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutRaw, withoutName, err := marshalAdoptLinkArchive(withoutHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(withRaw, withoutRaw) || withName != withoutName {
+		t.Fatalf("handle changed archive encoding: %s/%s vs %s/%s", withName, withRaw, withoutName, withoutRaw)
+	}
+}
+
+func TestValidateDirSwitchStatePreservesHandleStrengthAndAcceptsLegacyPairs(t *testing.T) {
+	parent := t.TempDir()
+	target := AdoptTarget{
+		Agent:         "claude",
+		SkillsDir:     filepath.Join(parent, "skills"),
+		SourcePath:    filepath.Join(parent, "target"),
+		EntryIdentity: store.FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"},
+	}
+	sw := &DirSwitchState{
+		Agent:           target.Agent,
+		Target:          target.SourcePath,
+		Sibling:         filepath.Join(parent, ".fu-skills-owned"),
+		SiblingIdentity: store.FileIdentity{Device: 3, Inode: 4},
+		SiblingManifest: []DirSwitchEntry{{Name: "alpha", Identity: store.FileIdentity{Device: 5, Inode: 6}}},
+		Backup:          filepath.Join(parent, ".fu-skills-old-owned"),
+		BackupIdentity:  store.FileIdentity{Device: 1, Inode: 2},
+		BackupMode:      uint32(os.ModeSymlink),
+		LinkArchive:     adoptLinkArchivePrefix + strings.Repeat("0", 64) + ".json",
+		CleanupID:       "0011223344556677",
+		Stage:           "swapped",
+	}
+	sw.BackupIdentity = target.EntryIdentity
+	if err := validateDirSwitchState(target, sw); err != nil {
+		t.Fatalf("valid copied backup identity was rejected: %v", err)
+	}
+	sw.BackupIdentity.Handle = ""
+	if err := validateDirSwitchState(target, sw); !errors.Is(err, ErrTxnConflict) ||
+		!strings.Contains(err.Error(), "lacks persisted artifact ownership") {
+		t.Fatalf("dropped backup handle must conflict, got %v", err)
+	}
+	legacyTarget := target
+	legacyTarget.EntryIdentity.Handle = ""
+	if err := validateDirSwitchState(legacyTarget, sw); err != nil {
+		t.Fatalf("fully handle-free legacy switch must remain admissible, got %v", err)
+	}
+	zeroTarget := legacyTarget
+	zeroTarget.EntryIdentity = store.FileIdentity{}
+	sw.BackupIdentity = store.FileIdentity{}
+	if err := validateDirSwitchState(zeroTarget, sw); !errors.Is(err, ErrTxnConflict) {
+		t.Fatalf("fully zeroed switch identities must conflict, got %v", err)
+	}
+}
+
+func TestAbandonDirSwitchRevalidatesRestoredLinkAgainstObservedBackup(t *testing.T) {
+	parentPath := t.TempDir()
+	parent, err := os.Open(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	parentIdentity, _, err := store.OpenIdentity(int(parent.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const skillsName = "skills"
+	const backupName = ".fu-skills-old-owned"
+	const linkTarget = "target"
+	backupPath := filepath.Join(parentPath, backupName)
+	if err := os.Symlink(linkTarget, backupPath); err != nil {
+		t.Fatal(err)
+	}
+	backupIdentity, _, err := store.EntryIdentityAt(int(parent.Fd()), backupName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordIdentity := backupIdentity
+	recordIdentity.Handle = ""
+	target := AdoptTarget{
+		Agent:          "claude",
+		SkillsDir:      filepath.Join(parentPath, skillsName),
+		WholeDir:       true,
+		ParentIdentity: parentIdentity,
+		EntryIdentity:  recordIdentity,
+		EntryKind:      adoptEntrySymlink,
+		LinkTarget:     linkTarget,
+		SourcePath:     filepath.Join(parentPath, linkTarget),
+	}
+	sw := &DirSwitchState{
+		Agent:           target.Agent,
+		Target:          target.SourcePath,
+		Sibling:         filepath.Join(parentPath, ".fu-skills-missing"),
+		SiblingIdentity: store.FileIdentity{Device: 3, Inode: 4},
+		SiblingManifest: []DirSwitchEntry{{Name: "alpha", Identity: store.FileIdentity{Device: 5, Inode: 6}}},
+		Backup:          backupPath,
+		BackupIdentity:  recordIdentity,
+		BackupMode:      uint32(os.ModeSymlink),
+		LinkArchive:     adoptLinkArchivePrefix + strings.Repeat("0", 64) + ".json",
+		CleanupID:       "0011223344556677",
+		Stage:           "swapped",
+	}
+	txn := &TxnRecord{Name: "alpha", AdoptTargets: []AdoptTarget{target}, DirSwitch: sw}
+	a := fakeAgent{name: target.Agent, dir: target.SkillsDir}
+
+	_, err = abandonDirSwitchWithHooks(nil, a, txn, hooks{entryIdentityAt: func(fd int, name string) (store.FileIdentity, unix.Stat_t, error) {
+		identity, stat, captureErr := store.EntryIdentityAt(fd, name)
+		if captureErr != nil {
+			return store.FileIdentity{}, unix.Stat_t{}, captureErr
+		}
+		switch name {
+		case backupName:
+			identity.Handle = "1:aa"
+		case skillsName:
+			identity.Handle = "1:bb"
+		}
+		return identity, stat, nil
+	}})
+	if !errors.Is(err, ErrTxnConflict) {
+		t.Fatalf("restored link with a different observed handle must conflict, got %v", err)
+	}
+	if txn.DirSwitch == nil {
+		t.Fatal("conflicted restored link must keep the switch record")
+	}
+}
+
+func TestValidateDirSwitchBackupRequiresExactCopiedIdentity(t *testing.T) {
+	parentPath := t.TempDir()
+	const backup = ".fu-skills-old-owned"
+	if err := os.Symlink("expected", filepath.Join(parentPath, backup)); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	observed, _, err := store.EntryIdentityAt(int(parent.Fd()), backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed.Handle = ""
+	targetIdentity := observed
+	targetIdentity.Handle = "1:aa"
+	sw := &DirSwitchState{Backup: filepath.Join(parentPath, backup), BackupIdentity: observed}
+	target := AdoptTarget{EntryIdentity: targetIdentity, LinkTarget: "expected"}
+
+	if _, err := observeDirSwitchBackup(parent, target, sw, sw.BackupIdentity); !errors.Is(err, ErrTxnConflict) {
+		t.Fatalf("dropped backup handle must conflict, got %v", err)
+	}
+}
+
+func TestDirSwitchEntrySameComparesEveryField(t *testing.T) {
+	base := DirSwitchEntry{
+		Name:       "alpha",
+		Mode:       uint32(os.ModeSymlink),
+		LinkTarget: "../target",
+		Identity:   store.FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"},
+	}
+	cases := []struct {
+		name string
+		edit func(*DirSwitchEntry)
+		want bool
+	}{
+		{name: "equal", edit: func(*DirSwitchEntry) {}, want: true},
+		{name: "name", edit: func(got *DirSwitchEntry) { got.Name = "beta" }},
+		{name: "mode", edit: func(got *DirSwitchEntry) { got.Mode = uint32(os.ModeDir) }},
+		{name: "link target", edit: func(got *DirSwitchEntry) { got.LinkTarget = "../other" }},
+		{name: "device", edit: func(got *DirSwitchEntry) { got.Identity.Device++ }},
+		{name: "inode", edit: func(got *DirSwitchEntry) { got.Identity.Inode++ }},
+		{name: "handle", edit: func(got *DirSwitchEntry) { got.Identity.Handle = "1:bb" }},
+		{name: "legacy handle", edit: func(got *DirSwitchEntry) { got.Identity.Handle = "" }, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			other := base
+			tc.edit(&other)
+			if got := base.same(other); got != tc.want {
+				t.Fatalf("same = %v, want %v for %+v vs %+v", got, tc.want, base, other)
+			}
+		})
+	}
+	if sameDirSwitchEntries([]DirSwitchEntry{base}, nil) {
+		t.Fatal("different manifest lengths must not compare equal")
+	}
+}
+
+func TestAsDirSwitchArtifactConflictIsAHardStop(t *testing.T) {
+	cause := fmt.Errorf("capture replacement: %w", store.ErrOwnedTreeChanged)
+	err := asDirSwitchArtifactConflict(cause)
+	if !errors.Is(err, ErrTxnConflict) || !errors.Is(err, store.ErrOwnedTreeChanged) {
+		t.Fatalf("artifact error = %v, want transaction conflict preserving cause", err)
+	}
+	if errors.Is(err, errAdoptTargetChanged) || canIsolateDirSwitchTargetConflict(err, nil, "claude") {
+		t.Fatalf("fu-owned artifact error must not be isolatable as a user-target change: %v", err)
+	}
+}
+
+func TestDirSwitchArtifactSyscallErrorsAreHardStops(t *testing.T) {
+	parent, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, err := range map[string]error{
+		"inspect absence": requireDirSwitchEntryAbsent(parent, "artifact", "artifact"),
+		"rename":          renameDirSwitchEntry(parent, "old", "new", "move artifact"),
+	} {
+		if !errors.Is(err, ErrTxnConflict) || !errors.Is(err, unix.EBADF) {
+			t.Errorf("%s error = %v, want transaction conflict preserving EBADF", name, err)
+		}
+	}
+}
+
+func TestWholeDirAlreadySwitchedCandidateOpenFailureIsIsolatable(t *testing.T) {
+	parentPath := t.TempDir()
+	skillsDir := filepath.Join(parentPath, "skills")
+	if err := os.Mkdir(skillsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent, parentIdentity, err := openAdoptDirectory(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.Close(); err != nil {
+		t.Fatal(err)
+	}
+	target := AdoptTarget{
+		SkillsDir:      skillsDir,
+		WholeDir:       true,
+		ParentIdentity: parentIdentity,
+	}
+	cause := fmt.Errorf("capture candidate: %w", store.ErrOwnedTreeChanged)
+
+	_, err = wholeDirAgentAlreadySwitchedWithOpen(&store.Store{}, target, "alpha",
+		func(*os.File, string, string, store.FileIdentity) (*os.File, *os.Root, error) {
+			return nil, nil, cause
+		})
+	if !errors.Is(err, ErrTxnConflict) || !errors.Is(err, errAdoptTargetChanged) || !errors.Is(err, cause) {
+		t.Fatalf("candidate error = %v, want isolatable target conflict preserving cause", err)
+	}
+	if !canIsolateDirSwitchTargetConflict(err, nil, "claude") {
+		t.Fatalf("candidate directory failure must remain isolatable: %v", err)
+	}
+}
+
+func TestWholeDirAlreadySwitchedClassifiesCaptureAndScanFailures(t *testing.T) {
+	parentPath := t.TempDir()
+	skillsDir := filepath.Join(parentPath, "skills")
+	if err := os.Mkdir(skillsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent, parentIdentity, err := openAdoptDirectory(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.Close(); err != nil {
+		t.Fatal(err)
+	}
+	target := AdoptTarget{SkillsDir: skillsDir, WholeDir: true, ParentIdentity: parentIdentity}
+	cause := errors.New("candidate inspection failed")
+	assertIsolatable := func(t *testing.T, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrTxnConflict) || !errors.Is(err, errAdoptTargetChanged) || !errors.Is(err, cause) {
+			t.Fatalf("candidate error = %v, want isolatable target conflict preserving cause", err)
+		}
+	}
+
+	t.Run("capture", func(t *testing.T) {
+		_, err := wholeDirAgentAlreadySwitchedWithOps(
+			&store.Store{}, target, "alpha",
+			func(int, string) (store.FileIdentity, unix.Stat_t, error) {
+				return store.FileIdentity{}, unix.Stat_t{}, cause
+			},
+			openDirSwitchDirectory,
+			scanDirSwitchEntries,
+		)
+		assertIsolatable(t, err)
+	})
+
+	t.Run("scan", func(t *testing.T) {
+		_, err := wholeDirAgentAlreadySwitchedWithOps(
+			&store.Store{}, target, "alpha",
+			store.EntryIdentityAt,
+			openDirSwitchDirectory,
+			func(*os.Root) ([]DirSwitchEntry, error) { return nil, cause },
+		)
+		assertIsolatable(t, err)
+	})
+}
+
+func TestDirSwitchInspectionErrorPreservesItsCause(t *testing.T) {
+	cause := errors.New("directory scan failed")
+	err := dirSwitchInspectionError("replacement directory", "/tmp/skills", cause)
+	if !errors.Is(err, ErrTxnConflict) || !errors.Is(err, cause) {
+		t.Fatalf("inspection error = %v, want transaction conflict and scan cause", err)
+	}
+}
+
+func TestValidateCurrentAdoptEntryReturnsItsObservedIdentityAndSealedStat(t *testing.T) {
+	parentPath := t.TempDir()
+	skillsPath := filepath.Join(parentPath, "skills")
+	if err := os.Symlink("target", skillsPath); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	expectedIdentity := store.FileIdentity{Device: 1, Inode: 2}
+	observedIdentity := store.FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"}
+	target := AdoptTarget{
+		Agent:         "claude",
+		SkillsDir:     skillsPath,
+		WholeDir:      true,
+		EntryIdentity: expectedIdentity,
+		EntryKind:     adoptEntrySymlink,
+		LinkTarget:    "target",
+	}
+
+	observed, stat, err := validateCurrentAdoptEntryStatWithCapture(parent, target, "alpha", expectedIdentity,
+		func(int, string) (store.FileIdentity, unix.Stat_t, error) {
+			return observedIdentity, unix.Stat_t{Mode: unix.S_IFLNK | 0o777}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed != observedIdentity {
+		t.Fatalf("observed identity = %+v, want captured %+v", observed, observedIdentity)
+	}
+	if statMode(stat.Mode) != unix.S_IFLNK {
+		t.Fatalf("validated mode = %#o, want symlink", stat.Mode)
+	}
+}
+
+func TestObserveDirSwitchBackupReturnsItsCapturedIdentity(t *testing.T) {
+	parentPath := t.TempDir()
+	backup := filepath.Join(parentPath, "backup")
+	if err := os.Symlink("target", backup); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	expectedIdentity := store.FileIdentity{Device: 1, Inode: 2}
+	observedIdentity := store.FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"}
+	target := AdoptTarget{EntryIdentity: expectedIdentity, EntryKind: adoptEntrySymlink, LinkTarget: "target"}
+	sw := &DirSwitchState{Backup: backup, BackupIdentity: expectedIdentity}
+
+	observed, err := observeDirSwitchBackupWithCapture(parent, target, sw, expectedIdentity,
+		func(int, string) (store.FileIdentity, unix.Stat_t, error) {
+			return observedIdentity, unix.Stat_t{Mode: unix.S_IFLNK | 0o777}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed != observedIdentity {
+		t.Fatalf("observed identity = %+v, want captured %+v", observed, observedIdentity)
+	}
+}
+
+func TestObserveDirSwitchSiblingReturnsItsCapturedIdentity(t *testing.T) {
+	parentPath := t.TempDir()
+	if err := os.Mkdir(filepath.Join(parentPath, "sibling"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	expectedIdentity := store.FileIdentity{Device: 1, Inode: 2}
+	observedIdentity := store.FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"}
+
+	observed, err := observeDirSwitchSiblingWithCapture(parent, parentPath, "sibling", &DirSwitchState{}, expectedIdentity,
+		func(int) (store.FileIdentity, unix.Stat_t, error) {
+			return observedIdentity, unix.Stat_t{Mode: unix.S_IFDIR | 0o755}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed != observedIdentity {
+		t.Fatalf("observed identity = %+v, want captured %+v", observed, observedIdentity)
+	}
+}
+
+func TestObserveDirSwitchLinkReturnsItsCapturedIdentity(t *testing.T) {
+	parentPath := t.TempDir()
+	if err := os.Symlink("target", filepath.Join(parentPath, "child")); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	expectedIdentity := store.FileIdentity{Device: 1, Inode: 2}
+	observedIdentity := store.FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"}
+	expected := DirSwitchEntry{Name: "child", LinkTarget: "target", Identity: expectedIdentity}
+
+	observed, err := observeDirSwitchLinkWithCapture(parent, "child", expected, expectedIdentity,
+		func(int, string) (store.FileIdentity, unix.Stat_t, error) {
+			return observedIdentity, unix.Stat_t{Mode: unix.S_IFLNK | 0o777}, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed != observedIdentity {
+		t.Fatalf("observed identity = %+v, want captured %+v", observed, observedIdentity)
+	}
+}
 
 // wholeDirFixture builds a HOME whose agent skills directory is itself a
 // symlink into a target directory holding one skill plus a non-skill file.
@@ -116,7 +553,7 @@ func TestDirSwitchResumeDoesNotRestoreArtifactsItDidNotRetire(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer parent.Close()
-		rootStat, err := statAdoptEntry(int(parent.Fd()), retired)
+		rootIdentity, _, err := store.EntryIdentityAt(int(parent.Fd()), retired)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -124,13 +561,13 @@ func TestDirSwitchResumeDoesNotRestoreArtifactsItDidNotRetire(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		childStat, err := statAdoptEntry(int(child.Fd()), "alpha")
+		childIdentity, _, err := store.EntryIdentityAt(int(child.Fd()), "alpha")
 		_ = child.Close()
 		if err != nil {
 			t.Fatal(err)
 		}
-		sw.SiblingIdentity = adoptIdentity(&rootStat)
-		sw.SiblingManifest = []DirSwitchEntry{{Name: "alpha", LinkTarget: "expected", Identity: adoptIdentity(&childStat)}}
+		sw.SiblingIdentity = rootIdentity
+		sw.SiblingManifest = []DirSwitchEntry{{Name: "alpha", LinkTarget: "expected", Identity: childIdentity}}
 		moved := filepath.Join(parentPath, retired+".owned")
 		h := hooks{beforeDirSwitchChildRetire: func(string) error {
 			if err := os.Rename(filepath.Join(parentPath, retired), moved); err != nil {
@@ -854,19 +1291,46 @@ func TestAdoptWholeDirRefusesChangedTargetEntry(t *testing.T) {
 }
 
 func TestAdoptWholeDirRejectsParentEntryReplacementBeforeArchive(t *testing.T) {
+	// This is the engine package's FU_REQUIRE_FILE_HANDLES inode-reuse tripwire;
+	// go test ./internal/engine must exercise the original replacement shape.
 	fuHome, homeDir, target := wholeDirFixture(t)
+	skipUnlessReplacementDetectable(t, homeDir)
 	s, err := store.Open(fuHome)
 	if err != nil {
 		t.Fatal(err)
 	}
 	skillsDir := filepath.Join(homeDir, ".claude", "skills")
+	parent, err := os.Open(filepath.Dir(skillsDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := store.EntryIdentityAt(int(parent.Fd()), filepath.Base(skillsDir))
+	if err != nil {
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	var after store.FileIdentity
 	foreignMarker := filepath.Join(skillsDir, "foreign.txt")
 	h := hooks{beforeDirSwitchArchive: func() error {
-		if err := os.Remove(skillsDir); err != nil {
-			return err
+		attempts := 1
+		if testenv.FileHandlesRequired() {
+			attempts = 32
 		}
-		if err := os.Mkdir(skillsDir, 0o755); err != nil {
-			return err
+		for range attempts {
+			if err := os.Remove(skillsDir); err != nil {
+				return err
+			}
+			if err := os.Mkdir(skillsDir, 0o755); err != nil {
+				return err
+			}
+			after, _, err = store.EntryIdentityAt(int(parent.Fd()), filepath.Base(skillsDir))
+			if err != nil {
+				return err
+			}
+			if after.Device == before.Device && after.Inode == before.Inode {
+				break
+			}
 		}
 		return os.WriteFile(foreignMarker, []byte("foreign\n"), 0o644)
 	}}
@@ -877,6 +1341,10 @@ func TestAdoptWholeDirRejectsParentEntryReplacementBeforeArchive(t *testing.T) {
 	}
 	if len(res.Pending) != 1 || res.Pending[0].Name != "pdf-tools" {
 		t.Fatalf("isolated whole-directory adoption must be pending: %+v", res.Pending)
+	}
+	if testenv.FileHandlesRequired() &&
+		(before.Device != after.Device || before.Inode != after.Inode || before.Handle == "" || after.Handle == "" || before.Handle == after.Handle) {
+		t.Fatalf("engine replacement coverage did not reuse the inode with a new handle: before=%+v after=%+v", before, after)
 	}
 	if got, err := os.ReadFile(foreignMarker); err != nil || string(got) != "foreign\n" {
 		t.Fatalf("foreign replacement = %q, %v; want preserved", got, err)
@@ -1088,8 +1556,8 @@ func TestAdoptWholeDirRetiresBackupBeforeCleanup(t *testing.T) {
 // TestAdoptWholeDirLandedReentryToleratesTargetChange replaces the test that
 // used to assert the opposite. Once the replacement has landed, the target is
 // not re-validated at all: the only operation left is removing fu's own
-// backup, which validateDirSwitchBackup proves by inode, mode and raw link
-// text on its own.
+// backup, which observeDirSwitchBackup proves by device, inode, file handle,
+// mode, and raw link text on its own.
 //
 // The check that used to sit here was narrowed three times and refused an
 // ordinary user action every time -- by digest (round 18 I6), then by child
@@ -1323,8 +1791,9 @@ func TestAdoptWholeDirMissingBackupIsConflict(t *testing.T) {
 
 // TestSwitchAdoptEntryRefusesWholeDirTarget pins round 18 finding I2: the
 // per-entry switch must refuse a whole-directory target outright. Damage was
-// avoided only incidentally -- pairBoundAdoptRoot compares against the
-// descriptor for Dir(SkillsDir), so os.SameFile happened to fail -- and one
+// avoided only incidentally -- pairBoundAdoptRoot compares the handle-aware
+// identities of both open descriptors, so the mismatched parent happened to
+// fail -- and one
 // refactor away the per-entry path would archive and delete the original from
 // the user's target through the parent symlink (SPEC rule 10).
 func TestSwitchAdoptEntryRefusesWholeDirTarget(t *testing.T) {
@@ -1998,6 +2467,51 @@ func TestSwappedDirSwitchRestoresLinkOnTargetChange(t *testing.T) {
 			}
 			if _, err := SetGlobal(s, []agent.Agent{agent.Claude{}}, "pdf-tools", false); err != nil {
 				t.Fatalf("later write commands must not be wedged: %v", err)
+			}
+		})
+	}
+}
+
+func TestRestoreUnexpectedDirSwitchMoveRevalidatesItsMove(t *testing.T) {
+	for _, failure := range []string{"replacement", "capture failure", "unchanged"} {
+		t.Run(failure, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Symlink("foreign-target", filepath.Join(dir, "moved")); err != nil {
+				t.Fatal(err)
+			}
+			parent, err := os.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer parent.Close()
+			captures := 0
+			err = restoreUnexpectedDirSwitchMoveWithCapture(parent, "moved", "original", func(fd int, name string) (store.FileIdentity, unix.Stat_t, error) {
+				id, stat, err := store.EntryIdentityAt(fd, name)
+				captures++
+				if captures == 2 && failure == "capture failure" {
+					return id, stat, unix.EPERM
+				}
+				id.Handle = "test:original"
+				if captures == 2 && failure == "replacement" {
+					id.Handle = "test:replacement"
+				}
+				return id, stat, err
+			})
+			if failure == "unchanged" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if !errors.Is(err, ErrTxnConflict) {
+				t.Fatalf("restore must retain a conflict after %s, got %v", failure, err)
+			}
+			if failure == "capture failure" && !errors.Is(err, unix.EPERM) {
+				t.Fatalf("capture cause lost: %v", err)
+			}
+			if captures != 2 {
+				t.Fatalf("captures=%d, want before and after rename", captures)
+			}
+			if got, err := os.Readlink(filepath.Join(dir, "original")); err != nil || got != "foreign-target" {
+				t.Fatalf("restored object was lost: %q %v", got, err)
 			}
 		})
 	}

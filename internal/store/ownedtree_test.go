@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,141 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestCompareOwnedEntryCoversEveryNonPathField(t *testing.T) {
+	base := OwnedTreeEntry{
+		Path:     "alpha",
+		Kind:     ownedFile,
+		Mode:     0o644,
+		Identity: FileIdentity{Device: 1, Inode: 2, Handle: "1:aa"},
+		Digest:   "sha256:abc",
+		Target:   "target",
+	}
+	cases := []struct {
+		name    string
+		edit    func(*OwnedTreeEntry)
+		matches bool
+	}{
+		{name: "equal", edit: func(*OwnedTreeEntry) {}, matches: true},
+		{name: "path is the map key", edit: func(got *OwnedTreeEntry) { got.Path = "beta" }, matches: true},
+		{name: "kind", edit: func(got *OwnedTreeEntry) { got.Kind = ownedSymlink }},
+		{name: "mode", edit: func(got *OwnedTreeEntry) { got.Mode = 0o600 }},
+		{name: "device", edit: func(got *OwnedTreeEntry) { got.Identity.Device++ }},
+		{name: "inode", edit: func(got *OwnedTreeEntry) { got.Identity.Inode++ }},
+		{name: "handle", edit: func(got *OwnedTreeEntry) { got.Identity.Handle = "1:bb" }},
+		{name: "legacy handle", edit: func(got *OwnedTreeEntry) { got.Identity.Handle = "" }, matches: true},
+		{name: "digest", edit: func(got *OwnedTreeEntry) { got.Digest = "sha256:def" }},
+		{name: "target", edit: func(got *OwnedTreeEntry) { got.Target = "other" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := base
+			tc.edit(&actual)
+			err := compareOwnedEntry(actual, base)
+			if (err == nil) != tc.matches {
+				t.Fatalf("compareOwnedEntry error = %v, matches = %v", err, tc.matches)
+			}
+			if err != nil && !strings.Contains(err.Error(), base.Path) {
+				t.Fatalf("compareOwnedEntry error must retain path %q: %v", base.Path, err)
+			}
+		})
+	}
+}
+
+func TestMoveOwnedTreeRevalidatesAgainstTheObservedManifest(t *testing.T) {
+	recorded := OwnedTree{RootIdentity: FileIdentity{Device: 1, Inode: 2}, RootMode: uint32(os.ModeDir | 0o755)}
+	captures := 0
+	renames := 0
+	err := moveOwnedTreeToRecoveryWithOps(
+		&checkedRoot{display: "source"}, "payload",
+		&checkedRoot{display: "recovery"}, "archive", recorded,
+		func(*checkedRoot, string) (OwnedTree, error) {
+			captures++
+			observed := recorded
+			observed.RootIdentity.Handle = "1:aa"
+			if captures == 2 {
+				observed.RootIdentity.Handle = "1:bb"
+			}
+			return observed, nil
+		},
+		func(*checkedRoot, string, *checkedRoot, string) error {
+			renames++
+			return nil
+		},
+	)
+	if !errors.Is(err, ErrOwnedTreeChanged) {
+		t.Fatalf("post-move handle change must conflict, got %v", err)
+	}
+	if captures != 2 || renames != 2 {
+		t.Fatalf("captures=%d renames=%d, want two captures and restore rename", captures, renames)
+	}
+}
+
+func TestMoveOwnedTreeValidatesManifestBeforeCapture(t *testing.T) {
+	recorded := OwnedTree{
+		RootIdentity: FileIdentity{Device: 1, Inode: 2},
+		RootMode:     uint32(os.ModeDir | 0o755),
+		Entries: []OwnedTreeEntry{
+			{Path: "duplicate", Kind: ownedFile, Mode: 0o644, Identity: FileIdentity{Device: 3, Inode: 4}, Digest: "sha256:" + strings.Repeat("0", 64)},
+			{Path: "duplicate", Kind: ownedFile, Mode: 0o644, Identity: FileIdentity{Device: 3, Inode: 4}, Digest: "sha256:" + strings.Repeat("0", 64)},
+		},
+	}
+	captured := false
+	err := moveOwnedTreeToRecoveryWithOps(
+		&checkedRoot{display: "source"}, "payload",
+		&checkedRoot{display: "recovery"}, "archive", recorded,
+		func(*checkedRoot, string) (OwnedTree, error) {
+			captured = true
+			return recorded, nil
+		},
+		func(*checkedRoot, string, *checkedRoot, string) error { return nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), "invalid transaction-owned tree manifest") {
+		t.Fatalf("invalid manifest error = %v", err)
+	}
+	if captured {
+		t.Fatal("an invalid manifest must be rejected before inspecting the filesystem")
+	}
+}
+
+func TestMoveOwnedTreeClassifiesTypeChangesBeforeAndAfterRename(t *testing.T) {
+	recorded := OwnedTree{RootIdentity: FileIdentity{Device: 1, Inode: 2}, RootMode: uint32(os.ModeDir | 0o755)}
+	tests := []struct {
+		name        string
+		captureErr  int
+		wantRenames int
+	}{
+		{name: "before rename", captureErr: 1, wantRenames: 0},
+		{name: "after rename", captureErr: 2, wantRenames: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			captures := 0
+			renames := 0
+			err := moveOwnedTreeToRecoveryWithOps(
+				&checkedRoot{display: "source"}, "payload",
+				&checkedRoot{display: "recovery"}, "archive", recorded,
+				func(*checkedRoot, string) (OwnedTree, error) {
+					captures++
+					if captures == test.captureErr {
+						return OwnedTree{}, unix.ELOOP
+					}
+					return recorded, nil
+				},
+				func(*checkedRoot, string, *checkedRoot, string) error {
+					renames++
+					return nil
+				},
+			)
+			if !errors.Is(err, ErrOwnedTreeChanged) {
+				t.Fatalf("type-change error = %v, want ErrOwnedTreeChanged", err)
+			}
+			if renames != test.wantRenames {
+				t.Fatalf("renames = %d, want %d", renames, test.wantRenames)
+			}
+		})
+	}
+}
 
 func TestHashFileAtRefusesFIFOReplacementWithoutBlocking(t *testing.T) {
 	dirPath := t.TempDir()
@@ -24,7 +160,7 @@ func TestHashFileAtRefusesFIFOReplacementWithoutBlocking(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dir.Close()
-	observed, err := statAt(int(dir.Fd()), name)
+	observedIdentity, _, err := entryIdentityAt(int(dir.Fd()), name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +173,7 @@ func TestHashFileAtRefusesFIFOReplacementWithoutBlocking(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		_, _, err := hashFileAt(int(dir.Fd()), name, identityFromStat(&observed))
+		_, _, _, err := hashFileAt(int(dir.Fd()), name, observedIdentity)
 		result <- err
 	}()
 	select {
@@ -242,6 +378,81 @@ func TestRecoveryPayloadSettledReportsFullyReclaimedPayloadSettled(t *testing.T)
 	}
 	if !settled {
 		t.Fatal("a fully reclaimed payload holds nothing under either name")
+	}
+}
+
+func TestArchiveRecoveryPayloadOwnedRevalidatesAgainstTheObservedManifest(t *testing.T) {
+	checked, manifest, payload := ownedRecoveryFixture(t, false)
+	// The injected live handle must be admitted by a legacy record on Linux
+	// as well as macOS; an actual Linux handle would reject the first capture.
+	manifest.RootIdentity.Handle = ""
+	captures := 0
+
+	err := archiveRecoveryPayloadOwnedWithSnapshot(checked, payload, manifest, ownedCleanupHooks{}, func(_ *checkedRoot, _ string) (OwnedTree, error) {
+		captures++
+		observed := manifest
+		observed.RootIdentity.Handle = "1:aa"
+		if captures == 2 {
+			observed.RootIdentity.Handle = "1:bb"
+		}
+		return observed, nil
+	})
+	if !errors.Is(err, ErrOwnedTreeChanged) {
+		t.Fatalf("post-rename replacement must conflict, got %v", err)
+	}
+	if captures != 2 {
+		t.Fatalf("snapshot captures = %d, want 2", captures)
+	}
+}
+
+func TestArchiveRecoveryPayloadOwnedPreservesSnapshotErrno(t *testing.T) {
+	checked, manifest, payload := ownedRecoveryFixture(t, false)
+
+	err := archiveRecoveryPayloadOwnedWithSnapshot(checked, payload, manifest, ownedCleanupHooks{}, func(_ *checkedRoot, _ string) (OwnedTree, error) {
+		return OwnedTree{}, unix.EPERM
+	})
+	if !errors.Is(err, unix.EPERM) {
+		t.Fatalf("snapshot errno must remain discoverable, got %v", err)
+	}
+	if errors.Is(err, ErrOwnedTreeChanged) {
+		t.Fatalf("environmental snapshot failure must not become an ownership conflict: %v", err)
+	}
+}
+
+func TestArchiveRecoveryPayloadOwnedClassifiesPostRenameSnapshotFailure(t *testing.T) {
+	checked, manifest, payload := ownedRecoveryFixture(t, false)
+	captures := 0
+	cause := unix.EPERM
+
+	err := archiveRecoveryPayloadOwnedWithSnapshot(checked, payload, manifest, ownedCleanupHooks{}, func(_ *checkedRoot, _ string) (OwnedTree, error) {
+		captures++
+		if captures == 2 {
+			return OwnedTree{}, cause
+		}
+		return manifest, nil
+	})
+	if !errors.Is(err, ErrOwnedTreeChanged) || !errors.Is(err, cause) {
+		t.Fatalf("post-rename snapshot error = %v, want ownership sentinel and cause", err)
+	}
+	if captures != 2 {
+		t.Fatalf("snapshot captures = %d, want 2", captures)
+	}
+	if _, statErr := os.Lstat(filepath.Join(checked.RecoveryDir(), payload)); statErr != nil {
+		t.Fatalf("failed post-rename revalidation must restore the payload: %v", statErr)
+	}
+}
+
+func TestClassifyOwnedSnapshotErrorUsesTheObjectLabel(t *testing.T) {
+	err := classifyOwnedSnapshotError("recovery payload", "payload", unix.ELOOP)
+	if !errors.Is(err, ErrOwnedTreeChanged) || !strings.Contains(err.Error(), `recovery payload "payload" changed type`) {
+		t.Fatalf("classified snapshot error = %v", err)
+	}
+}
+
+func TestValidateTransactionOwnedTreeManifestRejectsInvalidManifest(t *testing.T) {
+	err := validateTransactionOwnedTreeManifest(OwnedTree{})
+	if err == nil || !strings.Contains(err.Error(), "invalid transaction-owned tree manifest") {
+		t.Fatalf("manifest validation error = %v", err)
 	}
 }
 
@@ -480,4 +691,102 @@ func ownedRecoveryFixture(t *testing.T, withFile bool) (*Store, OwnedTree, strin
 		t.Fatal(err)
 	}
 	return checked, manifest, payload
+}
+
+func TestMoveOwnedTreePreservesPostRenameCaptureFailure(t *testing.T) {
+	recorded := OwnedTree{RootIdentity: FileIdentity{Device: 1, Inode: 2}, RootMode: uint32(os.ModeDir | 0o755)}
+	for _, after := range []bool{false, true} {
+		t.Run(fmt.Sprint(after), func(t *testing.T) {
+			captures, renames := 0, 0
+			err := moveOwnedTreeToRecoveryWithOps(&checkedRoot{}, "payload", &checkedRoot{}, "archive", recorded,
+				func(*checkedRoot, string) (OwnedTree, error) {
+					captures++
+					if !after || captures == 2 {
+						return OwnedTree{}, unix.EPERM
+					}
+					return recorded, nil
+				}, func(*checkedRoot, string, *checkedRoot, string) error { renames++; return nil })
+			if !errors.Is(err, unix.EPERM) || errors.Is(err, ErrOwnedTreeChanged) != after {
+				t.Fatalf("after=%v error=%v: want EPERM and conflict only after rename", after, err)
+			}
+			want := 0
+			if after {
+				want = 2
+			}
+			if renames != want {
+				t.Fatalf("renames=%d, want %d", renames, want)
+			}
+		})
+	}
+}
+
+func TestPublishStagedRootUsesLiveManifest(t *testing.T) {
+	for _, scenario := range []string{"published", "replaced", "before capture failure", "after capture failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir, err := os.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dir.Close()
+			staging := &checkedRoot{dir: dir, display: dir.Name()}
+			s := &Store{writeRoots: &checkedRoots{staging: staging}}
+			recorded := OwnedTree{RootIdentity: FileIdentity{Device: 1, Inode: 2}, RootMode: uint32(os.ModeDir | 0o755)}
+			reservation := StagedRootReservation{Name: ".fu-new-0123456789abcdef", Manifest: recorded}
+			captures, renames := 0, 0
+			got, err := s.publishStagedRootOwnedWithOps(reservation, "alpha",
+				func(*checkedRoot, string) (OwnedTree, error) {
+					captures++
+					if scenario == "before capture failure" || scenario == "after capture failure" && captures == 2 {
+						return OwnedTree{}, unix.EPERM
+					}
+					live := recorded
+					live.RootIdentity.Handle = "1:aa"
+					if scenario == "replaced" && captures == 2 {
+						live.RootIdentity.Handle = "1:bb"
+					}
+					return live, nil
+				}, func(*checkedRoot, string, *checkedRoot, string) error { renames++; return nil })
+			switch scenario {
+			case "published":
+				if err != nil || got.RootIdentity.Handle != "1:aa" || renames != 1 {
+					t.Fatalf("published=%+v error=%v renames=%d", got, err, renames)
+				}
+			case "before capture failure":
+				if !errors.Is(err, unix.EPERM) || errors.Is(err, ErrOwnedTreeChanged) || renames != 0 {
+					t.Fatalf("pre-rename error=%v renames=%d", err, renames)
+				}
+			default:
+				if !errors.Is(err, ErrOwnedTreeChanged) || renames != 2 {
+					t.Fatalf("post-rename error=%v renames=%d", err, renames)
+				}
+				if scenario == "after capture failure" && !errors.Is(err, unix.EPERM) {
+					t.Fatalf("cause lost: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestPublishStagedRootReportsRenameFailureOnce(t *testing.T) {
+	dir, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	const reserved = ".fu-new-0123456789abcdef"
+	for _, name := range []string{reserved, "alpha"} {
+		if err := os.Mkdir(filepath.Join(dir.Name(), name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	staging := &checkedRoot{dir: dir, display: dir.Name()}
+	s := &Store{writeRoots: &checkedRoots{staging: staging}}
+	recorded := OwnedTree{RootIdentity: FileIdentity{Device: 1, Inode: 2}, RootMode: uint32(os.ModeDir | 0o755)}
+	_, err = s.publishStagedRootOwnedWithOps(StagedRootReservation{Name: reserved, Manifest: recorded}, "alpha", func(*checkedRoot, string) (OwnedTree, error) { return recorded, nil }, renameChecked)
+	if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("rename cause=%v, want existing target", err)
+	}
+	if strings.Count(err.Error(), "rename ") != 1 {
+		t.Fatalf("rename context must appear once: %v", err)
+	}
 }

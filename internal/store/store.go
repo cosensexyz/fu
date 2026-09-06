@@ -13,7 +13,6 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/cache"
 	"github.com/go-git/go-git/v5/storage/filesystem"
-	"golang.org/x/sys/unix"
 )
 
 var bootstrapConfig = []byte("version: 1\nskills: {}\n")
@@ -172,15 +171,15 @@ func (s *Store) StagingIdentity() (FileIdentity, error) {
 	if err != nil {
 		return FileIdentity{}, fmt.Errorf("validated staging directory was replaced or is unavailable: %w", err)
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(int(root.dir.Fd()), &stat); err != nil {
+	identity, _, err := openIdentity(int(root.dir.Fd()))
+	if err != nil {
 		_ = root.close()
 		return FileIdentity{}, fmt.Errorf("inspect validated staging directory identity: %w", err)
 	}
 	if err := root.close(); err != nil {
 		return FileIdentity{}, fmt.Errorf("close validated staging directory identity descriptors: %w", err)
 	}
-	return identityFromStat(&stat), nil
+	return identity, nil
 }
 
 func (s *Store) RecoveryRoot() (*os.Root, error) {
@@ -287,6 +286,8 @@ func verifyCheckedRootsStillNamed(roots *checkedRoots) error {
 		if err != nil {
 			return fmt.Errorf("verify logical root %s before returning it: %w", root.display, err)
 		}
+		// root.dir stays open from Stat through this comparison, keeping its
+		// inode allocated even if the pathname is removed and recreated.
 		if !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(opened, current) {
 			return fmt.Errorf("logical root %s was replaced while the store was being opened", root.display)
 		}

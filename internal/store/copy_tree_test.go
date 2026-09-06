@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cosensexyz/fu/internal/skill"
+	"golang.org/x/sys/unix"
 )
 
 // zeros is a 64-hex zero string usable as a syntactically valid digest.
@@ -610,6 +611,28 @@ func TestCreateRecoveryRootOwnedRejectsReplacementBeforeChmod(t *testing.T) {
 	info, statErr := os.Stat(recoveryPath)
 	if statErr != nil || info.Mode().Perm() != 0o700 {
 		t.Fatalf("replacement recovery root was modified: mode=%v err=%v", info, statErr)
+	}
+}
+
+func TestCreateRecoveryRootOwnedPreservesIdentityCaptureError(t *testing.T) {
+	s, err := Init(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := s.BeginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	cause := errors.New("file-handle lookup denied")
+
+	_, err = session.Store.createRecoveryRootOwnedWithHooks("adopt-archive-alpha", 0o711, createRecoveryRootHooks{
+		captureIdentity: func(int, string) (FileIdentity, unix.Stat_t, error) {
+			return FileIdentity{}, unix.Stat_t{}, cause
+		},
+	})
+	if !errors.Is(err, ErrOwnedTreeChanged) || !errors.Is(err, cause) {
+		t.Fatalf("recovery-root validation = %v, want ownership sentinel and capture cause", err)
 	}
 }
 

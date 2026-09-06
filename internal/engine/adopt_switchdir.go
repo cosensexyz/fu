@@ -197,13 +197,17 @@ func abandonDirSwitchWithHooks(st *store.Store, a agent.Agent, txn *TxnRecord, h
 
 	skillsName := filepath.Base(target.SkillsDir)
 	siblingName := filepath.Base(sw.Sibling)
+	entryIdentityAt := h.entryIdentityAt
+	if entryIdentityAt == nil {
+		entryIdentityAt = store.EntryIdentityAt
+	}
 	switch sw.Stage {
 	case "building":
 		// Nothing user-owned has moved at building. Even if the live entry
 		// changed, removing the identity-bound sibling is sufficient to abandon
 		// this agent; re-validating the user's entry here would recreate the
 		// permanent conflict that routed us into abandon.
-		if !adoptIdentityValid(sw.SiblingIdentity) {
+		if !sw.SiblingIdentity.Valid() {
 			if err := reclaimUnjournalledDirSwitchSibling(parent, parentPath, siblingName); err != nil {
 				return false, err
 			}
@@ -211,10 +215,10 @@ func abandonDirSwitchWithHooks(st *store.Store, a agent.Agent, txn *TxnRecord, h
 			return false, err
 		}
 	case "swapped":
-		entry, statErr := statAdoptEntry(int(parent.Fd()), skillsName)
+		entryIdentity, entry, statErr := entryIdentityAt(int(parent.Fd()), skillsName)
 		switch {
-		case statErr == nil && adoptIdentity(&entry) == target.EntryIdentity:
-			if err := validateCurrentAdoptEntry(parent, target, txn.Name); err != nil {
+		case statErr == nil && entryIdentity.Same(target.EntryIdentity):
+			if err := validateObservedAdoptEntry(parent, target, txn.Name, target.EntryIdentity, entryIdentity, entry); err != nil {
 				return false, dirSwitchEntryConflict("original skills link", err)
 			}
 			if err := requireDirSwitchEntryAbsent(parent, filepath.Base(sw.Backup), "backup"); err != nil {
@@ -224,17 +228,18 @@ func abandonDirSwitchWithHooks(st *store.Store, a agent.Agent, txn *TxnRecord, h
 				return false, err
 			}
 		case errors.Is(statErr, unix.ENOENT):
-			if err := validateDirSwitchBackup(parent, target, sw); err != nil {
+			observedBackup, err := observeDirSwitchBackupWithCapture(parent, target, sw, sw.BackupIdentity, entryIdentityAt)
+			if err != nil {
 				return false, err
 			}
-			siblingErr := validateDirSwitchSibling(parent, parentPath, siblingName, sw, false)
+			_, siblingErr := observeDirSwitchSibling(parent, parentPath, siblingName, sw, sw.SiblingIdentity)
 			if siblingErr != nil && !errors.Is(siblingErr, errDirSwitchReplacementMissing) {
 				return false, siblingErr
 			}
 			if err := renameDirSwitchEntry(parent, filepath.Base(sw.Backup), skillsName, "restore original whole-directory link"); err != nil {
 				return false, err
 			}
-			if err := validateCurrentAdoptEntry(parent, target, txn.Name); err != nil {
+			if _, _, err := validateCurrentAdoptEntryStatWithCapture(parent, target, txn.Name, observedBackup, entryIdentityAt); err != nil {
 				return false, dirSwitchEntryConflict("restored skills link", err)
 			}
 			if siblingErr == nil {
@@ -243,7 +248,7 @@ func abandonDirSwitchWithHooks(st *store.Store, a agent.Agent, txn *TxnRecord, h
 				}
 			}
 		case statErr == nil && statMode(entry.Mode) == unix.S_IFDIR:
-			if err := validateDirSwitchSibling(parent, parentPath, skillsName, sw, false); err != nil {
+			if _, err := observeDirSwitchSibling(parent, parentPath, skillsName, sw, sw.SiblingIdentity); err != nil {
 				// A foreign directory at the still-live name before archive is a
 				// user replacement, not a landed sibling. With no backup present,
 				// nothing user-owned was moved and the recorded sibling can be
@@ -256,14 +261,14 @@ func abandonDirSwitchWithHooks(st *store.Store, a agent.Agent, txn *TxnRecord, h
 				}
 				break
 			}
-			// Landed: the target is not re-validated at all. The replacement is
-			// in place and the only operation left is removing fu's own
-			// backup, which validateDirSwitchBackup already proves by inode,
-			// mode and raw link text. Checking the user's directory here
-			// protected nothing and refused everything: first by digest
-			// (round 18 I6), then by child inode (round 19), and even with
-			// every failure mode tagged it still wedged, because the abandon's
-			// own landed arm re-runs the same check and refuses identically.
+			// Landed: the target is not re-validated at all. The replacement is in place
+			// and the only operation left is removing fu's own backup, which
+			// observeDirSwitchBackup already proves by device, inode, file handle, mode
+			// and raw link text. Checking the user's directory here protected nothing
+			// and refused everything: first by digest (round 18 I6), then by child inode
+			// (round 19), and even with every failure mode tagged it still wedged,
+			// because the abandon's own landed arm re-runs the same check and refuses
+			// identically.
 			if err := removeDirSwitchBackup(st, parent, target, txn.Name, sw, h); err != nil {
 				return false, err
 			}
@@ -279,17 +284,17 @@ func abandonDirSwitchWithHooks(st *store.Store, a agent.Agent, txn *TxnRecord, h
 			}
 		}
 	case "done":
-		if err := validateDirSwitchSibling(parent, parentPath, skillsName, sw, false); err != nil {
+		if _, err := observeDirSwitchSibling(parent, parentPath, skillsName, sw, sw.SiblingIdentity); err != nil {
 			return false, err
 		}
-		// Landed: the target is not re-validated at all. The replacement is
-		// in place and the only operation left is removing fu's own
-		// backup, which validateDirSwitchBackup already proves by inode,
-		// mode and raw link text. Checking the user's directory here
-		// protected nothing and refused everything: first by digest
-		// (round 18 I6), then by child inode (round 19), and even with
-		// every failure mode tagged it still wedged, because the abandon's
-		// own landed arm re-runs the same check and refuses identically.
+		// Landed: the target is not re-validated at all. The replacement is in place
+		// and the only operation left is removing fu's own backup, which
+		// observeDirSwitchBackup already proves by device, inode, file handle, mode
+		// and raw link text. Checking the user's directory here protected nothing and
+		// refused everything: first by digest (round 18 I6), then by child inode
+		// (round 19), and even with every failure mode tagged it still wedged,
+		// because the abandon's own landed arm re-runs the same check and refuses
+		// identically.
 		if err := removeDirSwitchBackup(st, parent, target, txn.Name, sw, h); err != nil {
 			return false, err
 		}
@@ -322,7 +327,28 @@ func switchWholeDirAgent(st *store.Store, a agent.Agent, name string, txn *TxnRe
 	return startDirSwitch(st, a, name, txn, h)
 }
 
+type openDirSwitchDirectoryFunc func(*os.File, string, string, store.FileIdentity) (*os.File, *os.Root, error)
+type captureDirSwitchEntryFunc func(int, string) (store.FileIdentity, unix.Stat_t, error)
+type scanDirSwitchEntriesFunc func(*os.Root) ([]DirSwitchEntry, error)
+
 func wholeDirAgentAlreadySwitched(st *store.Store, target AdoptTarget, name string) (bool, error) {
+	return wholeDirAgentAlreadySwitchedWithOpen(st, target, name, openDirSwitchDirectory)
+}
+
+func wholeDirAgentAlreadySwitchedWithOpen(st *store.Store, target AdoptTarget, name string, openDirectory openDirSwitchDirectoryFunc) (bool, error) {
+	return wholeDirAgentAlreadySwitchedWithOps(
+		st, target, name, store.EntryIdentityAt, openDirectory, scanDirSwitchEntries,
+	)
+}
+
+func wholeDirAgentAlreadySwitchedWithOps(
+	st *store.Store,
+	target AdoptTarget,
+	name string,
+	captureEntry captureDirSwitchEntryFunc,
+	openDirectory openDirSwitchDirectoryFunc,
+	scanEntries scanDirSwitchEntriesFunc,
+) (bool, error) {
 	parent, parentRoot, parentPath, err := openDirSwitchParent(target)
 	if err != nil {
 		return false, err
@@ -330,22 +356,25 @@ func wholeDirAgentAlreadySwitched(st *store.Store, target AdoptTarget, name stri
 	defer parent.Close()
 	defer parentRoot.Close()
 	skillsName := filepath.Base(target.SkillsDir)
-	stat, err := statAdoptEntry(int(parent.Fd()), skillsName)
+	identity, stat, err := captureEntry(int(parent.Fd()), skillsName)
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ENOENT) {
 		return false, nil
 	}
-	if err != nil || statMode(stat.Mode) != unix.S_IFDIR {
-		return false, err
-	}
-	dir, root, err := openDirSwitchDirectory(parent, parentPath, skillsName, adoptIdentity(&stat))
 	if err != nil {
-		return false, err
+		return false, asTargetConflict(err)
+	}
+	if statMode(stat.Mode) != unix.S_IFDIR {
+		return false, nil
+	}
+	dir, root, err := openDirectory(parent, parentPath, skillsName, identity)
+	if err != nil {
+		return false, asTargetConflict(err)
 	}
 	defer dir.Close()
 	defer root.Close()
-	actual, err := scanDirSwitchEntries(root)
+	actual, err := scanEntries(root)
 	if err != nil {
-		return false, err
+		return false, asTargetConflict(err)
 	}
 	expected := replacementDirManifest(st, target, name)
 	if len(actual) != len(expected) {
@@ -376,14 +405,11 @@ func startDirSwitch(st *store.Store, a agent.Agent, name string, txn *TxnRecord,
 	}
 	defer parent.Close()
 	defer parentRoot.Close()
-	if err := validateCurrentAdoptEntry(parent, target, name); err != nil {
+	originalIdentity, originalStat, err := validateCurrentAdoptEntryStat(parent, target, name)
+	if err != nil {
 		return dirSwitchEntryConflict("original skills link", err)
 	}
 	if err := validateWholeDirTarget(target); err != nil {
-		return err
-	}
-	originalStat, err := statAdoptEntry(int(parent.Fd()), filepath.Base(target.SkillsDir))
-	if err != nil {
 		return err
 	}
 
@@ -411,20 +437,22 @@ func startDirSwitch(st *store.Store, a agent.Agent, name string, txn *TxnRecord,
 	if err := parentRoot.Mkdir(siblingName, 0o755); err != nil {
 		return fmt.Errorf("create replacement skills directory %s: %w", sibling, err)
 	}
-	siblingStat, err := statAdoptEntry(int(parent.Fd()), siblingName)
+	siblingIdentity, siblingStat, err := store.EntryIdentityAt(int(parent.Fd()), siblingName)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	if statMode(siblingStat.Mode) != unix.S_IFDIR {
 		return fmt.Errorf("%w: replacement skills entry %s is not a directory", ErrTxnConflict, sibling)
 	}
-	sw.SiblingIdentity = adoptIdentity(&siblingStat)
+	sw.SiblingIdentity = siblingIdentity
 	if err := WriteTxn(st, txn); err != nil {
 		return err
 	}
-	siblingDir, siblingRoot, err := openDirSwitchDirectory(parent, parentPath, siblingName, sw.SiblingIdentity)
+	// EntryIdentityAt admitted the name above; OpenIdentity must return the same
+	// kernel handle when the descriptor below still names that object.
+	siblingDir, siblingRoot, _, err := openDirSwitchDirectoryObservedWithCapture(parent, parentPath, siblingName, sw.SiblingIdentity, store.OpenIdentity)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	for i := range sw.SiblingManifest {
 		entry := &sw.SiblingManifest[i]
@@ -440,18 +468,18 @@ func startDirSwitch(st *store.Store, a agent.Agent, name string, txn *TxnRecord,
 				return err
 			}
 		}
-		created, err := statAdoptEntry(int(siblingDir.Fd()), entry.Name)
+		createdIdentity, created, err := store.EntryIdentityAt(int(siblingDir.Fd()), entry.Name)
 		if err != nil {
 			_ = siblingRoot.Close()
 			_ = siblingDir.Close()
-			return err
+			return asDirSwitchArtifactConflict(err)
 		}
 		if statMode(created.Mode) != unix.S_IFLNK {
 			_ = siblingRoot.Close()
 			_ = siblingDir.Close()
 			return fmt.Errorf("%w: replacement child %s/%s changed type", ErrTxnConflict, sibling, entry.Name)
 		}
-		entry.Identity = adoptIdentity(&created)
+		entry.Identity = createdIdentity
 	}
 	if err := WriteTxn(st, txn); err != nil {
 		_ = siblingRoot.Close()
@@ -471,7 +499,7 @@ func startDirSwitch(st *store.Store, a agent.Agent, name string, txn *TxnRecord,
 	if err := validateWholeDirTargetAndSkill(target, name); err != nil {
 		return err
 	}
-	if err := validateDirSwitchSibling(parent, parentPath, siblingName, sw, false); err != nil {
+	if _, err := observeDirSwitchSibling(parent, parentPath, siblingName, sw, sw.SiblingIdentity); err != nil {
 		return err
 	}
 	backup, err := dirSwitchBackupName(parentPath)
@@ -479,7 +507,7 @@ func startDirSwitch(st *store.Store, a agent.Agent, name string, txn *TxnRecord,
 		return err
 	}
 	sw.Backup = backup
-	sw.BackupIdentity = target.EntryIdentity
+	sw.BackupIdentity = originalIdentity
 	sw.BackupMode = uint32(checkedAgentFileMode(uint32(originalStat.Mode)))
 	linkArchive, err := ensureAdoptLinkArchive(st, wholeDirAdoptLinkArchive(target, name, sw))
 	if err != nil {
@@ -539,7 +567,7 @@ func resumeDirSwitch(st *store.Store, a agent.Agent, name string, txn *TxnRecord
 				return statErr
 			}
 		}
-		if !adoptIdentityValid(sw.SiblingIdentity) {
+		if !sw.SiblingIdentity.Valid() {
 			if err := reclaimUnjournalledDirSwitchSibling(parent, parentPath, siblingName); err != nil {
 				return err
 			}
@@ -588,11 +616,11 @@ func reclaimUnjournalledDirSwitchSibling(parent *os.File, parentPath, name strin
 	retired := unjournalledDirSwitchRetiredName(name)
 	livePresent, err := adoptNamePresent(parent, name)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	retiredPresent, err := adoptNamePresent(parent, retired)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	if livePresent && retiredPresent {
 		return fmt.Errorf("%w: unrecorded replacement directory exists at live and retired names", ErrTxnConflict)
@@ -604,21 +632,24 @@ func reclaimUnjournalledDirSwitchSibling(parent *os.File, parentPath, name strin
 	if retiredPresent {
 		active = retired
 	}
-	observed, err := statAdoptEntry(int(parent.Fd()), active)
+	observedIdentity, observed, err := store.EntryIdentityAt(int(parent.Fd()), active)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	if statMode(observed.Mode) != unix.S_IFDIR {
 		return fmt.Errorf("%w: replacement entry %s exists without a recorded identity and is not a directory", ErrTxnConflict, display)
 	}
 	if livePresent {
 		if err := store.RenameNoReplaceAt(parent, name, parent, retired); err != nil {
-			return fmt.Errorf("retire unrecorded replacement directory %s: %w", display, err)
+			return asDirSwitchArtifactConflict(fmt.Errorf("retire unrecorded replacement directory %s: %w", display, err))
 		}
 	}
 	renamedHere := livePresent
-	moved, err := statAdoptEntry(int(parent.Fd()), retired)
-	if err != nil || adoptIdentity(&moved) != adoptIdentity(&observed) || statMode(moved.Mode) != unix.S_IFDIR {
+	movedIdentity, moved, err := store.EntryIdentityAt(int(parent.Fd()), retired)
+	if err != nil {
+		return asDirSwitchArtifactConflict(fmt.Errorf("capture retired unrecorded replacement directory: %w", err))
+	}
+	if !movedIdentity.Same(observedIdentity) || statMode(moved.Mode) != unix.S_IFDIR {
 		mismatch := fmt.Errorf("%w: unrecorded replacement directory %s changed at retirement", ErrTxnConflict, display)
 		if renamedHere {
 			if restoreErr := store.RestoreRetiredAt(parent, retired, name); restoreErr != nil {
@@ -670,12 +701,16 @@ func completeDirSwitch(st *store.Store, target AdoptTarget, name string, txn *Tx
 	skillsName := filepath.Base(target.SkillsDir)
 	siblingName := filepath.Base(sw.Sibling)
 	backupName := filepath.Base(sw.Backup)
+	// The record is admission evidence only on paths already landed before
+	// this invocation. A local landing must overwrite it before the shared tail.
+	landedSiblingIdentity := sw.SiblingIdentity
 
 	if sw.Stage == "swapped" {
-		entry, statErr := statAdoptEntry(int(parent.Fd()), skillsName)
+		entryIdentity, entry, statErr := store.EntryIdentityAt(int(parent.Fd()), skillsName)
 		switch {
-		case statErr == nil && adoptIdentity(&entry) == target.EntryIdentity:
-			if err := validateCurrentAdoptEntry(parent, target, name); err != nil {
+		case statErr == nil && entryIdentity.Same(target.EntryIdentity):
+			observedOriginal, _, err := validateCurrentAdoptEntryStat(parent, target, name)
+			if err != nil {
 				return dirSwitchEntryConflict("original skills link", err)
 			}
 			if err := requireDirSwitchEntryAbsent(parent, backupName, "backup"); err != nil {
@@ -684,40 +719,40 @@ func completeDirSwitch(st *store.Store, target AdoptTarget, name string, txn *Tx
 			if err := validateWholeDirTargetAndSkill(target, name); err != nil {
 				return err
 			}
-			if err := validateDirSwitchSibling(parent, parentPath, siblingName, sw, false); err != nil {
+			if _, err := observeDirSwitchSibling(parent, parentPath, siblingName, sw, sw.SiblingIdentity); err != nil {
 				return err
 			}
 			if err := renameDirSwitchEntry(parent, skillsName, backupName, "archive original whole-directory link"); err != nil {
 				return err
 			}
-			if err := validateDirSwitchBackup(parent, target, sw); err != nil {
+			if _, err := observeDirSwitchBackup(parent, target, sw, observedOriginal); err != nil {
 				return restoreUnexpectedDirSwitchMoveAfterError(parent, backupName, skillsName, err)
 			}
 			if err := h.fire(h.afterDirSwitchSwap); err != nil {
 				return err
 			}
 		case errors.Is(statErr, unix.ENOENT):
-			if err := validateDirSwitchBackup(parent, target, sw); err != nil {
+			if _, err := observeDirSwitchBackup(parent, target, sw, sw.BackupIdentity); err != nil {
 				return err
 			}
 		case statErr == nil && statMode(entry.Mode) == unix.S_IFDIR:
-			if err := validateDirSwitchSibling(parent, parentPath, skillsName, sw, false); err != nil {
+			if _, err := observeDirSwitchSibling(parent, parentPath, skillsName, sw, sw.SiblingIdentity); err != nil {
 				if absentErr := requireDirSwitchEntryAbsent(parent, backupName, "backup"); absentErr == nil {
 					return dirSwitchEntryConflict("skills entry", err)
 				}
 				return err
 			}
-			if err := validateDirSwitchBackup(parent, target, sw); err != nil {
+			if _, err := observeDirSwitchBackup(parent, target, sw, sw.BackupIdentity); err != nil {
 				return err
 			}
-			// Landed: the target is not re-validated at all. The replacement is
-			// in place and the only operation left is removing fu's own
-			// backup, which validateDirSwitchBackup already proves by inode,
-			// mode and raw link text. Checking the user's directory here
-			// protected nothing and refused everything: first by digest
-			// (round 18 I6), then by child inode (round 19), and even with
-			// every failure mode tagged it still wedged, because the abandon's
-			// own landed arm re-runs the same check and refuses identically.
+			// Landed: the target is not re-validated at all. The replacement is in place
+			// and the only operation left is removing fu's own backup, which
+			// observeDirSwitchBackup already proves by device, inode, file handle, mode
+			// and raw link text. Checking the user's directory here protected nothing
+			// and refused everything: first by digest (round 18 I6), then by child inode
+			// (round 19), and even with every failure mode tagged it still wedged,
+			// because the abandon's own landed arm re-runs the same check and refuses
+			// identically.
 			goto landed
 		default:
 			return dirSwitchEntryConflict("skills entry", statErr)
@@ -726,17 +761,21 @@ func completeDirSwitch(st *store.Store, target AdoptTarget, name string, txn *Tx
 		if err := validateWholeDirTargetAndSkill(target, name); err != nil {
 			return err
 		}
-		if err := validateDirSwitchSibling(parent, parentPath, siblingName, sw, false); err != nil {
-			return err
-		}
-		if err := renameDirSwitchEntry(parent, siblingName, skillsName, "land replacement skills directory"); err != nil {
-			return err
-		}
-		if err := validateDirSwitchSibling(parent, parentPath, skillsName, sw, false); err != nil {
-			return restoreUnexpectedDirSwitchMoveAfterError(parent, skillsName, siblingName, err)
-		}
-		if err := h.fire(h.afterDirSwitchLand); err != nil {
-			return err
+		{
+			observedSibling, err := observeDirSwitchSibling(parent, parentPath, siblingName, sw, sw.SiblingIdentity)
+			if err != nil {
+				return err
+			}
+			if err := renameDirSwitchEntry(parent, siblingName, skillsName, "land replacement skills directory"); err != nil {
+				return err
+			}
+			landedSiblingIdentity, err = observeDirSwitchSibling(parent, parentPath, skillsName, sw, observedSibling)
+			if err != nil {
+				return restoreUnexpectedDirSwitchMoveAfterError(parent, skillsName, siblingName, err)
+			}
+			if err := h.fire(h.afterDirSwitchLand); err != nil {
+				return err
+			}
 		}
 	landed:
 		sw.Stage = "done"
@@ -745,17 +784,17 @@ func completeDirSwitch(st *store.Store, target AdoptTarget, name string, txn *Tx
 		}
 	}
 
-	if err := validateDirSwitchSibling(parent, parentPath, skillsName, sw, false); err != nil {
+	if _, err := observeDirSwitchSibling(parent, parentPath, skillsName, sw, landedSiblingIdentity); err != nil {
 		return err
 	}
-	// The target is deliberately not re-validated here. See the landed arms
-	// above: once the replacement is in place, the only operation left is
-	// removing fu's own backup, and removeDirSwitchBackup proves that object
-	// by inode, mode and raw link text on its own. Three rounds of narrowing
-	// this check (digest, then child inode, then every failure mode tagged)
-	// each left a shape that refused an ordinary user action and wedged every
-	// later write command; the check was never protecting anything the backup
-	// validation does not already establish.
+	// The target is deliberately not re-validated here. See the landed arms above:
+	// once the replacement is in place, the only operation left is removing fu's
+	// own backup, and removeDirSwitchBackup proves that object by device, inode,
+	// file handle, mode and raw link text on its own. Three rounds of narrowing
+	// this check (digest, then child inode, then every failure mode tagged) each
+	// left a shape that refused an ordinary user action and wedged every later
+	// write command; the check was never protecting anything the backup validation
+	// does not already establish.
 	if err := removeDirSwitchBackup(st, parent, target, name, sw, h); err != nil {
 		return err
 	}
@@ -790,6 +829,16 @@ func asTargetConflict(err error) error {
 	return fmt.Errorf("%w: %w", errAdoptTargetChanged, err)
 }
 
+// asDirSwitchArtifactConflict marks failures while validating artifacts fu
+// created. Unlike asTargetConflict, it must remain a hard stop rather than
+// allowing the agent to be isolated and the switch abandoned.
+func asDirSwitchArtifactConflict(err error) error {
+	if err == nil || errors.Is(err, ErrTxnConflict) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrTxnConflict, err)
+}
+
 func validateWholeDirTarget(target AdoptTarget) error {
 	return asTargetConflict(validateWholeDirTargetInner(target))
 }
@@ -802,7 +851,7 @@ func validateWholeDirTargetInner(target AdoptTarget) error {
 	defer root.Close()
 	manifest, err := scanDirSwitchEntries(root)
 	if err != nil {
-		return fmt.Errorf("%w: inspect whole-directory target %s: %v", ErrTxnConflict, target.SourcePath, err)
+		return dirSwitchInspectionError("whole-directory target", target.SourcePath, err)
 	}
 	if !sameDirSwitchTargetEntries(manifest, target.TargetManifest) {
 		return dirSwitchTargetConflict(target, manifest)
@@ -902,56 +951,80 @@ func openDirSwitchParent(target AdoptTarget) (*os.File, *os.Root, string, error)
 	return parent, root, parentPath, nil
 }
 
+// openDirSwitchDirectory is the default adapter for seams that do not need the
+// freshly observed root identity.
 func openDirSwitchDirectory(parent *os.File, parentPath, name string, expected store.FileIdentity) (*os.File, *os.Root, error) {
+	dir, root, _, err := openDirSwitchDirectoryObservedWithCapture(parent, parentPath, name, expected, store.OpenIdentity)
+	return dir, root, err
+}
+
+func openDirSwitchDirectoryObservedWithCapture(
+	parent *os.File,
+	parentPath, name string,
+	expected store.FileIdentity,
+	capture openIdentityCapture,
+) (*os.File, *os.Root, store.FileIdentity, error) {
 	defer keepDescriptorOwnersAlive(parent)
 	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, nil, &os.PathError{Op: "openat", Path: filepath.Join(parentPath, name), Err: err}
+		return nil, nil, store.FileIdentity{}, &os.PathError{Op: "openat", Path: filepath.Join(parentPath, name), Err: err}
 	}
 	dir := os.NewFile(uintptr(fd), filepath.Join(parentPath, name))
 	if dir == nil {
 		_ = unix.Close(fd)
-		return nil, nil, fmt.Errorf("open replacement directory %s: invalid descriptor", name)
+		return nil, nil, store.FileIdentity{}, fmt.Errorf("open replacement directory %s: invalid descriptor", name)
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		_ = dir.Close()
-		return nil, nil, err
-	}
-	if !adoptIdentityValid(expected) || adoptIdentity(&stat) != expected {
-		_ = dir.Close()
-		return nil, nil, fmt.Errorf("%w: whole-directory switch directory %s was replaced", ErrTxnConflict, filepath.Join(parentPath, name))
-	}
-	root, err := pairBoundAdoptRoot(filepath.Join(parentPath, name), dir, expected)
+	identity, _, err := capture(fd)
 	if err != nil {
 		_ = dir.Close()
-		return nil, nil, err
+		return nil, nil, store.FileIdentity{}, err
 	}
-	return dir, root, nil
+	if !expected.Valid() || !identity.Same(expected) {
+		_ = dir.Close()
+		return nil, nil, store.FileIdentity{}, fmt.Errorf("%w: whole-directory switch directory %s was replaced", ErrTxnConflict, filepath.Join(parentPath, name))
+	}
+	// The name-based expected identity and both descriptor captures rely on
+	// EntryIdentityAt and OpenIdentity encoding the same kernel handle.
+	root, err := pairBoundAdoptRootWithIdentityCapture(filepath.Join(parentPath, name), dir, expected, capture)
+	if err != nil {
+		_ = dir.Close()
+		return nil, nil, store.FileIdentity{}, err
+	}
+	return dir, root, identity, nil
 }
 
-func validateDirSwitchSibling(parent *os.File, parentPath, name string, sw *DirSwitchState, partial bool) error {
-	dir, root, err := openDirSwitchDirectory(parent, parentPath, name, sw.SiblingIdentity)
+func observeDirSwitchSibling(parent *os.File, parentPath, name string, sw *DirSwitchState, expectedIdentity store.FileIdentity) (store.FileIdentity, error) {
+	return observeDirSwitchSiblingWithCapture(parent, parentPath, name, sw, expectedIdentity, store.OpenIdentity)
+}
+
+func observeDirSwitchSiblingWithCapture(
+	parent *os.File,
+	parentPath, name string,
+	sw *DirSwitchState,
+	expectedIdentity store.FileIdentity,
+	capture openIdentityCapture,
+) (store.FileIdentity, error) {
+	dir, root, observedIdentity, err := openDirSwitchDirectoryObservedWithCapture(parent, parentPath, name, expectedIdentity, capture)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) || errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("%w: %w: whole-directory replacement %s is missing; the preserved original is at %s", ErrTxnConflict, errDirSwitchReplacementMissing, filepath.Join(parentPath, name), sw.Backup)
+			return store.FileIdentity{}, fmt.Errorf("%w: %w: whole-directory replacement %s is missing; the preserved original is at %s", ErrTxnConflict, errDirSwitchReplacementMissing, filepath.Join(parentPath, name), sw.Backup)
 		}
-		return err
+		return store.FileIdentity{}, asDirSwitchArtifactConflict(err)
 	}
 	defer dir.Close()
 	defer root.Close()
 	manifest, err := scanDirSwitchEntries(root)
 	if err != nil {
-		return fmt.Errorf("%w: inspect replacement directory %s: %v", ErrTxnConflict, filepath.Join(parentPath, name), err)
+		return store.FileIdentity{}, dirSwitchInspectionError("replacement directory", filepath.Join(parentPath, name), err)
 	}
-	if partial {
-		if !dirSwitchManifestSubset(manifest, sw.SiblingManifest) {
-			return fmt.Errorf("%w: partially built replacement directory %s contains an undeclared entry", ErrTxnConflict, filepath.Join(parentPath, name))
-		}
-	} else if !sameDirSwitchEntries(manifest, sw.SiblingManifest) {
-		return fmt.Errorf("%w: replacement directory %s no longer matches its recorded manifest", ErrTxnConflict, filepath.Join(parentPath, name))
+	if !sameDirSwitchEntries(manifest, sw.SiblingManifest) {
+		return store.FileIdentity{}, fmt.Errorf("%w: replacement directory %s no longer matches its recorded manifest", ErrTxnConflict, filepath.Join(parentPath, name))
 	}
-	return nil
+	return observedIdentity, nil
+}
+
+func dirSwitchInspectionError(object, path string, cause error) error {
+	return fmt.Errorf("%w: inspect %s %s: %w", ErrTxnConflict, object, path, cause)
 }
 
 func removeDirSwitchSibling(parent *os.File, parentPath, name string, sw *DirSwitchState, partial bool, h hooks) error {
@@ -959,11 +1032,11 @@ func removeDirSwitchSibling(parent *os.File, parentPath, name string, sw *DirSwi
 	rootRetired := dirSwitchRetiredName(sw, "root", name)
 	originalPresent, err := adoptNamePresent(parent, name)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	retiredPresent, err := adoptNamePresent(parent, rootRetired)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	if originalPresent && retiredPresent {
 		return fmt.Errorf("%w: replacement directory exists at both live and retired names", ErrTxnConflict)
@@ -975,18 +1048,18 @@ func removeDirSwitchSibling(parent *os.File, parentPath, name string, sw *DirSwi
 	if retiredPresent {
 		active = rootRetired
 	}
-	dir, root, err := openDirSwitchDirectory(parent, parentPath, active, sw.SiblingIdentity)
+	dir, root, observedRootIdentity, err := openDirSwitchDirectoryObservedWithCapture(parent, parentPath, active, sw.SiblingIdentity, store.OpenIdentity)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	if err := root.Close(); err != nil {
 		_ = dir.Close()
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	entries, err := dir.ReadDir(-1)
 	if err != nil {
 		_ = dir.Close()
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	want := make(map[string]DirSwitchEntry, len(sw.SiblingManifest))
 	retiredNames := make(map[string]DirSwitchEntry, len(sw.SiblingManifest))
@@ -1023,7 +1096,7 @@ func removeDirSwitchSibling(parent *os.File, parentPath, name string, sw *DirSwi
 			continue
 		}
 		var retireErr error
-		if adoptIdentityValid(entry.Identity) {
+		if entry.Identity.Valid() {
 			retireErr = retireDirSwitchLink(dir, filepath.Join(parentPath, active), entry, sw, h.beforeDirSwitchChildRetire)
 		} else if partial {
 			retireErr = retireUnjournalledDirSwitchLink(dir, filepath.Join(parentPath, active), entry, sw, h.beforeDirSwitchChildRetire)
@@ -1036,21 +1109,35 @@ func removeDirSwitchSibling(parent *os.File, parentPath, name string, sw *DirSwi
 		}
 	}
 	if err := dir.Close(); err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	renamedHere := !retiredPresent
+	// This observation admits an already-retired root. A local retirement
+	// must replace it with the observation immediately preceding the rename.
+	postRetireIdentity := observedRootIdentity
 	if renamedHere {
+		liveIdentity, liveStat, captureErr := store.EntryIdentityAt(int(parent.Fd()), name)
+		if captureErr != nil {
+			return asDirSwitchArtifactConflict(fmt.Errorf("capture replacement directory before retirement: %w", captureErr))
+		}
+		if !liveIdentity.Same(sw.SiblingIdentity) || statMode(liveStat.Mode) != unix.S_IFDIR {
+			return fmt.Errorf("%w: replacement directory changed before retirement", ErrTxnConflict)
+		}
+		postRetireIdentity = liveIdentity
 		if h.beforeDirSwitchRootRetire != nil {
 			if err := h.beforeDirSwitchRootRetire(filepath.Join(parentPath, name)); err != nil {
 				return err
 			}
 		}
 		if err := store.RenameNoReplaceAt(parent, name, parent, rootRetired); err != nil {
-			return fmt.Errorf("retire replacement directory %s: %w", filepath.Join(parentPath, name), err)
+			return asDirSwitchArtifactConflict(fmt.Errorf("retire replacement directory %s: %w", filepath.Join(parentPath, name), err))
 		}
 	}
-	stat, err := statAdoptEntry(int(parent.Fd()), rootRetired)
-	if err != nil || adoptIdentity(&stat) != sw.SiblingIdentity || statMode(stat.Mode) != unix.S_IFDIR {
+	identity, stat, err := store.EntryIdentityAt(int(parent.Fd()), rootRetired)
+	if err != nil {
+		return asDirSwitchArtifactConflict(fmt.Errorf("capture retired replacement directory: %w", err))
+	}
+	if !identity.Same(postRetireIdentity) || statMode(stat.Mode) != unix.S_IFDIR {
 		mismatch := fmt.Errorf("%w: replacement directory changed at retirement", ErrTxnConflict)
 		if renamedHere {
 			if restoreErr := store.RestoreRetiredAt(parent, rootRetired, name); restoreErr != nil {
@@ -1060,7 +1147,7 @@ func removeDirSwitchSibling(parent *os.File, parentPath, name string, sw *DirSwi
 		return mismatch
 	}
 	if err := unix.Unlinkat(int(parent.Fd()), rootRetired, unix.AT_REMOVEDIR); err != nil {
-		return fmt.Errorf("remove retired replacement directory: %w", err)
+		return asDirSwitchArtifactConflict(fmt.Errorf("remove retired replacement directory: %w", err))
 	}
 	return nil
 }
@@ -1074,11 +1161,11 @@ func retireUnjournalledDirSwitchLink(dir *os.File, display string, expected DirS
 	retired := dirSwitchRetiredName(sw, "child", expected.Name)
 	livePresent, err := adoptNamePresent(dir, expected.Name)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	retiredPresent, err := adoptNamePresent(dir, retired)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	if livePresent && retiredPresent {
 		return fmt.Errorf("%w: replacement child %q exists at live and retired names", ErrTxnConflict, expected.Name)
@@ -1090,16 +1177,16 @@ func retireUnjournalledDirSwitchLink(dir *os.File, display string, expected DirS
 	if retiredPresent {
 		active = retired
 	}
-	observed, err := statAdoptEntry(int(dir.Fd()), active)
+	observedIdentity, observed, err := store.EntryIdentityAt(int(dir.Fd()), active)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	if statMode(observed.Mode) != unix.S_IFLNK {
 		return fmt.Errorf("%w: unjournalled replacement child %q is not a symlink", ErrTxnConflict, expected.Name)
 	}
 	raw, err := readAdoptLink(int(dir.Fd()), active)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	if raw != expected.LinkTarget {
 		return fmt.Errorf("%w: unjournalled replacement child %q changed target", ErrTxnConflict, expected.Name)
@@ -1111,11 +1198,14 @@ func retireUnjournalledDirSwitchLink(dir *os.File, display string, expected DirS
 			}
 		}
 		if err := store.RenameNoReplaceAt(dir, expected.Name, dir, retired); err != nil {
-			return err
+			return asDirSwitchArtifactConflict(err)
 		}
 	}
-	moved, err := statAdoptEntry(int(dir.Fd()), retired)
-	if err != nil || adoptIdentity(&moved) != adoptIdentity(&observed) || statMode(moved.Mode) != unix.S_IFLNK {
+	movedIdentity, moved, err := store.EntryIdentityAt(int(dir.Fd()), retired)
+	if err != nil {
+		return asDirSwitchArtifactConflict(err)
+	}
+	if !movedIdentity.Same(observedIdentity) || statMode(moved.Mode) != unix.S_IFLNK {
 		mismatch := fmt.Errorf("%w: unjournalled replacement child %q changed at retirement", ErrTxnConflict, expected.Name)
 		if livePresent {
 			if restoreErr := store.RestoreRetiredAt(dir, retired, expected.Name); restoreErr != nil {
@@ -1125,7 +1215,16 @@ func retireUnjournalledDirSwitchLink(dir *os.File, display string, expected DirS
 		return mismatch
 	}
 	raw, err = readAdoptLink(int(dir.Fd()), retired)
-	if err != nil || raw != expected.LinkTarget {
+	if err != nil {
+		artifactErr := asDirSwitchArtifactConflict(err)
+		if livePresent {
+			if restoreErr := store.RestoreRetiredAt(dir, retired, expected.Name); restoreErr != nil {
+				return errors.Join(artifactErr, restoreErr)
+			}
+		}
+		return artifactErr
+	}
+	if raw != expected.LinkTarget {
 		mismatch := fmt.Errorf("%w: unjournalled replacement child %q changed target at retirement", ErrTxnConflict, expected.Name)
 		if livePresent {
 			if restoreErr := store.RestoreRetiredAt(dir, retired, expected.Name); restoreErr != nil {
@@ -1134,7 +1233,10 @@ func retireUnjournalledDirSwitchLink(dir *os.File, display string, expected DirS
 		}
 		return mismatch
 	}
-	return unix.Unlinkat(int(dir.Fd()), retired, 0)
+	if err := unix.Unlinkat(int(dir.Fd()), retired, 0); err != nil {
+		return asDirSwitchArtifactConflict(err)
+	}
+	return nil
 }
 
 func retireDirSwitchLink(dir *os.File, display string, expected DirSwitchEntry, sw *DirSwitchState, before func(string) error) error {
@@ -1142,11 +1244,11 @@ func retireDirSwitchLink(dir *os.File, display string, expected DirSwitchEntry, 
 	retired := dirSwitchRetiredName(sw, "child", expected.Name)
 	livePresent, err := adoptNamePresent(dir, expected.Name)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	retiredPresent, err := adoptNamePresent(dir, retired)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	if livePresent && retiredPresent {
 		return fmt.Errorf("%w: replacement child %q exists at live and retired names", ErrTxnConflict, expected.Name)
@@ -1154,20 +1256,25 @@ func retireDirSwitchLink(dir *os.File, display string, expected DirSwitchEntry, 
 	if !livePresent && !retiredPresent {
 		return fmt.Errorf("%w: replacement child %q disappeared during cleanup", ErrTxnConflict, expected.Name)
 	}
+	// The record admits a previously retired child; a live-name path must
+	// overwrite it before renaming and carry that proof through deletion.
+	postRetireIdentity := expected.Identity
 	if livePresent {
-		if err := validateDirSwitchLink(dir, expected.Name, expected); err != nil {
+		observedIdentity, err := observeDirSwitchLink(dir, expected.Name, expected, expected.Identity)
+		if err != nil {
 			return err
 		}
+		postRetireIdentity = observedIdentity
 		if before != nil {
 			if err := before(filepath.Join(display, expected.Name)); err != nil {
 				return err
 			}
 		}
 		if err := store.RenameNoReplaceAt(dir, expected.Name, dir, retired); err != nil {
-			return err
+			return asDirSwitchArtifactConflict(err)
 		}
 	}
-	if err := validateDirSwitchLink(dir, retired, expected); err != nil {
+	if _, err := observeDirSwitchLink(dir, retired, expected, postRetireIdentity); err != nil {
 		if livePresent {
 			if restoreErr := store.RestoreRetiredAt(dir, retired, expected.Name); restoreErr != nil {
 				return errors.Join(err, restoreErr)
@@ -1176,54 +1283,78 @@ func retireDirSwitchLink(dir *os.File, display string, expected DirSwitchEntry, 
 		return err
 	}
 	if err := unix.Unlinkat(int(dir.Fd()), retired, 0); err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	return nil
 }
 
-func validateDirSwitchLink(parent *os.File, name string, expected DirSwitchEntry) error {
+func observeDirSwitchLink(parent *os.File, name string, expected DirSwitchEntry, expectedIdentity store.FileIdentity) (store.FileIdentity, error) {
+	return observeDirSwitchLinkWithCapture(parent, name, expected, expectedIdentity, store.EntryIdentityAt)
+}
+
+func observeDirSwitchLinkWithCapture(
+	parent *os.File,
+	name string,
+	expected DirSwitchEntry,
+	expectedIdentity store.FileIdentity,
+	capture func(int, string) (store.FileIdentity, unix.Stat_t, error),
+) (store.FileIdentity, error) {
 	defer keepDescriptorOwnersAlive(parent)
-	stat, err := statAdoptEntry(int(parent.Fd()), name)
+	identity, stat, err := capture(int(parent.Fd()), name)
 	if err != nil {
-		return err
+		return store.FileIdentity{}, asDirSwitchArtifactConflict(err)
 	}
-	if adoptIdentity(&stat) != expected.Identity || statMode(stat.Mode) != unix.S_IFLNK {
-		return fmt.Errorf("%w: replacement child %q changed identity or type", ErrTxnConflict, expected.Name)
+	if !identity.Same(expectedIdentity) || statMode(stat.Mode) != unix.S_IFLNK {
+		return store.FileIdentity{}, fmt.Errorf("%w: replacement child %q changed identity or type", ErrTxnConflict, expected.Name)
 	}
 	raw, err := readAdoptLink(int(parent.Fd()), name)
 	if err != nil {
-		return err
+		return store.FileIdentity{}, asDirSwitchArtifactConflict(err)
 	}
 	if raw != expected.LinkTarget {
-		return fmt.Errorf("%w: replacement child %q changed target", ErrTxnConflict, expected.Name)
+		return store.FileIdentity{}, fmt.Errorf("%w: replacement child %q changed target", ErrTxnConflict, expected.Name)
 	}
-	return nil
+	return identity, nil
 }
 
-func validateDirSwitchBackup(parent *os.File, target AdoptTarget, sw *DirSwitchState) error {
+func observeDirSwitchBackup(parent *os.File, target AdoptTarget, sw *DirSwitchState, expectedIdentity store.FileIdentity) (store.FileIdentity, error) {
+	return observeDirSwitchBackupWithCapture(parent, target, sw, expectedIdentity, store.EntryIdentityAt)
+}
+
+func observeDirSwitchBackupWithCapture(
+	parent *os.File,
+	target AdoptTarget,
+	sw *DirSwitchState,
+	expectedIdentity store.FileIdentity,
+	capture func(int, string) (store.FileIdentity, unix.Stat_t, error),
+) (store.FileIdentity, error) {
 	defer keepDescriptorOwnersAlive(parent)
 	if sw.Backup == "" {
-		return fmt.Errorf("%w: whole-directory switch has no backup path", ErrTxnConflict)
+		return store.FileIdentity{}, fmt.Errorf("%w: whole-directory switch has no backup path", ErrTxnConflict)
 	}
 	name := filepath.Base(sw.Backup)
-	stat, err := statAdoptEntry(int(parent.Fd()), name)
+	identity, stat, err := capture(int(parent.Fd()), name)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
-			return fmt.Errorf("%w: whole-directory backup %s is missing", ErrTxnConflict, sw.Backup)
+			return store.FileIdentity{}, fmt.Errorf("%w: whole-directory backup %s is missing", ErrTxnConflict, sw.Backup)
 		}
-		return err
+		return store.FileIdentity{}, asDirSwitchArtifactConflict(err)
 	}
-	if adoptIdentity(&stat) != sw.BackupIdentity || sw.BackupIdentity != target.EntryIdentity || statMode(stat.Mode) != unix.S_IFLNK {
-		return fmt.Errorf("%w: whole-directory backup %s was replaced", ErrTxnConflict, sw.Backup)
+	// Same admits legacy records only when the missing handle is already in the
+	// record. The second clause prevents a handle-bearing record from being
+	// downgraded by a handle-less artifact observation.
+	if !identity.Same(expectedIdentity) || !sw.BackupIdentity.Same(target.EntryIdentity) ||
+		(target.EntryIdentity.Handle != "" && sw.BackupIdentity.Handle == "") || statMode(stat.Mode) != unix.S_IFLNK {
+		return store.FileIdentity{}, fmt.Errorf("%w: whole-directory backup %s was replaced", ErrTxnConflict, sw.Backup)
 	}
 	raw, err := readAdoptLink(int(parent.Fd()), name)
 	if err != nil {
-		return err
+		return store.FileIdentity{}, asDirSwitchArtifactConflict(err)
 	}
 	if raw != target.LinkTarget {
-		return fmt.Errorf("%w: whole-directory backup %s changed target", ErrTxnConflict, sw.Backup)
+		return store.FileIdentity{}, fmt.Errorf("%w: whole-directory backup %s changed target", ErrTxnConflict, sw.Backup)
 	}
-	return nil
+	return identity, nil
 }
 
 func removeDirSwitchBackup(st *store.Store, parent *os.File, target AdoptTarget, skillName string, sw *DirSwitchState, h hooks) error {
@@ -1238,11 +1369,11 @@ func removeDirSwitchBackup(st *store.Store, parent *os.File, target AdoptTarget,
 	retired := dirSwitchRetiredName(sw, "backup", name)
 	livePresent, err := adoptNamePresent(parent, name)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	retiredPresent, err := adoptNamePresent(parent, retired)
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	if livePresent && retiredPresent {
 		return fmt.Errorf("%w: whole-directory backup exists at live and retired names", ErrTxnConflict)
@@ -1250,22 +1381,27 @@ func removeDirSwitchBackup(st *store.Store, parent *os.File, target AdoptTarget,
 	if !livePresent && !retiredPresent {
 		return nil
 	}
+	// The record admits a previously retired backup only. When its live
+	// name exists, overwrite this with the pre-rename proof before any unlink.
+	postRetireIdentity := sw.BackupIdentity
 	if livePresent {
-		if err := validateDirSwitchBackup(parent, target, sw); err != nil {
+		observedIdentity, err := observeDirSwitchBackup(parent, target, sw, sw.BackupIdentity)
+		if err != nil {
 			return err
 		}
+		postRetireIdentity = observedIdentity
 		if h.beforeDirSwitchBackupRetire != nil {
 			if err := h.beforeDirSwitchBackupRetire(sw.Backup); err != nil {
 				return err
 			}
 		}
 		if err := store.RenameNoReplaceAt(parent, name, parent, retired); err != nil {
-			return fmt.Errorf("retire archived whole-directory link %s: %w", sw.Backup, err)
+			return asDirSwitchArtifactConflict(fmt.Errorf("retire archived whole-directory link %s: %w", sw.Backup, err))
 		}
 	}
 	retiredState := *sw
 	retiredState.Backup = filepath.Join(filepath.Dir(sw.Backup), retired)
-	if err := validateDirSwitchBackup(parent, target, &retiredState); err != nil {
+	if _, err := observeDirSwitchBackup(parent, target, &retiredState, postRetireIdentity); err != nil {
 		if livePresent {
 			if restoreErr := store.RestoreRetiredAt(parent, retired, name); restoreErr != nil {
 				return errors.Join(err, restoreErr)
@@ -1274,7 +1410,7 @@ func removeDirSwitchBackup(st *store.Store, parent *os.File, target AdoptTarget,
 		return err
 	}
 	if err := unix.Unlinkat(int(parent.Fd()), retired, 0); err != nil {
-		return fmt.Errorf("remove archived whole-directory link %s: %w", sw.Backup, err)
+		return asDirSwitchArtifactConflict(fmt.Errorf("remove archived whole-directory link %s: %w", sw.Backup, err))
 	}
 	return nil
 }
@@ -1297,13 +1433,16 @@ func validateDirSwitchState(target AdoptTarget, sw *DirSwitchState) error {
 		if !validDirSwitchPath(sw.Backup, parent, ".fu-skills-old-") {
 			return fmt.Errorf("%w: whole-directory backup %q escapes its recorded parent", ErrTxnConflict, sw.Backup)
 		}
-		if !adoptIdentityValid(sw.SiblingIdentity) || sw.BackupIdentity != target.EntryIdentity ||
+		// A legacy pair with no handles remains admissible, while a handle-bearing
+		// target record may never be paired with a handle-less backup record.
+		if !sw.SiblingIdentity.Valid() || !sw.BackupIdentity.Valid() || !sw.BackupIdentity.Same(target.EntryIdentity) ||
+			(target.EntryIdentity.Handle != "" && sw.BackupIdentity.Handle == "") ||
 			os.FileMode(sw.BackupMode).Type() != os.ModeSymlink ||
 			!validAdoptLinkArchiveName(sw.LinkArchive) || len(sw.SiblingManifest) == 0 {
 			return fmt.Errorf("%w: whole-directory switch lacks persisted artifact ownership", ErrTxnConflict)
 		}
 		for _, entry := range sw.SiblingManifest {
-			if !adoptIdentityValid(entry.Identity) {
+			if !entry.Identity.Valid() {
 				return fmt.Errorf("%w: whole-directory switch child %q lacks persisted identity", ErrTxnConflict, entry.Name)
 			}
 		}
@@ -1334,7 +1473,7 @@ func requireDirSwitchEntryAbsent(parent *os.File, name, label string) error {
 		return nil
 	}
 	if err != nil {
-		return err
+		return asDirSwitchArtifactConflict(err)
 	}
 	return fmt.Errorf("%w: whole-directory %s %s already exists", ErrTxnConflict, label, name)
 }
@@ -1344,36 +1483,47 @@ func renameDirSwitchEntry(parent *os.File, oldName, newName, action string) erro
 		if errors.Is(err, unix.EEXIST) || errors.Is(err, fs.ErrExist) {
 			return fmt.Errorf("%w: %s would replace existing entry %s", ErrTxnConflict, action, newName)
 		}
-		return fmt.Errorf("%s: %w", action, err)
+		return asDirSwitchArtifactConflict(fmt.Errorf("%s: %w", action, err))
 	}
 	return nil
 }
 
 func restoreUnexpectedDirSwitchMove(parent *os.File, movedName, originalName string) error {
+	return restoreUnexpectedDirSwitchMoveWithCapture(parent, movedName, originalName, store.EntryIdentityAt)
+}
+
+func restoreUnexpectedDirSwitchMoveWithCapture(parent *os.File, movedName, originalName string, capture func(int, string) (store.FileIdentity, unix.Stat_t, error)) error {
 	defer keepDescriptorOwnersAlive(parent)
 	if _, err := statAdoptEntry(int(parent.Fd()), originalName); err == nil {
 		return fmt.Errorf("%w: cannot restore %s because %s is occupied", ErrTxnConflict, movedName, originalName)
 	} else if !errors.Is(err, unix.ENOENT) {
-		return fmt.Errorf("inspect restore destination %s: %w", originalName, err)
+		return asDirSwitchArtifactConflict(fmt.Errorf("inspect restore destination %s: %w", originalName, err))
 	}
-	return store.RenameNoReplaceAt(parent, movedName, parent, originalName)
+	observedIdentity, err := observeDirSwitchMovedEntry(parent, movedName, capture)
+	if err != nil {
+		return asDirSwitchArtifactConflict(err)
+	}
+	if err := store.RenameNoReplaceAt(parent, movedName, parent, originalName); err != nil {
+		return asDirSwitchArtifactConflict(err)
+	}
+	restoredIdentity, err := observeDirSwitchMovedEntry(parent, originalName, capture)
+	if err != nil {
+		return asDirSwitchArtifactConflict(err)
+	}
+	if !restoredIdentity.Same(observedIdentity) {
+		return fmt.Errorf("%w: restored entry %s changed during compensation", ErrTxnConflict, originalName)
+	}
+	return nil
+}
+
+func observeDirSwitchMovedEntry(parent *os.File, name string, capture func(int, string) (store.FileIdentity, unix.Stat_t, error)) (store.FileIdentity, error) {
+	defer keepDescriptorOwnersAlive(parent)
+	identity, _, err := capture(int(parent.Fd()), name)
+	return identity, err
 }
 
 func restoreUnexpectedDirSwitchMoveAfterError(parent *os.File, movedName, originalName string, primary error) error {
 	return errors.Join(primary, restoreUnexpectedDirSwitchMove(parent, movedName, originalName))
-}
-
-func dirSwitchManifestSubset(actual, expected []DirSwitchEntry) bool {
-	want := make(map[string]DirSwitchEntry, len(expected))
-	for _, entry := range expected {
-		want[entry.Name] = entry
-	}
-	for _, entry := range actual {
-		if expectedEntry, ok := want[entry.Name]; !ok || expectedEntry != entry {
-			return false
-		}
-	}
-	return true
 }
 
 func dirSwitchEntryConflict(label string, err error) error {

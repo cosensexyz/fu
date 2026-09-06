@@ -14,6 +14,7 @@ import (
 	"github.com/cosensexyz/fu/internal/skill"
 	"github.com/cosensexyz/fu/internal/source"
 	"github.com/cosensexyz/fu/internal/store"
+	"github.com/cosensexyz/fu/internal/testenv"
 )
 
 // crashRemoveAfterTxnClearedEnv, set to "1" in the environment, switches
@@ -336,11 +337,18 @@ func crashUpdateAfterTxnClearedChild() {
 // crashUpdateAfterTxnClearedChild() at its own entry. It returns the home
 // directory left in the post-crash state.
 func runCrashedUpdate(t *testing.T, testName string) string {
+	return runCrashedUpdateAfterInit(t, testName, nil)
+}
+
+func runCrashedUpdateAfterInit(t *testing.T, testName string, afterInit func(*store.Store)) string {
 	t.Helper()
 	home := filepath.Join(t.TempDir(), "home")
 	s, err := store.Init(home)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if afterInit != nil {
+		afterInit(s)
 	}
 	cfg, err := store.LoadConfig(s.ConfigPath())
 	if err != nil {
@@ -1790,8 +1798,9 @@ func TestPruneSettlesAnUpdateFamilyWhoseStagingOrphanIsGone(t *testing.T) {
 // Collectable); it is the recovery half that lied.
 func TestStatusDoesNotPromiseCollectionBlockedByAForeignStagingEntry(t *testing.T) {
 	crashUpdateAfterTxnClearedChild()
-
-	home := runCrashedUpdate(t, "TestStatusDoesNotPromiseCollectionBlockedByAForeignStagingEntry")
+	home := runCrashedUpdateAfterInit(t, "TestStatusDoesNotPromiseCollectionBlockedByAForeignStagingEntry", func(s *store.Store) {
+		skipUnlessReplacementDetectable(t, s.StagingDir())
+	})
 	s, err := store.Open(home)
 	if err != nil {
 		t.Fatal(err)
@@ -1814,10 +1823,38 @@ func TestStatusDoesNotPromiseCollectionBlockedByAForeignStagingEntry(t *testing.
 
 	// The user's own directory replaces it on the same name.
 	staging := filepath.Join(s.StagingDir(), "alpha")
-	if err := os.RemoveAll(staging); err != nil {
+	stagingParent, err := os.Open(filepath.Dir(staging))
+	if err != nil {
 		t.Fatal(err)
 	}
-	writeSkillBody(t, staging, "alpha", "mine, not fu's")
+	defer stagingParent.Close()
+	beforeIdentity, _, err := store.EntryIdentityAt(int(stagingParent.Fd()), filepath.Base(staging))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts := 1
+	if testenv.FileHandlesRequired() {
+		attempts = 32
+	}
+	var afterIdentity store.FileIdentity
+	for range attempts {
+		if err := os.RemoveAll(staging); err != nil {
+			t.Fatal(err)
+		}
+		writeSkillBody(t, staging, "alpha", "mine, not fu's")
+		afterIdentity, _, err = store.EntryIdentityAt(int(stagingParent.Fd()), filepath.Base(staging))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if afterIdentity.Device == beforeIdentity.Device && afterIdentity.Inode == beforeIdentity.Inode {
+			break
+		}
+	}
+	if testenv.FileHandlesRequired() &&
+		(beforeIdentity.Device != afterIdentity.Device || beforeIdentity.Inode != afterIdentity.Inode ||
+			beforeIdentity.Handle == "" || afterIdentity.Handle == "" || beforeIdentity.Handle == afterIdentity.Handle) {
+		t.Fatalf("gc replacement coverage did not reuse the inode with a new handle: before=%+v after=%+v", beforeIdentity, afterIdentity)
+	}
 
 	after, err := Status(s, cfg, nil)
 	if err != nil {

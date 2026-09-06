@@ -27,7 +27,7 @@ func TestRegularFileReadsRejectSameInodeMutationAtFinalBoundary(t *testing.T) {
 		{
 			name: "owned-tree hash",
 			read: func(parentFD int, name string, identity FileIdentity, hooks regularFileReadHooks) error {
-				_, _, err := hashFileAtWithHooks(parentFD, name, identity, hooks)
+				_, _, _, err := hashFileAtWithHooks(parentFD, name, identity, hooks)
 				return err
 			},
 			want: ErrOwnedTreeChanged,
@@ -46,11 +46,10 @@ func TestRegularFileReadsRejectSameInodeMutationAtFinalBoundary(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer dir.Close()
-			before, err := statAt(int(dir.Fd()), name)
+			identity, before, err := entryIdentityAt(int(dir.Fd()), name)
 			if err != nil {
 				t.Fatal(err)
 			}
-			identity := identityFromStat(&before)
 			hooks := regularFileReadHooks{beforePostStat: func() error {
 				file, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
 				if err != nil {
@@ -77,11 +76,11 @@ func TestRegularFileReadsRejectSameInodeMutationAtFinalBoundary(t *testing.T) {
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("same-inode mutation must return %v, got %v", tt.want, err)
 			}
-			after, err := statAt(int(dir.Fd()), name)
+			afterIdentity, after, err := entryIdentityAt(int(dir.Fd()), name)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if identityFromStat(&after) != identity {
+			if !afterIdentity.Same(identity) {
 				t.Fatal("test mutation unexpectedly replaced the inode")
 			}
 			if after.Mode&unix.S_IFMT != unix.S_IFREG {

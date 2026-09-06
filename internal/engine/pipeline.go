@@ -10,6 +10,7 @@ import (
 
 	"github.com/cosensexyz/fu/internal/agent"
 	"github.com/cosensexyz/fu/internal/store"
+	"golang.org/x/sys/unix"
 )
 
 // Op is one write command's mutation. Run wraps it with the invariant
@@ -213,6 +214,7 @@ type hooks struct {
 	beforeUpdateReclaim         func() error       // update: WAL cleared, replaced tree still at staging/<name>
 	afterAdoptSwitch            func() error       // adopt: first agent switched, rest pending
 	beforeAdoptRetire           func() error       // adopt: original approved, retirement not yet attempted
+	afterAdoptRetiredJournal    func() error       // adopt: retirement journaled, before entering the retired arm
 	afterAdoptRetire            func() error       // adopt: original retired, exact archive not yet copied
 	afterAdoptArchiveCopy       func() error       // adopt: exact archive recorded, retired original remains
 	afterDirSwitchChildCreate   func(string) error // adopt: replacement child created, identity not yet recorded
@@ -223,6 +225,7 @@ type hooks struct {
 	beforeDirSwitchChildRetire  func(string) error
 	beforeDirSwitchRootRetire   func(string) error
 	beforeDirSwitchBackupRetire func(string) error
+	entryIdentityAt             func(int, string) (store.FileIdentity, unix.Stat_t, error) // adopt test seam
 	beforeAdoptTargetCapture    func() error
 	afterAdoptLinkRead          func() error
 	beforeAdoptSourcePair       func() error

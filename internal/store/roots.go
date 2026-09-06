@@ -73,6 +73,8 @@ func pairPinnedRoot(dir *os.File, path string) (*checkedRoot, error) {
 		_ = root.Close()
 		return fail(fmt.Errorf("stat rooted logical directory %s: %w", path, err))
 	}
+	// Both descriptors stay open across these observations and the pairing.
+	// Removing either pathname cannot free its still-referenced inode for reuse.
 	if !os.SameFile(opened, rootInfo) {
 		_ = root.Close()
 		return fail(fmt.Errorf("%s changed while its logical root was being pinned", path))

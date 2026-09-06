@@ -143,13 +143,11 @@ func writeFileAtomicNoReplaceRoot(root *os.Root, path string, data []byte, perm 
 			retErr = errors.Join(retErr, fmt.Errorf("remove unpublished atomic temporary %q: %w", tmpName, err))
 		}
 	}()
-	var created unix.Stat_t
-	if err := unix.Fstat(int(tmp.Fd()), &created); err != nil {
-		runtime.KeepAlive(tmp)
+	expected, _, err := openIdentity(int(tmp.Fd()))
+	runtime.KeepAlive(tmp)
+	if err != nil {
 		return err
 	}
-	runtime.KeepAlive(tmp)
-	expected := identityFromStat(&created)
 	tempOwned := true
 	parent, err := root.Open(dir)
 	if err != nil {
@@ -163,7 +161,7 @@ func writeFileAtomicNoReplaceRoot(root *os.Root, path string, data []byte, perm 
 		if !tempOwned {
 			return
 		}
-		stat, err := statAt(int(parent.Fd()), filepath.Base(tmpName))
+		identity, stat, err := entryIdentityAt(int(parent.Fd()), filepath.Base(tmpName))
 		runtime.KeepAlive(parent)
 		if errors.Is(err, unix.ENOENT) {
 			return
@@ -172,11 +170,11 @@ func writeFileAtomicNoReplaceRoot(root *os.Root, path string, data []byte, perm 
 			retErr = errors.Join(retErr, fmt.Errorf("inspect atomic temporary during cleanup: %w", err))
 			return
 		}
-		if identityFromStat(&stat) != expected || uint32(stat.Mode)&uint32(unix.S_IFMT) != uint32(unix.S_IFREG) {
+		if !identity.Same(expected) || uint32(stat.Mode)&uint32(unix.S_IFMT) != uint32(unix.S_IFREG) {
 			retErr = errors.Join(retErr, fmt.Errorf("%w: atomic temporary %q was replaced; preserving it", ErrOwnedTreeChanged, tmpName))
 			return
 		}
-		retErr = errors.Join(retErr, retireOwnedLeafAt(parent, filepath.Base(tmpName), ".tmp-retired-", expected, uint32(unix.S_IFREG)))
+		retErr = errors.Join(retErr, retireObservedLeafAt(parent, filepath.Base(tmpName), ".tmp-retired-", identity, uint32(unix.S_IFREG)))
 	}()
 	if err := fillRegularFile(tmp, data, perm); err != nil {
 		return err
@@ -198,10 +196,10 @@ func writeFileAtomicNoReplaceRoot(root *os.Root, path string, data []byte, perm 
 			return err
 		}
 	}
-	current, err := statAt(int(parent.Fd()), filepath.Base(tmpName))
+	currentIdentity, current, err := entryIdentityAt(int(parent.Fd()), filepath.Base(tmpName))
 	runtime.KeepAlive(parent)
-	if err != nil || identityFromStat(&current) != expected || uint32(current.Mode)&uint32(unix.S_IFMT) != uint32(unix.S_IFREG) {
-		return fmt.Errorf("%w: atomic temporary %q was replaced before publication", ErrOwnedTreeChanged, tmpName)
+	if err != nil || !currentIdentity.Same(expected) || uint32(current.Mode)&uint32(unix.S_IFMT) != uint32(unix.S_IFREG) {
+		return atomicIdentityMismatch(fmt.Sprintf("atomic temporary %q failed identity validation before publication", tmpName), err)
 	}
 	if err := renameNoReplace(
 		int(parent.Fd()), filepath.Base(tmpName),
@@ -214,12 +212,12 @@ func writeFileAtomicNoReplaceRoot(root *os.Root, path string, data []byte, perm 
 	// The source name is free after rename. Never run name-based deferred
 	// cleanup against a later occupant of that name.
 	tempOwned = false
-	installed, err := statAt(int(parent.Fd()), filepath.Base(path))
+	installedIdentity, installed, err := entryIdentityAt(int(parent.Fd()), filepath.Base(path))
 	runtime.KeepAlive(parent)
-	if err != nil || identityFromStat(&installed) != expected || uint32(installed.Mode)&uint32(unix.S_IFMT) != uint32(unix.S_IFREG) {
+	if err != nil || !installedIdentity.Same(expected) || uint32(installed.Mode)&uint32(unix.S_IFMT) != uint32(unix.S_IFREG) {
 		restoreErr := renameNoReplace(int(parent.Fd()), filepath.Base(path), int(parent.Fd()), filepath.Base(tmpName))
 		runtime.KeepAlive(parent)
-		mismatch := fmt.Errorf("%w: installed atomic file %q does not match its live descriptor", ErrOwnedTreeChanged, path)
+		mismatch := atomicIdentityMismatch(fmt.Sprintf("installed atomic file %q does not match its live descriptor", path), err)
 		if restoreErr != nil {
 			return errors.Join(mismatch, fmt.Errorf("restore mismatched installed file: %w", restoreErr))
 		}
@@ -231,4 +229,12 @@ func writeFileAtomicNoReplaceRoot(root *os.Root, path string, data []byte, perm 
 		}
 	}
 	return nil
+}
+
+func atomicIdentityMismatch(message string, cause error) error {
+	mismatch := fmt.Errorf("%w: %s", ErrOwnedTreeChanged, message)
+	if cause != nil {
+		return errors.Join(mismatch, cause)
+	}
+	return mismatch
 }

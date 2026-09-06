@@ -19,18 +19,11 @@ import (
 	"github.com/cosensexyz/fu/internal/skill"
 )
 
-// ErrOwnedTreeChanged means transaction-owned archive content no longer
-// matches the identity and manifest recorded before it entered recovery.
-var ErrOwnedTreeChanged = errors.New("transaction-owned tree changed externally")
+// ErrOwnedTreeChanged means a filesystem entry no longer matches the identity
+// or manifest captured before the mutation.
+var ErrOwnedTreeChanged = errors.New("filesystem entry changed externally")
 
 var errUnsupportedOwnedType = errors.New("unsupported transaction-owned filesystem type")
-
-// FileIdentity is a persistent identity for one filesystem entry on the
-// supported POSIX platforms. Renames preserve it; replacement does not.
-type FileIdentity struct {
-	Device uint64 `json:"device"`
-	Inode  uint64 `json:"inode"`
-}
 
 // OwnedTreeEntry records one descendant of a transaction-owned directory.
 // Paths always use slash separators and are relative to the tree root.
@@ -58,12 +51,8 @@ const (
 	ownedSymlink   = "symlink"
 )
 
-func (id FileIdentity) valid() bool {
-	return id.Inode != 0
-}
-
 func (tree OwnedTree) Validate() error {
-	if !tree.RootIdentity.valid() {
+	if !tree.RootIdentity.Valid() {
 		return errors.New("owned tree has no root identity")
 	}
 	if os.FileMode(tree.RootMode).Type() != os.ModeDir {
@@ -80,7 +69,7 @@ func (tree OwnedTree) Validate() error {
 			return fmt.Errorf("owned tree entries are not strictly sorted at %q", entry.Path)
 		}
 		previous = entry.Path
-		if !entry.Identity.valid() {
+		if !entry.Identity.Valid() {
 			return fmt.Errorf("owned tree entry %q has no filesystem identity", entry.Path)
 		}
 		mode := os.FileMode(entry.Mode)
@@ -116,10 +105,6 @@ func (tree OwnedTree) Validate() error {
 		}
 	}
 	return nil
-}
-
-func identityFromStat(stat *unix.Stat_t) FileIdentity {
-	return FileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
 }
 
 func modeAndKind(stat *unix.Stat_t) (os.FileMode, string, error) {
@@ -168,35 +153,37 @@ func readlinkAt(parentFD int, name string) (string, error) {
 	return "", fmt.Errorf("symlink target at %q exceeds 1 MiB", name)
 }
 
-func hashFileAt(parentFD int, name string, expected FileIdentity) (string, unix.Stat_t, error) {
+func hashFileAt(parentFD int, name string, expected FileIdentity) (string, FileIdentity, unix.Stat_t, error) {
 	return hashFileAtWithHooks(parentFD, name, expected, regularFileReadHooks{})
 }
 
-func hashFileAtWithHooks(parentFD int, name string, expected FileIdentity, hooks regularFileReadHooks) (string, unix.Stat_t, error) {
-	file, stat, err := openRegularFileAt(parentFD, name)
+// hashFileAtWithHooks hashes the regular file at name and returns, with the
+// digest, the identity and stat of the object it actually read.
+func hashFileAtWithHooks(parentFD int, name string, expected FileIdentity, hooks regularFileReadHooks) (string, FileIdentity, unix.Stat_t, error) {
+	file, identity, stat, err := openRegularFileAt(parentFD, name)
 	if err != nil {
-		if expected.valid() && (errors.Is(err, errRegularFileChanged) || errors.Is(err, errUnsupportedOwnedType)) {
-			return "", unix.Stat_t{}, fmt.Errorf("%w: file %q changed type while being inspected: %v", ErrOwnedTreeChanged, name, err)
+		if expected.Valid() && (errors.Is(err, errRegularFileChanged) || errors.Is(err, errUnsupportedOwnedType)) {
+			return "", FileIdentity{}, unix.Stat_t{}, fmt.Errorf("%w: file %q changed type while being inspected: %v", ErrOwnedTreeChanged, name, err)
 		}
-		return "", unix.Stat_t{}, err
+		return "", FileIdentity{}, unix.Stat_t{}, err
 	}
-	if expected.valid() && identityFromStat(&stat) != expected {
+	if expected.Valid() && !identity.Same(expected) {
 		_ = file.Close()
-		return "", unix.Stat_t{}, fmt.Errorf("%w: file %q was replaced while being inspected", ErrOwnedTreeChanged, name)
+		return "", FileIdentity{}, unix.Stat_t{}, fmt.Errorf("%w: file %q was replaced while being inspected", ErrOwnedTreeChanged, name)
 	}
 	h := sha256.New()
 	byteCount, copyErr := io.Copy(h, file)
 	if copyErr != nil {
 		_ = file.Close()
-		return "", unix.Stat_t{}, copyErr
+		return "", FileIdentity{}, unix.Stat_t{}, copyErr
 	}
 	if err := finishRegularFileRead(file, name, stat, byteCount, hooks); err != nil {
 		if errors.Is(err, errRegularFileChanged) {
-			return "", unix.Stat_t{}, fmt.Errorf("%w: file %q changed while being hashed: %v", ErrOwnedTreeChanged, name, err)
+			return "", FileIdentity{}, unix.Stat_t{}, fmt.Errorf("%w: file %q changed while being hashed: %v", ErrOwnedTreeChanged, name, err)
 		}
-		return "", unix.Stat_t{}, err
+		return "", FileIdentity{}, unix.Stat_t{}, err
 	}
-	return "sha256:" + hex.EncodeToString(h.Sum(nil)), stat, nil
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), identity, stat, nil
 }
 
 func snapshotOwnedTree(root *checkedRoot, name string) (OwnedTree, error) {
@@ -217,8 +204,8 @@ func snapshotOwnedTree(root *checkedRoot, name string) (OwnedTree, error) {
 		_ = unix.Close(fd)
 		return OwnedTree{}, errors.New("invalid transaction-owned root descriptor")
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
+	identity, stat, err := openIdentity(fd)
+	if err != nil {
 		_ = file.Close()
 		return OwnedTree{}, err
 	}
@@ -231,7 +218,7 @@ func snapshotOwnedTree(root *checkedRoot, name string) (OwnedTree, error) {
 		_ = file.Close()
 		return OwnedTree{}, fmt.Errorf("transaction-owned root %q is not a directory", name)
 	}
-	tree := OwnedTree{RootIdentity: identityFromStat(&stat), RootMode: uint32(rootMode)}
+	tree := OwnedTree{RootIdentity: identity, RootMode: uint32(rootMode)}
 	if err := scanOwnedDirectory(file, "", &tree.Entries, 0); err != nil {
 		_ = file.Close()
 		return OwnedTree{}, err
@@ -269,8 +256,8 @@ func snapshotRootOwned(root *os.Root, rel string, maxFileBytes int64) (OwnedTree
 	if err != nil {
 		return OwnedTree{}, err
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(int(dir.Fd()), &stat); err != nil {
+	identity, stat, err := openIdentity(int(dir.Fd()))
+	if err != nil {
 		_ = dir.Close()
 		return OwnedTree{}, err
 	}
@@ -283,7 +270,7 @@ func snapshotRootOwned(root *os.Root, rel string, maxFileBytes int64) (OwnedTree
 		_ = dir.Close()
 		return OwnedTree{}, fmt.Errorf("rooted source %q is not a directory", rel)
 	}
-	tree := OwnedTree{RootIdentity: identityFromStat(&stat), RootMode: uint32(rootMode)}
+	tree := OwnedTree{RootIdentity: identity, RootMode: uint32(rootMode)}
 	if err := scanOwnedDirectory(dir, "", &tree.Entries, maxFileBytes); err != nil {
 		_ = dir.Close()
 		return OwnedTree{}, err
@@ -321,7 +308,7 @@ func scanOwnedDirectory(dir *os.File, prefix string, entries *[]OwnedTreeEntry, 
 		if prefix != "" {
 			rel = path.Join(prefix, name)
 		}
-		stat, err := statAt(int(dir.Fd()), name)
+		identity, stat, err := entryIdentityAt(int(dir.Fd()), name)
 		if err != nil {
 			return err
 		}
@@ -329,7 +316,7 @@ func scanOwnedDirectory(dir *os.File, prefix string, entries *[]OwnedTreeEntry, 
 		if err != nil {
 			return fmt.Errorf("inspect transaction-owned entry %q: %w", rel, err)
 		}
-		entry := OwnedTreeEntry{Path: rel, Kind: kind, Mode: uint32(mode), Identity: identityFromStat(&stat)}
+		entry := OwnedTreeEntry{Path: rel, Kind: kind, Mode: uint32(mode), Identity: identity}
 		switch kind {
 		case ownedDirectory:
 			fd, err := unix.Openat(int(dir.Fd()), name,
@@ -342,12 +329,12 @@ func scanOwnedDirectory(dir *os.File, prefix string, entries *[]OwnedTreeEntry, 
 				_ = unix.Close(fd)
 				return errors.New("invalid transaction-owned directory descriptor")
 			}
-			var opened unix.Stat_t
-			if err := unix.Fstat(fd, &opened); err != nil {
+			openedIdentity, _, err := openIdentity(fd)
+			if err != nil {
 				_ = child.Close()
 				return err
 			}
-			if identityFromStat(&opened) != entry.Identity {
+			if !openedIdentity.Same(entry.Identity) {
 				_ = child.Close()
 				return fmt.Errorf("%w: directory %q was replaced while being inspected", ErrOwnedTreeChanged, rel)
 			}
@@ -363,7 +350,7 @@ func scanOwnedDirectory(dir *os.File, prefix string, entries *[]OwnedTreeEntry, 
 			if maxFileBytes > 0 && stat.Size > maxFileBytes {
 				return fmt.Errorf("file %q size %d exceeds the %d-byte copy limit", rel, stat.Size, maxFileBytes)
 			}
-			digest, opened, err := hashFileAt(int(dir.Fd()), name, entry.Identity)
+			digest, _, opened, err := hashFileAt(int(dir.Fd()), name, entry.Identity)
 			if err != nil {
 				return err
 			}
@@ -387,15 +374,22 @@ func scanOwnedDirectory(dir *os.File, prefix string, entries *[]OwnedTreeEntry, 
 }
 
 func compareOwnedEntry(actual, expected OwnedTreeEntry) error {
-	if actual.Kind != expected.Kind || actual.Mode != expected.Mode || actual.Identity != expected.Identity ||
-		actual.Digest != expected.Digest || actual.Target != expected.Target {
-		return fmt.Errorf("%w: recovery entry %q no longer matches its recorded identity and content", ErrOwnedTreeChanged, expected.Path)
+	expectedPath := expected.Path
+	if !actual.Identity.Same(expected.Identity) {
+		return fmt.Errorf("%w: recovery entry %q no longer matches its recorded identity and content", ErrOwnedTreeChanged, expectedPath)
+	}
+	actual.Path = ""
+	expected.Path = ""
+	actual.Identity = FileIdentity{}
+	expected.Identity = FileIdentity{}
+	if actual != expected {
+		return fmt.Errorf("%w: recovery entry %q no longer matches its recorded identity and content", ErrOwnedTreeChanged, expectedPath)
 	}
 	return nil
 }
 
 func compareOwnedTreeExact(actual, expected OwnedTree) error {
-	if actual.RootIdentity != expected.RootIdentity || actual.RootMode != expected.RootMode {
+	if !actual.RootIdentity.Same(expected.RootIdentity) || actual.RootMode != expected.RootMode {
 		return fmt.Errorf("%w: transaction-owned root no longer matches its recorded identity and mode", ErrOwnedTreeChanged)
 	}
 	want := make(map[string]OwnedTreeEntry, len(expected.Entries))
@@ -424,31 +418,79 @@ func compareOwnedTreeExact(actual, expected OwnedTree) error {
 }
 
 func validateOwnedTreeAt(root *checkedRoot, name string, expected OwnedTree) error {
-	if err := expected.Validate(); err != nil {
-		return fmt.Errorf("invalid transaction-owned tree manifest: %w", err)
+	_, err := observeOwnedTreeAt(root, name, expected)
+	return err
+}
+
+func observeOwnedTreeAt(root *checkedRoot, name string, expected OwnedTree) (OwnedTree, error) {
+	if err := validateTransactionOwnedTreeManifest(expected); err != nil {
+		return OwnedTree{}, err
 	}
 	actual, err := snapshotOwnedTree(root, name)
 	if err != nil {
-		if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) || errors.Is(err, errUnsupportedOwnedType) {
-			return fmt.Errorf("%w: transaction-owned tree %q changed type: %v", ErrOwnedTreeChanged, name, err)
-		}
-		return err
+		return OwnedTree{}, classifyOwnedSnapshotError("transaction-owned tree", name, err)
 	}
-	return compareOwnedTreeExact(actual, expected)
+	if err := compareOwnedTreeExact(actual, expected); err != nil {
+		return OwnedTree{}, err
+	}
+	return actual, nil
+}
+
+func validateTransactionOwnedTreeManifest(expected OwnedTree) error {
+	if err := expected.Validate(); err != nil {
+		return fmt.Errorf("invalid transaction-owned tree manifest: %w", err)
+	}
+	return nil
+}
+
+func classifyOwnedSnapshotError(object, name string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) || errors.Is(err, errUnsupportedOwnedType) {
+		return fmt.Errorf("%w: %s %q changed type: %v", ErrOwnedTreeChanged, object, name, err)
+	}
+	return err
 }
 
 func moveOwnedTreeToRecovery(src *checkedRoot, srcName string, recovery *checkedRoot, payloadName string, expected OwnedTree) error {
-	if err := validateOwnedTreeAt(src, srcName, expected); err != nil {
+	return moveOwnedTreeToRecoveryWithOps(src, srcName, recovery, payloadName, expected, snapshotOwnedTree, renameChecked)
+}
+
+type ownedTreeSnapshotFunc func(*checkedRoot, string) (OwnedTree, error)
+type checkedRootRenameFunc func(*checkedRoot, string, *checkedRoot, string) error
+
+func moveOwnedTreeToRecoveryWithOps(
+	src *checkedRoot,
+	srcName string,
+	recovery *checkedRoot,
+	payloadName string,
+	expected OwnedTree,
+	snapshot ownedTreeSnapshotFunc,
+	rename checkedRootRenameFunc,
+) error {
+	if err := validateTransactionOwnedTreeManifest(expected); err != nil {
 		return err
 	}
-	if err := renameChecked(src, srcName, recovery, payloadName); err != nil {
+	observed, err := snapshot(src, srcName)
+	if err != nil {
+		return classifyOwnedSnapshotError("transaction-owned tree", srcName, err)
+	}
+	if err := compareOwnedTreeExact(observed, expected); err != nil {
 		return err
 	}
-	movedErr := validateOwnedTreeAt(recovery, payloadName, expected)
+	if err := rename(src, srcName, recovery, payloadName); err != nil {
+		return err
+	}
+	moved, err := snapshot(recovery, payloadName)
+	movedErr := classifyPostRenameOwnedSnapshotError("transaction-owned tree", payloadName, err)
+	if movedErr == nil {
+		movedErr = compareOwnedTreeExact(moved, observed)
+	}
 	if movedErr == nil {
 		return nil
 	}
-	if restoreErr := renameChecked(recovery, payloadName, src, srcName); restoreErr != nil {
+	if restoreErr := rename(recovery, payloadName, src, srcName); restoreErr != nil {
 		return fmt.Errorf("%w (the moved object is preserved at %s/%s because restoring %s/%s failed: %v)",
 			movedErr, recovery.display, payloadName, src.display, srcName, restoreErr)
 	}
@@ -551,8 +593,11 @@ func (s *Store) reserveStagedRootOwnedWithHooks(perm os.FileMode, hooks stagedRo
 	if err := unix.Mkdirat(parentFD, private, uint32(perm.Perm())); err != nil {
 		return StagedRootReservation{}, fmt.Errorf("create private staging root %s/%s exclusively: %w", staging.display, private, err)
 	}
-	observed, err := statAt(parentFD, private)
+	expectedIdentity, observed, err := entryIdentityAt(parentFD, private)
 	if err != nil {
+		// The random 128-bit name was created exclusively immediately above and
+		// was never published, so this best-effort removal cannot target a
+		// caller-provided entry even when identity capture itself failed.
 		cleanupErr := unix.Unlinkat(parentFD, private, unix.AT_REMOVEDIR)
 		return StagedRootReservation{}, errors.Join(err, cleanupErr)
 	}
@@ -561,7 +606,6 @@ func (s *Store) reserveStagedRootOwnedWithHooks(perm os.FileMode, hooks stagedRo
 		cleanupErr := unix.Unlinkat(parentFD, private, unix.AT_REMOVEDIR)
 		return StagedRootReservation{}, errors.Join(err, cleanupErr)
 	}
-	expectedIdentity := identityFromStat(&observed)
 	expectedMode := uint32(mode)
 	succeeded := false
 	defer func() {
@@ -594,6 +638,10 @@ func (s *Store) reserveStagedRootOwnedWithHooks(perm os.FileMode, hooks stagedRo
 // PublishStagedRootOwned moves a persisted private reservation to its final
 // staging name without replacement and post-validates the same inode.
 func (s *Store) PublishStagedRootOwned(reservation StagedRootReservation, name string) (OwnedTree, error) {
+	return s.publishStagedRootOwnedWithOps(reservation, name, snapshotOwnedTree, renameChecked)
+}
+
+func (s *Store) publishStagedRootOwnedWithOps(reservation StagedRootReservation, name string, snapshot ownedTreeSnapshotFunc, rename checkedRootRenameFunc) (OwnedTree, error) {
 	defer keepDescriptorOwnersAlive(s)
 	if s.writeRoots == nil || s.writeRoots.staging == nil || s.writeRoots.staging.dir == nil {
 		return OwnedTree{}, errors.New("store is not attached to a checked staging root")
@@ -605,20 +653,33 @@ func (s *Store) PublishStagedRootOwned(reservation StagedRootReservation, name s
 		return OwnedTree{}, fmt.Errorf("publish staged root requires a public single-component name outside the .fu- namespace: %q", name)
 	}
 	staging := s.writeRoots.staging
-	if err := validateOwnedTreeAt(staging, reservation.Name, reservation.Manifest); err != nil {
+	observe := func(name string, expected OwnedTree) (OwnedTree, error) {
+		actual, err := snapshot(staging, name)
+		if err != nil {
+			return OwnedTree{}, classifyOwnedSnapshotError("transaction-owned tree", name, err)
+		}
+		if err := compareOwnedTreeExact(actual, expected); err != nil {
+			return OwnedTree{}, err
+		}
+		return actual, nil
+	}
+	observed, err := observe(reservation.Name, reservation.Manifest)
+	if err != nil {
 		return OwnedTree{}, err
 	}
-	if err := renameNoReplace(int(staging.dir.Fd()), reservation.Name, int(staging.dir.Fd()), name); err != nil {
-		return OwnedTree{}, fmt.Errorf("rename %s/%s to unoccupied %s/%s: %w", staging.display, reservation.Name, staging.display, name, err)
+	if err := rename(staging, reservation.Name, staging, name); err != nil {
+		return OwnedTree{}, err
 	}
-	if err := validateOwnedTreeAt(staging, name, reservation.Manifest); err != nil {
-		restoreErr := renameNoReplace(int(staging.dir.Fd()), name, int(staging.dir.Fd()), reservation.Name)
+	published, err := observe(name, observed)
+	err = classifyPostRenameOwnedSnapshotError("staged reservation", name, err)
+	if err != nil {
+		restoreErr := rename(staging, name, staging, reservation.Name)
 		if restoreErr != nil {
 			return OwnedTree{}, errors.Join(err, fmt.Errorf("restore mismatched staged reservation: %w", restoreErr))
 		}
 		return OwnedTree{}, err
 	}
-	return reservation.Manifest, nil
+	return published, nil
 }
 
 // DeclaredEntry describes one entry a transaction has committed to creating
@@ -781,7 +842,7 @@ func (s *Store) SettleDeclaredStagedEntries(name string, base OwnedTree, declare
 // and, when present and matching, extends the settled manifest with it. An
 // absent entry is dropped: the transaction died before creating it.
 func settleDeclaredAt(s *Store, parentFD int, leaf string, entry DeclaredEntry, settled *OwnedTree) error {
-	observed, statErr := statAt(parentFD, leaf)
+	observedIdentity, observed, statErr := entryIdentityAt(parentFD, leaf)
 	if errors.Is(statErr, unix.ENOENT) {
 		return nil
 	}
@@ -797,7 +858,7 @@ func settleDeclaredAt(s *Store, parentFD int, leaf string, entry DeclaredEntry, 
 		if kind != ownedFile || uint32(mode) != entry.Mode {
 			return fmt.Errorf("%w: declared entry %q is not the file the transaction described", ErrOwnedTreeChanged, entry.Path)
 		}
-		digest, opened, err := hashFileAt(parentFD, leaf, identityFromStat(&observed))
+		digest, openedIdentity, opened, err := hashFileAt(parentFD, leaf, observedIdentity)
 		if err != nil {
 			return err
 		}
@@ -812,7 +873,7 @@ func settleDeclaredAt(s *Store, parentFD int, leaf string, entry DeclaredEntry, 
 			Path:     entry.Path,
 			Kind:     ownedFile,
 			Mode:     uint32(openedMode),
-			Identity: identityFromStat(&opened),
+			Identity: openedIdentity,
 			Digest:   digest,
 		})
 	case declaredSymlink:
@@ -836,7 +897,7 @@ func settleDeclaredAt(s *Store, parentFD int, leaf string, entry DeclaredEntry, 
 			Path:     entry.Path,
 			Kind:     ownedSymlink,
 			Mode:     uint32(mode),
-			Identity: identityFromStat(&observed),
+			Identity: observedIdentity,
 			Target:   target,
 		})
 	case declaredDir:
@@ -851,7 +912,7 @@ func settleDeclaredAt(s *Store, parentFD int, leaf string, entry DeclaredEntry, 
 			Path:     entry.Path,
 			Kind:     ownedDirectory,
 			Mode:     uint32(mode),
-			Identity: identityFromStat(&observed),
+			Identity: observedIdentity,
 		})
 	default:
 		return fmt.Errorf("declared transaction entry %q has unknown kind %q", entry.Path, entry.Kind)
@@ -932,8 +993,8 @@ func (s *Store) CreateStagedFileOwned(name, rel string, data []byte, perm os.Fil
 	if err != nil {
 		return OwnedTreeEntry{}, err
 	}
-	var rootStat unix.Stat_t
-	if err := unix.Fstat(int(dir.Fd()), &rootStat); err != nil {
+	rootIdentity, rootStat, err := openIdentity(int(dir.Fd()))
+	if err != nil {
 		_ = dir.Close()
 		return OwnedTreeEntry{}, err
 	}
@@ -942,7 +1003,7 @@ func (s *Store) CreateStagedFileOwned(name, rel string, data []byte, perm os.Fil
 		_ = dir.Close()
 		return OwnedTreeEntry{}, err
 	}
-	if rootKind != ownedDirectory || identityFromStat(&rootStat) != expected.RootIdentity || uint32(rootMode) != expected.RootMode {
+	if rootKind != ownedDirectory || !rootIdentity.Same(expected.RootIdentity) || uint32(rootMode) != expected.RootMode {
 		_ = dir.Close()
 		return OwnedTreeEntry{}, fmt.Errorf("%w: staged root %q changed before file creation", ErrOwnedTreeChanged, name)
 	}
@@ -969,9 +1030,10 @@ func (s *Store) CreateStagedFileOwned(name, rel string, data []byte, perm os.Fil
 	if writeErr == nil {
 		writeErr = file.Sync()
 	}
+	var identity FileIdentity
 	var created unix.Stat_t
 	if writeErr == nil {
-		writeErr = unix.Fstat(fd, &created)
+		identity, created, writeErr = openIdentity(fd)
 	}
 	closeErr := file.Close()
 	if writeErr != nil {
@@ -986,8 +1048,7 @@ func (s *Store) CreateStagedFileOwned(name, rel string, data []byte, perm os.Fil
 		_ = dir.Close()
 		return OwnedTreeEntry{}, err
 	}
-	identity := identityFromStat(&created)
-	digest, opened, err := hashFileAt(int(dir.Fd()), rel, identity)
+	digest, openedIdentity, opened, err := hashFileAt(int(dir.Fd()), rel, identity)
 	if err != nil {
 		_ = dir.Close()
 		return OwnedTreeEntry{}, err
@@ -1008,7 +1069,7 @@ func (s *Store) CreateStagedFileOwned(name, rel string, data []byte, perm os.Fil
 		Path:     filepath.ToSlash(rel),
 		Kind:     kind,
 		Mode:     uint32(mode),
-		Identity: identityFromStat(&opened),
+		Identity: openedIdentity,
 		Digest:   digest,
 	}, nil
 }
@@ -1016,10 +1077,17 @@ func (s *Store) CreateStagedFileOwned(name, rel string, data []byte, perm os.Fil
 // ValidateStagedOwned checks that a staged tree contains exactly the entries
 // Fu recorded while exclusively creating them.
 func (s *Store) ValidateStagedOwned(name string, expected OwnedTree) error {
+	_, err := s.ObserveStagedOwned(name, expected)
+	return err
+}
+
+// ObserveStagedOwned admits a recorded staged tree and returns the live
+// manifest that subsequent in-process operations must carry forward.
+func (s *Store) ObserveStagedOwned(name string, expected OwnedTree) (OwnedTree, error) {
 	if s.writeRoots == nil || s.writeRoots.staging == nil {
-		return errors.New("store is not attached to a checked staging root")
+		return OwnedTree{}, errors.New("store is not attached to a checked staging root")
 	}
-	return validateOwnedTreeAt(s.writeRoots.staging, name, expected)
+	return observeOwnedTreeAt(s.writeRoots.staging, name, expected)
 }
 
 // CopyStagedTreeOwned copies the subtree at srcRel beneath src into the
@@ -1100,12 +1168,12 @@ func copyTreeOwnedWithHooks(dst *checkedRoot, name string, base OwnedTree, src *
 		return OwnedTree{}, err
 	}
 	defer dir.Close()
-	var rootStat unix.Stat_t
-	if err := unix.Fstat(int(dir.Fd()), &rootStat); err != nil {
+	rootIdentity, rootStat, err := openIdentity(int(dir.Fd()))
+	if err != nil {
 		return OwnedTree{}, err
 	}
 	rootMode, rootKind, err := modeAndKind(&rootStat)
-	if err != nil || rootKind != ownedDirectory || identityFromStat(&rootStat) != base.RootIdentity || uint32(rootMode) != base.RootMode {
+	if err != nil || rootKind != ownedDirectory || !rootIdentity.Same(base.RootIdentity) || uint32(rootMode) != base.RootMode {
 		return OwnedTree{}, fmt.Errorf("%w: copy destination root %q changed before creation", ErrOwnedTreeChanged, name)
 	}
 
@@ -1254,8 +1322,8 @@ func mkdirDeclared(dir *os.File, rel string, declared DeclaredEntry) error {
 		if err := unix.Mkdirat(parentFD, leaf, uint32(os.FileMode(declared.Mode).Perm())); err != nil {
 			return fmt.Errorf("create staged directory %q: %w", rel, err)
 		}
-		var pathStat unix.Stat_t
-		if err := unix.Fstatat(parentFD, leaf, &pathStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		pathIdentity, _, err := entryIdentityAt(parentFD, leaf)
+		if err != nil {
 			return fmt.Errorf("inspect staged directory %q after creation: %w", rel, err)
 		}
 		fd, err := unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
@@ -1263,20 +1331,21 @@ func mkdirDeclared(dir *os.File, rel string, declared DeclaredEntry) error {
 			return fmt.Errorf("open staged directory %q after creation: %w", rel, err)
 		}
 		defer unix.Close(fd)
-		var openedStat unix.Stat_t
-		if err := unix.Fstat(fd, &openedStat); err != nil {
+		openedIdentity, openedStat, err := openIdentity(fd)
+		if err != nil {
 			return fmt.Errorf("inspect opened staged directory %q: %w", rel, err)
 		}
-		if identityFromStat(&pathStat) != identityFromStat(&openedStat) || openedStat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		if !pathIdentity.Same(openedIdentity) || openedStat.Mode&unix.S_IFMT != unix.S_IFDIR {
 			return fmt.Errorf("staged directory %q was replaced after creation", rel)
 		}
 		if err := unix.Fchmod(fd, uint32(os.FileMode(declared.Mode).Perm())); err != nil {
 			return fmt.Errorf("set staged directory mode for %q: %w", rel, err)
 		}
-		if err := unix.Fstatat(parentFD, leaf, &pathStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		pathIdentity, _, err = entryIdentityAt(parentFD, leaf)
+		if err != nil {
 			return fmt.Errorf("reinspect staged directory %q after chmod: %w", rel, err)
 		}
-		if identityFromStat(&pathStat) != identityFromStat(&openedStat) {
+		if !pathIdentity.Same(openedIdentity) {
 			return fmt.Errorf("staged directory %q was replaced while applying its mode", rel)
 		}
 		return nil
@@ -1411,7 +1480,8 @@ func (s *Store) CreateRecoveryRootOwned(payload string, perm os.FileMode) (Owned
 }
 
 type createRecoveryRootHooks struct {
-	afterOpen func() error
+	afterOpen       func() error
+	captureIdentity func(int, string) (FileIdentity, unix.Stat_t, error)
 }
 
 func (s *Store) createRecoveryRootOwnedWithHooks(payload string, perm os.FileMode, hooks createRecoveryRootHooks) (OwnedTree, error) {
@@ -1424,6 +1494,10 @@ func (s *Store) createRecoveryRootOwnedWithHooks(payload string, perm os.FileMod
 	}
 	recovery := s.writeRoots.recovery
 	parentFD := int(recovery.dir.Fd())
+	captureIdentity := entryIdentityAt
+	if hooks.captureIdentity != nil {
+		captureIdentity = hooks.captureIdentity
+	}
 	if err := unix.Mkdirat(parentFD, payload, uint32(perm.Perm())); err != nil {
 		return OwnedTree{}, fmt.Errorf("create recovery root %s/%s exclusively: %w", recovery.display, payload, err)
 	}
@@ -1431,16 +1505,18 @@ func (s *Store) createRecoveryRootOwnedWithHooks(payload string, perm os.FileMod
 	if err != nil {
 		return OwnedTree{}, err
 	}
-	var opened unix.Stat_t
-	if err := unix.Fstat(int(dir.Fd()), &opened); err != nil {
+	openedIdentity, opened, err := openIdentity(int(dir.Fd()))
+	if err != nil {
 		_ = dir.Close()
 		return OwnedTree{}, err
 	}
-	var named unix.Stat_t
-	if err := unix.Fstatat(parentFD, payload, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
-		identityFromStat(&named) != identityFromStat(&opened) || opened.Mode&unix.S_IFMT != unix.S_IFDIR {
+	namedIdentity, _, namedErr := captureIdentity(parentFD, payload)
+	if namedErr != nil || !namedIdentity.Same(openedIdentity) || opened.Mode&unix.S_IFMT != unix.S_IFDIR {
 		_ = dir.Close()
-		return OwnedTree{}, fmt.Errorf("%w: recovery root %s/%s changed while being opened", ErrOwnedTreeChanged, recovery.display, payload)
+		return OwnedTree{}, atomicIdentityMismatch(
+			fmt.Sprintf("recovery root %s/%s changed while being opened", recovery.display, payload),
+			namedErr,
+		)
 	}
 	if hooks.afterOpen != nil {
 		if err := hooks.afterOpen(); err != nil {
@@ -1452,9 +1528,13 @@ func (s *Store) createRecoveryRootOwnedWithHooks(payload string, perm os.FileMod
 		_ = dir.Close()
 		return OwnedTree{}, fmt.Errorf("set recovery root mode %s/%s: %w", recovery.display, payload, err)
 	}
-	if err := unix.Fstatat(parentFD, payload, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil || identityFromStat(&named) != identityFromStat(&opened) {
+	namedIdentity, _, namedErr = captureIdentity(parentFD, payload)
+	if namedErr != nil || !namedIdentity.Same(openedIdentity) {
 		_ = dir.Close()
-		return OwnedTree{}, fmt.Errorf("%w: recovery root %s/%s was replaced while applying its mode", ErrOwnedTreeChanged, recovery.display, payload)
+		return OwnedTree{}, atomicIdentityMismatch(
+			fmt.Sprintf("recovery root %s/%s was replaced while applying its mode", recovery.display, payload),
+			namedErr,
+		)
 	}
 	tree, err := snapshotOwnedOpenDirectory(dir)
 	if err != nil {
@@ -1721,13 +1801,14 @@ func (s *Store) StagingRootMatches(name string, expected OwnedTree) bool {
 	if s.writeRoots != nil {
 		staging = s.writeRoots.staging
 	}
+	var identity FileIdentity
 	var stat unix.Stat_t
 	var err error
 	if staging != nil {
-		stat, err = statAt(int(staging.dir.Fd()), name)
+		identity, stat, err = entryIdentityAt(int(staging.dir.Fd()), name)
 		keepDescriptorOwnersAlive(staging)
 	} else {
-		err = unix.Lstat(filepath.Join(s.StagingDir(), name), &stat)
+		identity, stat, err = entryIdentityAt(unixAtFDCWD, filepath.Join(s.StagingDir(), name))
 	}
 	if err != nil {
 		return false
@@ -1736,7 +1817,7 @@ func (s *Store) StagingRootMatches(name string, expected OwnedTree) bool {
 	if modeErr != nil || kind != ownedDirectory {
 		return false
 	}
-	return identityFromStat(&stat) == expected.RootIdentity && uint32(mode) == expected.RootMode
+	return identity.Same(expected.RootIdentity) && uint32(mode) == expected.RootMode
 }
 
 // ReclaimRecoveryPayloadOwned disposes of a transaction payload whose owning
@@ -1791,12 +1872,22 @@ func pathPresentAt(parentFD int, name string) (bool, error) {
 }
 
 func archiveRecoveryPayloadOwned(s *Store, name string, expected OwnedTree, hooks ownedCleanupHooks) error {
+	return archiveRecoveryPayloadOwnedWithSnapshot(s, name, expected, hooks, snapshotOwnedTree)
+}
+
+func archiveRecoveryPayloadOwnedWithSnapshot(
+	s *Store,
+	name string,
+	expected OwnedTree,
+	hooks ownedCleanupHooks,
+	snapshot ownedTreeSnapshotFunc,
+) error {
 	defer keepDescriptorOwnersAlive(s)
 	if s.writeRoots == nil || s.writeRoots.recovery == nil || s.writeRoots.recovery.dir == nil {
 		return errors.New("store is not attached to a checked recovery-root session")
 	}
-	if err := expected.Validate(); err != nil {
-		return fmt.Errorf("invalid transaction-owned tree manifest: %w", err)
+	if err := validateTransactionOwnedTreeManifest(expected); err != nil {
+		return err
 	}
 	parentFD := int(s.writeRoots.recovery.dir.Fd())
 	archive := ownedArchiveName(name, expected)
@@ -1823,14 +1914,21 @@ func archiveRecoveryPayloadOwned(s *Store, name string, expected OwnedTree, hook
 	// describe: a recorded entry that is missing means the payload was changed
 	// under fu, and the archive would otherwise claim to have retained content
 	// that is gone.
-	validateAt := func(candidate string) error {
-		actual, err := snapshotOwnedTree(s.writeRoots.recovery, candidate)
+	observeAt := func(candidate string) (OwnedTree, error) {
+		actual, err := snapshot(s.writeRoots.recovery, candidate)
 		if err != nil {
-			return fmt.Errorf("%w: inspect recovery payload %q: %v", ErrOwnedTreeChanged, candidate, err)
+			if classified := classifyOwnedSnapshotError("recovery payload", candidate, err); errors.Is(classified, ErrOwnedTreeChanged) {
+				return OwnedTree{}, classified
+			}
+			return OwnedTree{}, fmt.Errorf("inspect recovery payload %q: %w", candidate, err)
 		}
-		return compareOwnedTreeExact(actual, expected)
+		return actual, nil
 	}
-	if err := validateAt(active); err != nil {
+	observed, err := observeAt(active)
+	if err != nil {
+		return err
+	}
+	if err := compareOwnedTreeExact(observed, expected); err != nil {
 		return err
 	}
 	if active == archive {
@@ -1856,11 +1954,23 @@ func archiveRecoveryPayloadOwned(s *Store, name string, expected OwnedTree, hook
 		}
 		return err
 	}
-	if err := validateAt(archive); err != nil {
+	archived, err := observeAt(archive)
+	err = classifyPostRenameOwnedSnapshotError("recovery payload", archive, err)
+	if err == nil {
+		err = compareOwnedTreeExact(archived, observed)
+	}
+	if err != nil {
 		if restoreErr := renameNoReplace(parentFD, archive, parentFD, active); restoreErr != nil {
 			return fmt.Errorf("%w (the mismatching payload is preserved at archive name %q because restoring %q failed: %v)", err, archive, active, restoreErr)
 		}
 		return err
 	}
 	return nil
+}
+
+func classifyPostRenameOwnedSnapshotError(object, name string, err error) error {
+	if err == nil || errors.Is(err, ErrOwnedTreeChanged) {
+		return err
+	}
+	return atomicIdentityMismatch(fmt.Sprintf("revalidate archived %s %q", object, name), err)
 }

@@ -221,3 +221,61 @@ func TestRenameExchangeRequiresBothSidesToExist(t *testing.T) {
 		})
 	}
 }
+
+func TestExchangeRevalidatesBothLiveManifests(t *testing.T) {
+	for _, fault := range []string{"none", "skills replacement", "staging replacement", "capture failure"} {
+		t.Run(fault, func(t *testing.T) {
+			s := exchangeSessionFixture(t)
+			staged, published := exchangeFixture(t, s, "kit")
+			staged.RootIdentity.Handle = ""
+			published.RootIdentity.Handle = ""
+			exchanged := false
+			captures := 0
+			err := s.exchangeStagedWithSkillOwnedWithOps("kit", staged, published,
+				func(root *checkedRoot, name string) (OwnedTree, error) {
+					actual, err := snapshotOwnedTree(root, name)
+					if err != nil {
+						return actual, err
+					}
+					captures++
+					if exchanged && fault == "capture failure" {
+						return OwnedTree{}, os.ErrPermission
+					}
+					handle := "test:published"
+					if (root == s.writeRoots.staging) != exchanged {
+						handle = "test:staged"
+					}
+					if exchanged && (fault == "skills replacement" && root == s.writeRoots.skills || fault == "staging replacement" && root == s.writeRoots.staging) {
+						handle = "test:foreign"
+					}
+					actual.RootIdentity.Handle = handle
+					return actual, nil
+				}, func(a int, an string, b int, bn string) error {
+					if exchanged {
+						t.Fatal("a failed proof must preserve the exchanged objects rather than swap unknown replacements again")
+					}
+					err := renameExchange(a, an, b, bn)
+					exchanged = err == nil
+					return err
+				})
+			if fault == "none" {
+				if err != nil || captures != 4 {
+					t.Fatalf("exchange error=%v captures=%d, want two observations on each side", err, captures)
+				}
+			} else if !errors.Is(err, ErrOwnedTreeChanged) {
+				t.Fatalf("post-exchange %s must conflict, got %v", fault, err)
+			}
+			if fault == "capture failure" && !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("capture cause lost: %v", err)
+			}
+			if !exchanged {
+				t.Fatal("exchange was not exercised")
+			}
+			for path, want := range map[string]string{filepath.Join(s.SkillsDir(), "kit", "f.txt"): "NEW", filepath.Join(s.StagingDir(), "kit", "old", "f.txt"): "OLD"} {
+				if got, err := os.ReadFile(path); err != nil || string(got) != want {
+					t.Fatalf("exchanged content lost: %q %v", got, err)
+				}
+			}
+		})
+	}
+}

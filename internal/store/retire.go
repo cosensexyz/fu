@@ -73,17 +73,39 @@ func NewRetiredName(prefix string) (string, error) {
 }
 
 func retireOwnedLeafAt(parent *os.File, name, prefix string, expected FileIdentity, expectedType uint32) error {
+	return retireOwnedLeafAtWithCapture(parent, name, prefix, expected, expectedType, entryIdentityAt)
+}
+
+func retireOwnedLeafAtWithCapture(
+	parent *os.File,
+	name, prefix string,
+	expected FileIdentity,
+	expectedType uint32,
+	capture ownedLeafIdentityCapture,
+) error {
+	defer keepDescriptorOwnersAlive(parent)
+	observed, stat, err := capture(int(parent.Fd()), name)
+	if err != nil {
+		return atomicIdentityMismatch(fmt.Sprintf("inspect owned leaf %q before retirement", name), err)
+	}
+	if !observed.Same(expected) || uint32(stat.Mode)&uint32(unix.S_IFMT) != expectedType {
+		return fmt.Errorf("%w: entry %q did not match its recorded identity and type before retirement", ErrOwnedTreeChanged, name)
+	}
+	return retireObservedLeafAt(parent, name, prefix, observed, expectedType)
+}
+
+func retireObservedLeafAt(parent *os.File, name, prefix string, observed FileIdentity, expectedType uint32) error {
 	defer keepDescriptorOwnersAlive(parent)
 	retired, err := RetireNameAt(parent, name, prefix)
 	if err != nil {
 		return err
 	}
-	stat, statErr := statAt(int(parent.Fd()), retired)
-	if statErr != nil || identityFromStat(&stat) != expected || uint32(stat.Mode)&uint32(unix.S_IFMT) != expectedType {
+	identity, stat, statErr := entryIdentityAt(int(parent.Fd()), retired)
+	if statErr != nil || !identity.Same(observed) || uint32(stat.Mode)&uint32(unix.S_IFMT) != expectedType {
 		restoreErr := RestoreRetiredAt(parent, retired, name)
 		mismatch := fmt.Errorf("%w: retired entry %q did not match its recorded identity and type", ErrOwnedTreeChanged, retired)
 		if statErr != nil {
-			mismatch = fmt.Errorf("%w: inspect retired entry %q: %v", ErrOwnedTreeChanged, retired, statErr)
+			mismatch = retiredLeafIdentityMismatch(retired, statErr)
 		}
 		if restoreErr != nil {
 			return errors.Join(mismatch, fmt.Errorf("restore mismatched retired entry %q: %w", retired, restoreErr))
@@ -91,6 +113,10 @@ func retireOwnedLeafAt(parent *os.File, name, prefix string, expected FileIdenti
 		return mismatch
 	}
 	return removeRetiredAt(parent, retired, name, 0, "unlinkat", true)
+}
+
+func retiredLeafIdentityMismatch(name string, cause error) error {
+	return atomicIdentityMismatch(fmt.Sprintf("inspect retired entry %q", name), cause)
 }
 
 // RemoveOwnedTreeAt removes exactly one previously manifested directory tree
@@ -102,7 +128,11 @@ func retireOwnedLeafAt(parent *os.File, name, prefix string, expected FileIdenti
 // it. Safety therefore does not rest on an unguessable name -- it rests on the
 // all-or-nothing manifest preflight, the no-replace retirement rename, and the
 // post-move revalidation. A replacement or unknown entry is preserved and
-// reported as a conflict.
+// reported. Directory roots forward the descriptor identity captured by the
+// preflight. Leaves deliberately retain the manifest entry as their admission
+// reference because retireOwnedEntryAtWithOps recaptures their live identity
+// immediately before rename and promotes that observation for post-rename
+// content and identity validation.
 func RemoveOwnedTreeAt(parent *os.File, name string, expected OwnedTree) error {
 	defer keepDescriptorOwnersAlive(parent)
 	if parent == nil {
@@ -163,7 +193,7 @@ func RemoveOwnedTreeAt(parent *os.File, name string, expected OwnedTree) error {
 	if err := root.Close(); err != nil {
 		return err
 	}
-	return retireOwnedDirectoryAtPath(parent, name, name, ".fu-retired-dir-", expected.RootIdentity, expected.RootMode)
+	return retireOwnedDirectoryAtPath(parent, name, name, ".fu-retired-dir-", actual.RootIdentity, expected.RootMode)
 }
 
 // compareOwnedTreeCleanupState validates every state the bottom-up removal
@@ -172,7 +202,7 @@ func RemoveOwnedTreeAt(parent *os.File, name string, expected OwnedTree) error {
 // been removed. Whichever copy remains must match the original manifest
 // exactly, and every actual path must be accounted for before cleanup resumes.
 func compareOwnedTreeCleanupState(actual, expected OwnedTree, rootPath string) error {
-	if actual.RootIdentity != expected.RootIdentity || actual.RootMode != expected.RootMode {
+	if !actual.RootIdentity.Same(expected.RootIdentity) || actual.RootMode != expected.RootMode {
 		return fmt.Errorf("%w: transaction-owned root no longer matches its recorded identity and mode", ErrOwnedTreeChanged)
 	}
 	actualByPath := make(map[string]OwnedTreeEntry, len(actual.Entries))
@@ -256,12 +286,15 @@ func RemoveOwnedContents(dir *os.File, expected OwnedTree) error {
 	if err := removeOwnedDirectoryContents(dir, "", expected); err != nil {
 		return err
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(int(dir.Fd()), &stat); err != nil {
+	// The descriptor has pinned this exact directory since the initial snapshot;
+	// unlike a pathname revalidation, comparing it with the admitted record
+	// cannot observe a same-name replacement.
+	identity, stat, err := openIdentity(int(dir.Fd()))
+	if err != nil {
 		return err
 	}
 	mode, kind, err := modeAndKind(&stat)
-	if err != nil || kind != ownedDirectory || identityFromStat(&stat) != expected.RootIdentity || uint32(mode) != expected.RootMode {
+	if err != nil || kind != ownedDirectory || !identity.Same(expected.RootIdentity) || uint32(mode) != expected.RootMode {
 		return fmt.Errorf("%w: owned root changed during contents cleanup", ErrOwnedTreeChanged)
 	}
 	checkFD, err := unix.Openat(int(dir.Fd()), ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
@@ -298,8 +331,8 @@ func snapshotOwnedOpenDirectory(dir *os.File) (OwnedTree, error) {
 		_ = unix.Close(fd)
 		return OwnedTree{}, errors.New("snapshot owned directory: invalid descriptor")
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
+	identity, stat, err := openIdentity(fd)
+	if err != nil {
 		_ = copyDir.Close()
 		return OwnedTree{}, err
 	}
@@ -308,7 +341,7 @@ func snapshotOwnedOpenDirectory(dir *os.File) (OwnedTree, error) {
 		_ = copyDir.Close()
 		return OwnedTree{}, fmt.Errorf("snapshot owned directory: root is not a directory")
 	}
-	tree := OwnedTree{RootIdentity: identityFromStat(&stat), RootMode: uint32(mode)}
+	tree := OwnedTree{RootIdentity: identity, RootMode: uint32(mode)}
 	if err := scanOwnedDirectory(copyDir, "", &tree.Entries, 0); err != nil {
 		_ = copyDir.Close()
 		return OwnedTree{}, err
@@ -381,13 +414,13 @@ func removeOwnedDirectoryContents(dir *os.File, prefix string, expected OwnedTre
 			_ = unix.Close(fd)
 			return errors.New("remove owned tree: invalid child descriptor")
 		}
-		var opened unix.Stat_t
-		if err := unix.Fstat(fd, &opened); err != nil {
+		openedIdentity, opened, err := openIdentity(fd)
+		if err != nil {
 			_ = child.Close()
 			return err
 		}
 		mode, kind, err := modeAndKind(&opened)
-		if err != nil || kind != ownedDirectory || identityFromStat(&opened) != entry.Identity || uint32(mode) != entry.Mode {
+		if err != nil || kind != ownedDirectory || !openedIdentity.Same(entry.Identity) || uint32(mode) != entry.Mode {
 			_ = child.Close()
 			return fmt.Errorf("%w: owned directory %q changed before cleanup", ErrOwnedTreeChanged, entry.Path)
 		}
@@ -398,7 +431,7 @@ func removeOwnedDirectoryContents(dir *os.File, prefix string, expected OwnedTre
 		if err := child.Close(); err != nil {
 			return err
 		}
-		if err := retireOwnedDirectoryAtPath(dir, name, entry.Path, ".fu-retired-dir-", entry.Identity, entry.Mode); err != nil {
+		if err := retireOwnedDirectoryAtPath(dir, name, entry.Path, ".fu-retired-dir-", openedIdentity, entry.Mode); err != nil {
 			return err
 		}
 	}
@@ -406,6 +439,14 @@ func removeOwnedDirectoryContents(dir *os.File, prefix string, expected OwnedTre
 }
 
 func retireOwnedEntryAt(parent *os.File, name, prefix string, expected OwnedTreeEntry) error {
+	return retireOwnedEntryAtWithOps(parent, name, prefix, expected, entryIdentityAt, snapshotOwnedLeafAt, RenameNoReplaceAt)
+}
+
+type ownedLeafIdentityCapture func(int, string) (FileIdentity, unix.Stat_t, error)
+type ownedLeafSnapshotFunc func(int, string, string) (OwnedTreeEntry, error)
+type descriptorRenameFunc func(*os.File, string, *os.File, string) error
+
+func retireOwnedEntryAtWithOps(parent *os.File, name, prefix string, expected OwnedTreeEntry, capture ownedLeafIdentityCapture, snapshot ownedLeafSnapshotFunc, rename descriptorRenameFunc) error {
 	defer keepDescriptorOwnersAlive(parent)
 	retired := ownedCleanupRetiredName(prefix, expected.Path, expected.Identity)
 	livePresent, err := namePresentAt(parent, name)
@@ -424,17 +465,30 @@ func retireOwnedEntryAt(parent *os.File, name, prefix string, expected OwnedTree
 		return nil
 	}
 	renamedHere := false
+	postRenameExpected := expected
 	if livePresent {
-		if err := RenameNoReplaceAt(parent, name, parent, retired); err != nil {
+		observedIdentity, observedStat, inspectErr := capture(int(parent.Fd()), name)
+		if inspectErr != nil {
+			return ownedLeafIdentityMismatch(expected.Path, inspectErr)
+		}
+		observedMode, observedKind, inspectErr := modeAndKind(&observedStat)
+		if inspectErr != nil {
+			return ownedLeafIdentityMismatch(expected.Path, inspectErr)
+		}
+		if !observedIdentity.Same(expected.Identity) || observedKind != expected.Kind || uint32(observedMode) != expected.Mode {
+			return fmt.Errorf("%w: owned entry %q changed identity, type, or mode before retirement", ErrOwnedTreeChanged, expected.Path)
+		}
+		if err := rename(parent, name, parent, retired); err != nil {
 			return retirementRenameError(name, retired, err)
 		}
 		renamedHere = true
+		postRenameExpected.Identity = observedIdentity
 	}
-	actual, inspectErr := snapshotOwnedLeafAt(int(parent.Fd()), retired, expected.Path)
-	if inspectErr != nil || compareOwnedEntry(actual, expected) != nil {
+	actual, inspectErr := snapshot(int(parent.Fd()), retired, expected.Path)
+	if inspectErr != nil || compareOwnedEntry(actual, postRenameExpected) != nil {
 		mismatch := fmt.Errorf("%w: retired entry %q changed before cleanup", ErrOwnedTreeChanged, expected.Path)
 		if inspectErr != nil {
-			mismatch = fmt.Errorf("%w: inspect retired entry %q: %v", ErrOwnedTreeChanged, expected.Path, inspectErr)
+			mismatch = retiredLeafIdentityMismatch(expected.Path, inspectErr)
 		}
 		if renamedHere {
 			if restoreErr := RestoreRetiredAt(parent, retired, name); restoreErr != nil {
@@ -446,8 +500,16 @@ func retireOwnedEntryAt(parent *os.File, name, prefix string, expected OwnedTree
 	return removeRetiredAt(parent, retired, name, 0, "unlinkat", renamedHere)
 }
 
+func ownedLeafIdentityMismatch(path string, cause error) error {
+	mismatch := fmt.Errorf("%w: inspect owned entry %q before retirement", ErrOwnedTreeChanged, path)
+	if cause != nil {
+		return errors.Join(mismatch, cause)
+	}
+	return mismatch
+}
+
 func snapshotOwnedLeafAt(parentFD int, name, logicalPath string) (OwnedTreeEntry, error) {
-	stat, err := statAt(parentFD, name)
+	identity, stat, err := entryIdentityAt(parentFD, name)
 	if err != nil {
 		return OwnedTreeEntry{}, err
 	}
@@ -455,10 +517,10 @@ func snapshotOwnedLeafAt(parentFD int, name, logicalPath string) (OwnedTreeEntry
 	if err != nil {
 		return OwnedTreeEntry{}, err
 	}
-	entry := OwnedTreeEntry{Path: logicalPath, Kind: kind, Mode: uint32(mode), Identity: identityFromStat(&stat)}
+	entry := OwnedTreeEntry{Path: logicalPath, Kind: kind, Mode: uint32(mode), Identity: identity}
 	switch kind {
 	case ownedFile:
-		entry.Digest, _, err = hashFileAt(parentFD, name, entry.Identity)
+		entry.Digest, _, _, err = hashFileAt(parentFD, name, entry.Identity)
 	case ownedSymlink:
 		entry.Target, err = readlinkAt(parentFD, name)
 	case ownedDirectory:
@@ -472,6 +534,16 @@ func retireOwnedDirectoryAt(parent *os.File, name, prefix string, expected FileI
 }
 
 func retireOwnedDirectoryAtPath(parent *os.File, name, logicalPath, prefix string, expected FileIdentity, expectedMode uint32) error {
+	return retireOwnedDirectoryAtPathWithCapture(parent, name, logicalPath, prefix, expected, expectedMode, entryIdentityAt)
+}
+
+func retireOwnedDirectoryAtPathWithCapture(
+	parent *os.File,
+	name, logicalPath, prefix string,
+	expected FileIdentity,
+	expectedMode uint32,
+	capture ownedLeafIdentityCapture,
+) error {
 	retired := ownedCleanupRetiredName(prefix, logicalPath, expected)
 	livePresent, err := namePresentAt(parent, name)
 	if err != nil {
@@ -489,13 +561,34 @@ func retireOwnedDirectoryAtPath(parent *os.File, name, logicalPath, prefix strin
 		return nil
 	}
 	renamedHere := false
+	postRenameExpected := expected
 	if livePresent {
+		identity, stat, err := capture(int(parent.Fd()), name)
+		if err != nil {
+			return ownedDirectoryIdentityMismatch(logicalPath, err)
+		}
+		mode, kind, modeErr := modeAndKind(&stat)
+		if modeErr != nil || kind != ownedDirectory || !identity.Same(expected) || uint32(mode) != expectedMode {
+			return atomicIdentityMismatch(
+				fmt.Sprintf("owned directory %q changed before retirement", name),
+				modeErr,
+			)
+		}
 		if err := RenameNoReplaceAt(parent, name, parent, retired); err != nil {
 			return retirementRenameError(name, retired, err)
 		}
 		renamedHere = true
+		postRenameExpected = identity
 	}
-	return finishRetiredOwnedDirectory(parent, retired, name, expected, expectedMode, renamedHere)
+	return finishRetiredOwnedDirectory(parent, retired, name, postRenameExpected, expectedMode, renamedHere)
+}
+
+// Once a manifest has admitted a live object for retirement, a failed identity
+// recapture is an ownership conflict as well as an environmental error. Pure
+// discovery paths, including archive recovery scans, have not admitted an
+// object yet and preserve environmental errors without adding that sentinel.
+func ownedDirectoryIdentityMismatch(path string, cause error) error {
+	return atomicIdentityMismatch(fmt.Sprintf("inspect owned directory %q before retirement", path), cause)
 }
 
 func ownedSiblingPath(parent *os.File, name string) string {
@@ -514,10 +607,10 @@ func retirementRenameError(live, retired string, err error) error {
 
 func finishRetiredOwnedDirectory(parent *os.File, retired, name string, expected FileIdentity, expectedMode uint32, renamedHere bool) error {
 	defer keepDescriptorOwnersAlive(parent)
-	stat, statErr := statAt(int(parent.Fd()), retired)
+	identity, stat, statErr := entryIdentityAt(int(parent.Fd()), retired)
 	mode, kind, modeErr := modeAndKind(&stat)
-	if statErr != nil || modeErr != nil || kind != ownedDirectory || identityFromStat(&stat) != expected || uint32(mode) != expectedMode {
-		mismatch := fmt.Errorf("%w: retired directory %q changed before finalization", ErrOwnedTreeChanged, name)
+	if statErr != nil || modeErr != nil || kind != ownedDirectory || !identity.Same(expected) || uint32(mode) != expectedMode {
+		mismatch := retiredDirectoryIdentityMismatch(name, statErr, modeErr)
 		if renamedHere {
 			if restoreErr := RestoreRetiredAt(parent, retired, name); restoreErr != nil {
 				return errors.Join(mismatch, fmt.Errorf("restore mismatched retired directory %q: %w", retired, restoreErr))
@@ -526,6 +619,13 @@ func finishRetiredOwnedDirectory(parent *os.File, retired, name string, expected
 		return mismatch
 	}
 	return removeRetiredAt(parent, retired, name, unix.AT_REMOVEDIR, "rmdir", renamedHere)
+}
+
+func retiredDirectoryIdentityMismatch(name string, statErr, modeErr error) error {
+	return atomicIdentityMismatch(
+		fmt.Sprintf("retired directory %q changed before finalization", name),
+		errors.Join(statErr, modeErr),
+	)
 }
 
 func removeRetiredAt(parent *os.File, retired, original string, flags int, operation string, renamedHere bool) error {

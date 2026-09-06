@@ -19,14 +19,6 @@ const (
 	adoptEntrySymlink   = "symlink"
 )
 
-func adoptIdentity(stat *unix.Stat_t) store.FileIdentity {
-	return store.FileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}
-}
-
-func adoptIdentityValid(id store.FileIdentity) bool {
-	return id.Inode != 0
-}
-
 func openAdoptDirectory(path string) (*os.File, store.FileIdentity, error) {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -37,12 +29,12 @@ func openAdoptDirectory(path string) (*os.File, store.FileIdentity, error) {
 		_ = unix.Close(fd)
 		return nil, store.FileIdentity{}, fmt.Errorf("open %s: invalid directory descriptor", path)
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
+	identity, _, err := store.OpenIdentity(fd)
+	if err != nil {
 		_ = file.Close()
 		return nil, store.FileIdentity{}, err
 	}
-	return file, adoptIdentity(&stat), nil
+	return file, identity, nil
 }
 
 func statAdoptEntry(parentFD int, name string) (unix.Stat_t, error) {
@@ -103,7 +95,7 @@ func captureAdoptTargetWithHooks(a agent.Agent, name, digest string, wholeDir bo
 		return AdoptTarget{}, err
 	}
 	defer parent.Close()
-	entry, err := statAdoptEntry(int(parent.Fd()), entryName)
+	entryIdentity, entry, err := store.EntryIdentityAt(int(parent.Fd()), entryName)
 	if err != nil {
 		return AdoptTarget{}, err
 	}
@@ -112,7 +104,7 @@ func captureAdoptTargetWithHooks(a agent.Agent, name, digest string, wholeDir bo
 		SkillsDir:      skillsDir,
 		WholeDir:       wholeDir,
 		ParentIdentity: parentIdentity,
-		EntryIdentity:  adoptIdentity(&entry),
+		EntryIdentity:  entryIdentity,
 		Digest:         digest,
 	}
 	mode := uint32(entry.Mode) & uint32(unix.S_IFMT)
@@ -205,13 +197,13 @@ func scanDirSwitchEntries(root *os.Root) ([]DirSwitchEntry, error) {
 	}
 	manifest := make([]DirSwitchEntry, 0, len(entries))
 	for _, entry := range entries {
-		stat, err := statAdoptEntry(int(dir.Fd()), entry.Name())
+		identity, stat, err := store.EntryIdentityAt(int(dir.Fd()), entry.Name())
 		if err != nil {
 			_ = dir.Close()
 			return nil, err
 		}
 		mode := checkedAgentFileMode(uint32(stat.Mode))
-		item := DirSwitchEntry{Name: entry.Name(), Mode: uint32(mode.Type()), Identity: adoptIdentity(&stat)}
+		item := DirSwitchEntry{Name: entry.Name(), Mode: uint32(mode.Type()), Identity: identity}
 		if mode&fs.ModeSymlink != 0 {
 			item.LinkTarget, err = readAdoptLink(int(dir.Fd()), entry.Name())
 			if err != nil {
@@ -228,6 +220,18 @@ func scanDirSwitchEntries(root *os.Root) ([]DirSwitchEntry, error) {
 	return manifest, nil
 }
 
+// same reports whether two manifest entries describe the same child. Identity
+// goes through FileIdentity.Same rather than struct equality so a persisted
+// entry captured without a handle still reconciles with one captured now.
+func (e DirSwitchEntry) same(other DirSwitchEntry) bool {
+	if !e.Identity.Same(other.Identity) {
+		return false
+	}
+	e.Identity = store.FileIdentity{}
+	other.Identity = store.FileIdentity{}
+	return e == other
+}
+
 // sameDirSwitchEntries is the strict comparison, identity included. It is
 // correct only for objects fu created and can therefore prove it owns: the
 // replacement sibling and the archived backup. See
@@ -238,7 +242,7 @@ func sameDirSwitchEntries(left, right []DirSwitchEntry) bool {
 		return false
 	}
 	for i := range left {
-		if left[i] != right[i] {
+		if !left[i].same(right[i]) {
 			return false
 		}
 	}
@@ -262,6 +266,11 @@ func sameDirSwitchEntries(left, right []DirSwitchEntry) bool {
 // cannot be undone at all, so the conflict became permanent, and in the
 // swapped-vacant window it became permanent with the agent's skills directory
 // missing entirely.
+//
+// The scan still seals each child's identity so its returned mode belongs to
+// one observed object. A replacement during that narrow capture window is
+// therefore refused and isolates the agent, even though a replacement that
+// completes before the scan is accepted when its name and type are unchanged.
 func sameDirSwitchTargetEntries(left, right []DirSwitchEntry) bool {
 	if len(left) != len(right) {
 		return false
@@ -290,12 +299,9 @@ func openBoundAdoptParent(target AdoptTarget) (*os.File, error) {
 	}
 	parent, identity, err := openAdoptDirectory(parentPath)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, asTargetConflict(fmt.Errorf("%w: reopen adopt parent %s: %w", ErrTxnConflict, parentPath, err))
-		}
 		return nil, asTargetConflict(fmt.Errorf("%w: reopen adopt parent %s: %w", ErrTxnConflict, parentPath, err))
 	}
-	if identity != target.ParentIdentity {
+	if !identity.Same(target.ParentIdentity) {
 		_ = parent.Close()
 		return nil, asTargetConflict(fmt.Errorf("%w: adopt parent %s was replaced", ErrTxnConflict, parentPath))
 	}
@@ -303,21 +309,38 @@ func openBoundAdoptParent(target AdoptTarget) (*os.File, error) {
 }
 
 func pairBoundAdoptRoot(path string, dir *os.File, expected store.FileIdentity) (*os.Root, error) {
+	return pairBoundAdoptRootWithIdentityCapture(path, dir, expected, store.OpenIdentity)
+}
+
+type openIdentityCapture func(int) (store.FileIdentity, unix.Stat_t, error)
+
+func pairBoundAdoptRootWithIdentityCapture(path string, dir *os.File, expected store.FileIdentity, capture openIdentityCapture) (*os.Root, error) {
+	defer keepDescriptorOwnersAlive(dir)
 	root, err := os.OpenRoot(path)
 	if err != nil {
 		return nil, fmt.Errorf("%w: open rooted adopt parent %s: %v", ErrTxnConflict, path, err)
 	}
-	rootInfo, err := root.Stat(".")
+	dirIdentity, _, err := capture(int(dir.Fd()))
 	if err != nil {
 		_ = root.Close()
 		return nil, err
 	}
-	dirInfo, err := dir.Stat()
+	opened, err := root.Open(".")
 	if err != nil {
 		_ = root.Close()
 		return nil, err
 	}
-	if !os.SameFile(rootInfo, dirInfo) || !adoptIdentityValid(expected) {
+	rootIdentity, _, identityErr := capture(int(opened.Fd()))
+	closeErr := opened.Close()
+	if identityErr != nil {
+		_ = root.Close()
+		return nil, identityErr
+	}
+	if closeErr != nil {
+		_ = root.Close()
+		return nil, closeErr
+	}
+	if !expected.Valid() || !dirIdentity.Same(expected) || !rootIdentity.Same(expected) || !rootIdentity.Same(dirIdentity) {
 		_ = root.Close()
 		return nil, fmt.Errorf("%w: adopt parent %s changed while its descriptor was being paired", ErrTxnConflict, path)
 	}
@@ -334,8 +357,7 @@ func openBoundAdoptSource(target AdoptTarget) (*os.Root, error) {
 		_ = root.Close()
 		return nil, asTargetConflict(err)
 	}
-	var stat unix.Stat_t
-	statErr := unix.Fstat(int(opened.Fd()), &stat)
+	identity, _, statErr := store.OpenIdentity(int(opened.Fd()))
 	closeErr := opened.Close()
 	if statErr != nil {
 		_ = root.Close()
@@ -345,7 +367,7 @@ func openBoundAdoptSource(target AdoptTarget) (*os.Root, error) {
 		_ = root.Close()
 		return nil, asTargetConflict(closeErr)
 	}
-	if adoptIdentity(&stat) != target.SourceIdentity {
+	if !identity.Same(target.SourceIdentity) {
 		_ = root.Close()
 		return nil, asTargetConflict(fmt.Errorf("%w: recorded adopt source %s was replaced", ErrTxnConflict, target.SourcePath))
 	}
@@ -353,19 +375,53 @@ func openBoundAdoptSource(target AdoptTarget) (*os.Root, error) {
 }
 
 func validateCurrentAdoptEntry(parent *os.File, target AdoptTarget, name string) error {
+	_, _, err := validateCurrentAdoptEntryStat(parent, target, name)
+	return err
+}
+
+func validateCurrentAdoptEntryStat(parent *os.File, target AdoptTarget, name string) (store.FileIdentity, unix.Stat_t, error) {
+	return validateCurrentAdoptEntryStatWithCapture(parent, target, name, target.EntryIdentity, store.EntryIdentityAt)
+}
+
+func validateCurrentAdoptEntryStatWithCapture(
+	parent *os.File,
+	target AdoptTarget,
+	name string,
+	expectedIdentity store.FileIdentity,
+	capture func(int, string) (store.FileIdentity, unix.Stat_t, error),
+) (store.FileIdentity, unix.Stat_t, error) {
 	defer keepDescriptorOwnersAlive(parent)
 	entryName := name
 	if target.WholeDir {
 		entryName = filepath.Base(target.SkillsDir)
 	}
-	entry, err := statAdoptEntry(int(parent.Fd()), entryName)
+	entryIdentity, entry, err := capture(int(parent.Fd()), entryName)
 	if errors.Is(err, unix.ENOENT) {
-		return asTargetConflict(fs.ErrNotExist)
+		return store.FileIdentity{}, unix.Stat_t{}, asTargetConflict(fs.ErrNotExist)
 	}
 	if err != nil {
-		return asTargetConflict(err)
+		return store.FileIdentity{}, unix.Stat_t{}, asTargetConflict(err)
 	}
-	if adoptIdentity(&entry) != target.EntryIdentity {
+	if err := validateObservedAdoptEntry(parent, target, name, expectedIdentity, entryIdentity, entry); err != nil {
+		return store.FileIdentity{}, unix.Stat_t{}, err
+	}
+	return entryIdentity, entry, nil
+}
+
+func validateObservedAdoptEntry(
+	parent *os.File,
+	target AdoptTarget,
+	name string,
+	expectedIdentity store.FileIdentity,
+	entryIdentity store.FileIdentity,
+	entry unix.Stat_t,
+) error {
+	defer keepDescriptorOwnersAlive(parent)
+	entryName := name
+	if target.WholeDir {
+		entryName = filepath.Base(target.SkillsDir)
+	}
+	if !entryIdentity.Same(expectedIdentity) {
 		return asTargetConflict(fmt.Errorf("%w: adopt entry %s/%s was replaced", ErrTxnConflict, target.Agent, name))
 	}
 	mode := uint32(entry.Mode) & uint32(unix.S_IFMT)

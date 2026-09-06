@@ -233,7 +233,7 @@ func rollBackUncommittedInstall(st *store.Store, storeRoot, skillsRoot, stagingR
 		if privatePresent {
 			manifest, err = st.PublishStagedRootOwned(reservation, record.Name)
 		} else {
-			err = st.ValidateStagedOwned(record.Name, manifest)
+			manifest, err = st.ObserveStagedOwned(record.Name, manifest)
 		}
 		if err != nil {
 			return mapInstallOwnershipError("recover staged-root reservation", err)

@@ -16,8 +16,11 @@ type regularFileReadHooks struct {
 	beforePostStat func() error
 }
 
+// regularFileStamp is the metadata a read is verified against. It carries no
+// identity on purpose: every stamp comparison is between two fstat calls on
+// one open descriptor, whose inode cannot change, and the one cross-descriptor
+// case (CreateStagedFileOwned) verifies identity through hashFileAt.
 type regularFileStamp struct {
-	identity  FileIdentity
 	mode      uint32
 	size      int64
 	mtimeSec  int64
@@ -28,7 +31,6 @@ type regularFileStamp struct {
 
 func stampRegularFile(stat *unix.Stat_t) regularFileStamp {
 	return regularFileStamp{
-		identity:  identityFromStat(stat),
 		mode:      uint32(stat.Mode),
 		size:      stat.Size,
 		mtimeSec:  int64(stat.Mtim.Sec),
@@ -78,44 +80,45 @@ func requireRegularStat(name string, stat *unix.Stat_t) error {
 	return nil
 }
 
-func openRegularFileAt(parentFD int, name string) (*os.File, unix.Stat_t, error) {
+func openRegularFileAt(parentFD int, name string) (*os.File, FileIdentity, unix.Stat_t, error) {
 	return openRegularFileAtMode(parentFD, name, unix.O_RDONLY)
 }
 
 // openRegularFileAtMode is openRegularFileAt with an explicit access mode for
-// callers that need more than a read-only descriptor.
-func openRegularFileAtMode(parentFD int, name string, access int) (*os.File, unix.Stat_t, error) {
-	observed, err := statAt(parentFD, name)
+// callers that need more than a read-only descriptor. The identity returned
+// is the opened object's, proven equal to the one classified by name.
+func openRegularFileAtMode(parentFD int, name string, access int) (*os.File, FileIdentity, unix.Stat_t, error) {
+	observedIdentity, observed, err := entryIdentityAt(parentFD, name)
 	if err != nil {
-		return nil, unix.Stat_t{}, err
+		return nil, FileIdentity{}, unix.Stat_t{}, err
 	}
 	if err := requireRegularStat(name, &observed); err != nil {
-		return nil, unix.Stat_t{}, err
+		return nil, FileIdentity{}, unix.Stat_t{}, err
 	}
 	fd, err := unix.Openat(parentFD, name,
 		access|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, unix.Stat_t{}, err
+		return nil, FileIdentity{}, unix.Stat_t{}, err
 	}
 	file := os.NewFile(uintptr(fd), name)
 	if file == nil {
 		_ = unix.Close(fd)
-		return nil, unix.Stat_t{}, errors.New("invalid regular-file descriptor")
+		return nil, FileIdentity{}, unix.Stat_t{}, errors.New("invalid regular-file descriptor")
 	}
-	var opened unix.Stat_t
-	if err := unix.Fstat(fd, &opened); err != nil {
+	openedIdentity, opened, err := openIdentity(fd)
+	if err != nil {
 		_ = file.Close()
-		return nil, unix.Stat_t{}, err
+		return nil, FileIdentity{}, unix.Stat_t{}, err
 	}
 	if err := requireRegularStat(name, &opened); err != nil {
 		_ = file.Close()
-		return nil, unix.Stat_t{}, fmt.Errorf("%w: %q changed type after classification: %v", errRegularFileChanged, name, err)
+		return nil, FileIdentity{}, unix.Stat_t{}, fmt.Errorf("%w: %q changed type after classification: %v", errRegularFileChanged, name, err)
 	}
-	if identityFromStat(&opened) != identityFromStat(&observed) {
+	if !openedIdentity.Same(observedIdentity) {
 		_ = file.Close()
-		return nil, unix.Stat_t{}, fmt.Errorf("%w: %q changed identity after classification", errRegularFileChanged, name)
+		return nil, FileIdentity{}, unix.Stat_t{}, fmt.Errorf("%w: %q changed identity after classification", errRegularFileChanged, name)
 	}
-	return file, opened, nil
+	return file, openedIdentity, opened, nil
 }
 
 func readRegularFileAt(parentFD int, name string, maxBytes int64) ([]byte, error) {
@@ -126,7 +129,7 @@ func readRegularFileAtWithHooks(parentFD int, name string, maxBytes int64, hooks
 	if maxBytes < 0 {
 		return nil, fmt.Errorf("read regular file %q: negative size limit %d", name, maxBytes)
 	}
-	file, stat, err := openRegularFileAt(parentFD, name)
+	file, _, stat, err := openRegularFileAt(parentFD, name)
 	if err != nil {
 		return nil, err
 	}
