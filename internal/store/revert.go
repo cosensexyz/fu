@@ -45,9 +45,18 @@ import (
 // message name a different count from the one actually resolved. One parameter
 // cannot drift from itself.
 func (s *Store) Revert(n int) ([]string, error) {
+	return s.revertWithHooks(n, worktreeRewriteHooks{})
+}
+
+func (s *Store) revertWithHooks(n int, hooks worktreeRewriteHooks) ([]string, error) {
 	if n < 1 {
 		return nil, fmt.Errorf("revert count must be >= 1, got %d", n)
 	}
+	guard, err := s.newWorktreeGuard()
+	if err != nil {
+		return nil, err
+	}
+	guard.hooks = hooks
 	target, err := s.resolveOperationsBack(n)
 	if err != nil {
 		return nil, fmt.Errorf("no commit %d operation(s) back: %w", n, err)
@@ -64,7 +73,10 @@ func (s *Store) Revert(n int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	changed, err := s.applyTreeToWorktree(paths)
+	if hooks.beforeApply != nil {
+		hooks.beforeApply()
+	}
+	changed, err := s.applyTreeToWorktreeGuarded(paths, guard)
 	if err != nil {
 		return changed, fmt.Errorf("reset worktree to %s: %w", target.String()[:7], err)
 	}
@@ -101,7 +113,13 @@ func (s *Store) Revert(n int) ([]string, error) {
 			s.withdrawPreparedIndex(prepared))
 	}
 
-	outcome, err := s.CommitPrepared(fmt.Sprintf("revert: back %d operation(s) to %s", n, target.String()[:7]), prepared)
+	if hooks.beforePublish != nil {
+		hooks.beforePublish()
+	}
+	if err := guard.checkAll(); err != nil {
+		return changed, err
+	}
+	outcome, err := s.commitPreparedWithReference(fmt.Sprintf("revert: back %d operation(s) to %s", n, target.String()[:7]), prepared, nil, &guard.ref)
 	if err == nil && !outcome.Written {
 		// The target tree equals HEAD's, so CommitPrepared's no-change branch
 		// published nothing. The worktree is right and nothing is broken, but

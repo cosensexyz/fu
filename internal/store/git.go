@@ -516,6 +516,10 @@ func (s *Store) CommitPrepared(msg string, prepared PreparedCommit) (CommitOutco
 }
 
 func (s *Store) commitPreparedWithHook(msg string, prepared PreparedCommit, beforeWrite func()) (CommitOutcome, error) {
+	return s.commitPreparedWithReference(msg, prepared, beforeWrite, nil)
+}
+
+func (s *Store) commitPreparedWithReference(msg string, prepared PreparedCommit, beforeWrite func(), expected *preparedCommitReference) (CommitOutcome, error) {
 	if prepared.fingerprint == "" {
 		return CommitOutcome{}, errors.New("prepared commit has no tree fingerprint")
 	}
@@ -525,6 +529,15 @@ func (s *Store) commitPreparedWithHook(msg string, prepared PreparedCommit, befo
 	refState, err := s.capturePreparedCommitReference()
 	if err != nil {
 		return CommitOutcome{}, err
+	}
+	if expected != nil {
+		if refState.before == nil || expected.before == nil ||
+			refState.head.String() != expected.head.String() || refState.before.String() != expected.before.String() {
+			return CommitOutcome{}, fmt.Errorf("%w: HEAD changed before publishing the rewrite", ErrConcurrentWorktreeChange)
+		}
+		// The rewrite's starting reference remains the CAS precondition even
+		// if another writer arrives while the commit object is being built.
+		refState = *expected
 	}
 	if beforeWrite != nil {
 		beforeWrite()

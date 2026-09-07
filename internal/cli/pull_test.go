@@ -87,3 +87,16 @@ func TestPullCommandDoesNotConfirmAnIncompleteFastForward(t *testing.T) {
 		}
 	}
 }
+
+func TestPullCommandReportsPathsChangedBeforeFailure(t *testing.T) {
+	failure := errors.New("concurrent store change")
+	out, err := runPull(t, &fakePullApplication{
+		outcome: engine.PullOutcome{Changed: []string{"skills/a/SKILL.md", "skills/b/SKILL.md"}},
+		err:     failure,
+	})
+	if !errors.Is(err, failure) || !strings.Contains(out, "changed 2 path(s) in the store worktree:") ||
+		!strings.Contains(out, "  skills/a/SKILL.md\n") || !strings.Contains(out, "  skills/b/SKILL.md\n") ||
+		strings.Contains(out, "fast-forwarded ") {
+		t.Fatalf("partial changes must be reported without claiming a fast-forward: out=%q err=%v", out, err)
+	}
+}

@@ -441,26 +441,11 @@ func RevertOperations(st *store.Store, agents []agent.Agent, n int) (outcome Rev
 		// adjustment: this call's own sweep is skipped for the same reason
 		// every other sweep is, because it is not an operation. Nothing is
 		// left for the caller to correct.
-		// Not guarded against a concurrent direct-git writer the way run is.
-		// run compares bytes after its sweep and raises ErrConcurrentStoreChange
-		// (pipeline.go); revert has no equivalent, and applyTreeToWorktree
-		// overwrites any path where the worktree differs from the target before
-		// the tree fingerprint is taken. That fingerprint catches content the
-		// target does not name -- it cannot catch *different* content on a path
-		// the target does name, because the updater has already converged it.
-		//
-		// The window is narrow: fu.lock excludes other fu processes, so it takes
-		// a direct-git write landing inside this locked section. It is recorded
-		// rather than closed because closing it means giving revert run's whole
-		// baseline-comparison apparatus, which is a larger change than this
-		// round; it does mean DESIGN's "sweeping loses not one byte on fu's
-		// side" is, for revert, stated more strongly than the code supports.
-		//
-		// "Recorded" means recorded in DESIGN §6's known-gap list, which is the
-		// only place that survives. It used to cite the batch design document
-		// under docs/superpowers/ instead -- a directory .gitignore excludes,
-		// so the sole durable trace of the gap was this comment asserting it
-		// was written down somewhere else.
+		// Revert captures the swept HEAD and public index, verifies worktree
+		// bytes before each affected path, and rechecks before index/ref
+		// publication. A detected external edit stays in place; Changed still
+		// reports paths completed before a later conflict. Check-to-syscall
+		// windows remain bounded as documented in DESIGN's known gaps.
 		changed, err := checked.Revert(n)
 		outcome.Changed = changed
 		if err != nil {

@@ -472,9 +472,18 @@ type FastForwardOutcome struct {
 // The caller must Sweep immediately before FastForward in the same locked
 // session, so the index equals HEAD and pending hand edits are preserved.
 func (s *Store) FastForward() (FastForwardOutcome, error) {
+	return s.fastForwardWithHooks(worktreeRewriteHooks{})
+}
+
+func (s *Store) fastForwardWithHooks(hooks worktreeRewriteHooks) (FastForwardOutcome, error) {
 	if s.worktreeFS == nil {
 		return FastForwardOutcome{}, errUnpinnedWorktree
 	}
+	guard, err := s.newWorktreeGuard()
+	if err != nil {
+		return FastForwardOutcome{}, err
+	}
+	guard.hooks = hooks
 	branch, err := s.currentBranch()
 	if err != nil {
 		return FastForwardOutcome{}, err
@@ -529,10 +538,19 @@ func (s *Store) FastForward() (FastForwardOutcome, error) {
 	if err != nil {
 		return outcome, err
 	}
-	changed, err := s.applyTreeToWorktree(paths)
+	if hooks.beforeApply != nil {
+		hooks.beforeApply()
+	}
+	changed, err := s.applyTreeToWorktreeGuarded(paths, guard)
 	outcome.Changed = changed
 	if err != nil {
 		return outcome, fmt.Errorf("fast-forward worktree to %s: %w", tracking.Hash().String()[:7], err)
+	}
+	if hooks.beforePublish != nil {
+		hooks.beforePublish()
+	}
+	if err := guard.checkAll(); err != nil {
+		return outcome, err
 	}
 	updated := plumbing.NewHashReference(branch, tracking.Hash())
 	if err := s.Repo.Storer.CheckAndSetReference(updated, local); err != nil {

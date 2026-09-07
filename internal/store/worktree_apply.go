@@ -210,13 +210,13 @@ func (s *Store) checkTargetNoAbsoluteSymlinks(target map[string]worktreeTarget) 
 // the worktree and deletes what it finds there; this updater decides what to
 // touch without consulting the worktree at all.
 //
-// The worktree is enumerated exactly once, by the checkNoAbsoluteSymlinks
-// precondition below (walkStoreFiles, git.go), and that pass is read-only: it
-// reads link targets to decide whether to refuse, and not one of the names it
-// visits flows into the change set computed afterwards.
+// The reset path enumerates the worktree for checkNoAbsoluteSymlinks.
+// Revert and pull additionally compare its complete file projection through
+// worktreeGuard. These scans only decide whether to refuse; none of their
+// visited names widens the change set computed from the index and target.
 //
 // The path-set argument does not cover directories, and on its own it is
-// therefore not the safety argument. pruneEmptiedParents below issues Remove
+// therefore not the safety argument. pruneEmptiedParents below issues rmdir
 // on ancestor *directory* names, and git indexes no directory, so those names
 // are in neither the index nor the target: this updater demonstrably names and
 // unlinks paths outside union(index, target). What actually protects untracked
@@ -234,8 +234,17 @@ func (s *Store) checkTargetNoAbsoluteSymlinks(target map[string]worktreeTarget) 
 // target is HEAD, so HEAD is a subset of it, and revert and pull sweep before
 // applying their target trees, so the index equals HEAD.
 func (s *Store) applyTreeToWorktree(target map[string]worktreeTarget) (changed []string, err error) {
+	return s.applyTreeToWorktreeGuarded(target, nil)
+}
+
+func (s *Store) applyTreeToWorktreeGuarded(target map[string]worktreeTarget, guard *worktreeGuard) (changed []string, err error) {
 	if s.worktreeFS == nil {
 		return nil, errUnpinnedWorktree
+	}
+	if guard != nil {
+		if err := guard.checkAll(); err != nil {
+			return nil, err
+		}
 	}
 	// Precondition 5 of DESIGN §6, and it must stay a precondition: an
 	// escaping link is refused before a single path is touched, so a store
@@ -353,12 +362,23 @@ func (s *Store) applyTreeToWorktree(target map[string]worktreeTarget) (changed [
 				continue
 			}
 		}
+		if guard != nil && guard.hooks.beforePath != nil {
+			guard.hooks.beforePath(name)
+		}
+		if guard != nil {
+			if err := guard.checkPath(name); err != nil {
+				return changed, err
+			}
+		}
 		removed, err := s.removeWorktreeEntry(name)
 		if err != nil {
 			return changed, err
 		}
 		if removed {
 			changed = append(changed, name)
+			if guard != nil {
+				delete(guard.expected, name)
+			}
 			if err := s.pruneEmptiedParents(name); err != nil {
 				return changed, err
 			}
@@ -376,10 +396,16 @@ func (s *Store) applyTreeToWorktree(target map[string]worktreeTarget) (changed [
 		if matched {
 			continue
 		}
-		if err := s.writeWorktreeEntry(name, want); err != nil {
+		if guard != nil && guard.hooks.beforePath != nil {
+			guard.hooks.beforePath(name)
+		}
+		if err := s.writeWorktreeEntryGuarded(name, want, guard); err != nil {
 			return changed, err
 		}
 		changed = append(changed, name)
+		if guard != nil {
+			guard.expected[name] = want
+		}
 	}
 	// Skipped when nothing moved and the index already describes the target.
 	// Rebuilding unconditionally made a --hard over a worktree dirty only with
@@ -387,7 +413,10 @@ func (s *Store) applyTreeToWorktree(target map[string]worktreeTarget) (changed [
 	// reason -- and fail outright when another git process held the lock,
 	// despite having no work to do.
 	if len(changed) != 0 || !s.indexMatchesTarget(idx, target) {
-		if err := s.rebuildIndexFromTarget(target); err != nil {
+		if guard != nil && guard.hooks.beforeIndex != nil {
+			guard.hooks.beforeIndex()
+		}
+		if err := s.rebuildIndexFromTargetGuarded(target, guard); err != nil {
 			return changed, err
 		}
 	}
@@ -534,12 +563,10 @@ func (s *Store) headTargets() (map[string]worktreeTarget, error) {
 // the index is public and the supported direct-Git path may write it, and
 // holding the lock is what serialises this rewrite against that writer.
 //
-// It is a whole-index overwrite, not a compare-and-swap: nothing here reads
-// the previous index or compares against it. That is correct for what this
-// implements -- `git reset --hard` discards the index outright -- but the
-// distinction is worth stating, because a caller who read this as a CAS would
-// expect a concurrent index write to be detected, and it is not; it is
-// overwritten. The lock bounds the window, it does not report on it.
+// The reset wrapper deliberately overwrites the whole index. Revert and pull
+// use rebuildIndexFromTargetGuarded instead: while holding index.lock it
+// compares the captured public index and expected worktree before installing
+// the replacement, so a later Git writer's index is preserved on refusal.
 //
 // Version 2 is written unconditionally for the same reason: the target fully
 // determines the result, so nothing from a v3 or v4 index survives. A store
@@ -558,12 +585,21 @@ func (s *Store) headTargets() (map[string]worktreeTarget, error) {
 // included. What filling them buys is that the fallback is not taken, which is
 // also what real git writes into its index.
 func (s *Store) rebuildIndexFromTarget(target map[string]worktreeTarget) error {
+	return s.rebuildIndexFromTargetGuarded(target, nil)
+}
+
+func (s *Store) rebuildIndexFromTargetGuarded(target map[string]worktreeTarget, guard *worktreeGuard) error {
 	names := make([]string, 0, len(target))
 	for name := range target {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	return s.withIndexLock(func() error {
+		if guard != nil {
+			if err := guard.checkAll(); err != nil {
+				return err
+			}
+		}
 		idx := &indexformat.Index{Version: 2}
 		for _, name := range names {
 			want := target[name]
@@ -605,7 +641,24 @@ func (s *Store) rebuildIndexFromTarget(target map[string]worktreeTarget) error {
 		// Safe to call while .git/index.lock is held: the writer stages under
 		// its own .fu-index- name precisely so it does not consume the lock by
 		// renaming it.
-		return s.writePublicIndexAtomically(idx)
+		if guard != nil {
+			if err := guard.checkAll(); err != nil {
+				return err
+			}
+		}
+		if err := s.writePublicIndexAtomically(idx); err != nil {
+			return err
+		}
+		if guard != nil {
+			// Decode exactly what was installed while index.lock still
+			// excludes a Git writer, including serialized stat timestamps.
+			installed, err := s.Repo.Storer.Index()
+			if err != nil {
+				return err
+			}
+			guard.index = cloneIndex(installed)
+		}
+		return nil
 	})
 }
 
@@ -615,6 +668,10 @@ func (s *Store) rebuildIndexFromTarget(target map[string]worktreeTarget) error {
 // a symlink where it has a regular file -- and an open-for-write would either
 // fail or follow the link out of the store.
 func (s *Store) writeWorktreeEntry(name string, want worktreeTarget) error {
+	return s.writeWorktreeEntryGuarded(name, want, nil)
+}
+
+func (s *Store) writeWorktreeEntryGuarded(name string, want worktreeTarget, guard *worktreeGuard) error {
 	data, err := s.blobBytes(want.Hash)
 	if err != nil {
 		return err
@@ -636,6 +693,11 @@ func (s *Store) writeWorktreeEntry(name string, want worktreeTarget) error {
 			if isNotADirectory(err) {
 				return fmt.Errorf("refusing to write %q: %s is occupied by a file, not a directory: %w", name, dir, err)
 			}
+			return err
+		}
+	}
+	if guard != nil {
+		if err := guard.checkPath(name); err != nil {
 			return err
 		}
 	}
@@ -784,9 +846,9 @@ func isNotADirectory(err error) bool {
 //
 // worktreeFS exposes no "list then decide" primitive that would not itself
 // race a concurrent writer between the check and the remove, so emptiness is
-// proven exactly the way rootFilesystem.Remove already proves it when a path
-// turns out to hold a directory instead of a file: attempt the removal and
-// read the result. isDirectoryNotEmpty means real content is still there and
+// proven by a directory-only removal (AT_REMOVEDIR), which also refuses an
+// editor's file or symlink replacing the empty parent. An ordinary Remove
+// would unlink that replacement. isDirectoryNotEmpty means content remains and
 // is the stop condition, not an error -- including the ordinary case where a
 // sibling path the target still wants sorts after this one in
 // applyTreeToWorktree's alphabetical walk and has not been written yet; when
@@ -795,7 +857,7 @@ func isNotADirectory(err error) bool {
 // at most a redundant mkdir, never a wrong result.
 func (s *Store) pruneEmptiedParents(name string) error {
 	for dir := path.Dir(name); dir != "." && !s.worktreeFS.isLogicalRoot(dir); dir = path.Dir(dir) {
-		if err := s.worktreeFS.Remove(dir); err != nil {
+		if err := s.worktreeFS.removeDirectory(dir); err != nil {
 			switch {
 			case isDirectoryNotEmpty(err):
 				return nil
@@ -808,7 +870,7 @@ func (s *Store) pruneEmptiedParents(name string) error {
 				// prunable.
 				continue
 			case isNotADirectory(err):
-				return fmt.Errorf("refusing to prune %q: a file occupies one of its parent directories: %w", dir, err)
+				return fmt.Errorf("refusing to prune %q: the path or one of its parents is no longer a directory: %w", dir, err)
 			}
 			return err
 		}

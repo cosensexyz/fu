@@ -553,6 +553,26 @@ func (f *rootFilesystem) Remove(name string) error {
 	return closeErr
 }
 
+// removeDirectory atomically refuses non-directories, including symlinks.
+// Ancestor pruning must never unlink a file that replaced an emptied parent.
+func (f *rootFilesystem) removeDirectory(name string) error {
+	defer keepDescriptorOwnersAlive(f)
+	root, p, _, err := f.resolve(name)
+	if err != nil {
+		return err
+	}
+	dir, base, err := openCheckedParent(root, p, false)
+	if err != nil {
+		return err
+	}
+	removeErr := unix.Unlinkat(int(dir.Fd()), base, unix.AT_REMOVEDIR)
+	closeErr := dir.Close()
+	if removeErr != nil {
+		return errors.Join(&os.PathError{Op: "rmdir", Path: name, Err: removeErr}, closeErr)
+	}
+	return closeErr
+}
+
 func (f *rootFilesystem) Join(elem ...string) string { return filepath.Join(elem...) }
 
 // TempFile creates through the same no-follow walk as OpenFile: it is the

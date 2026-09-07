@@ -50,6 +50,11 @@ with each revertible operation numbered the way `fu revert n` counts.
 `remote` sets the store's single remote; `push` and `pull` sync with it,
 recording pending hand edits first, and `pull` only ever fast-forwards;
 `clone` restores the whole store on a new machine and rebuilds every link.
+`revert` and `pull` check for edits arriving after their initial sweep and
+stop when a worktree, index, or HEAD check detects a conflict. If some paths
+were already changed, they list those paths and preserve the remaining state
+for inspection; a later write command records that state before proceeding.
+These checks do not make the multi-file update atomic against external editors.
 Still designed but not built: `agent`.
 See [Roadmap](#roadmap).
 

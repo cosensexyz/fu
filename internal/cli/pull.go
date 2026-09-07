@@ -21,6 +21,12 @@ func newPullCmd(app pullApplication) *cobra.Command {
 			outcome, err := app.Pull()
 			printResult(cmd, outcome.Result)
 			if err != nil && !outcome.Completed {
+				if len(outcome.Changed) != 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "changed %d path(s) in the store worktree:\n", len(outcome.Changed))
+					for _, path := range outcome.Changed {
+						fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", path)
+					}
+				}
 				return err
 			}
 			out := cmd.OutOrStdout()
