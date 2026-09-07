@@ -221,12 +221,17 @@ var (
 	// can attribute that back to fu. ".fu-config-swap" is the same story at a
 	// fixed name -- DESIGN §6 has fu refuse to take over an active name it
 	// holds no matching record for, treating it as external occupation.
+	//
+	// ".fu-clone-" is the scratch store.Clone fills before renaming it into
+	// place; a clone killed before that rename leaves it, and nothing can
+	// collect it for the same reason nothing collects ".fu-src-".
 	stagingResiduePrefixes = []string{
 		".fu-src-",
 		".fu-new-",
 		".fu-retired-staging-",
 		".fu-config-candidate-",
 		".fu-config-swap",
+		".fu-clone-",
 	}
 )
 

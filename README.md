@@ -26,9 +26,9 @@ move, and every change is a commit.
 
 ## Status
 
-**Seventeen commands ship today:** `init`, `new`, `list`, `show`, `status`,
+**Twenty-one commands ship today:** `init`, `new`, `list`, `show`, `status`,
 `restore`, `revert`, `commit`, `log`, `enable`, `disable`, `add`, `adopt`,
-`rm`, `outdated`, `update`, `gc`.
+`rm`, `outdated`, `update`, `gc`, `remote`, `push`, `pull`, `clone`.
 
 `add` installs a skill from a git URL or a local directory and records the
 locked source; `adopt` takes skills that already live in an agent's directory
@@ -47,7 +47,10 @@ tree and republishing that as a new commit.
 `commit` records hand edits deliberately — one skill, or the whole store —
 under a generated subject line, with `-m` as the body; `log` lists history
 with each revertible operation numbered the way `fu revert n` counts.
-Still designed but not built: `clone`, `push`, `pull`, `remote`, `agent`.
+`remote` sets the store's single remote; `push` and `pull` sync with it,
+recording pending hand edits first, and `pull` only ever fast-forwards;
+`clone` restores the whole store on a new machine and rebuilds every link.
+Still designed but not built: `agent`.
 See [Roadmap](#roadmap).
 
 **macOS and Linux.** fu relies on POSIX directory-relative syscalls and does not
@@ -224,6 +227,10 @@ so a skill is never out of date in one agent and current in another.
 | `fu revert <n>` | Roll the store back `n` operations: any pending hand edit is committed first, then the store worktree converges to the tree from `n` operations ago and that becomes a new commit. |
 | `fu commit [name] [-m <message>]` | Record pending hand edits as one operation. With a name, only `skills/<name>/` is recorded and everything else stays pending; without one, the whole store is. The name must be a skill `fu.yaml` already registers. Naming a skill while paths outside it are staged with `git` and differ from the last commit is refused outright, with those paths named — they would be recorded by a commit whose subject names one skill. Unstage them in the store, or drop the name. With a name the worktree wins: a version you staged inside that skill and then edited further is superseded and does not enter history. That matches `git commit <path>` wherever a commit is actually written — but the two invert when the tree does not move. Stage a draft, edit the file back to the committed bytes, and real git exits 1 with `nothing to commit, working tree clean` and keeps your staged draft; fu prints the shorter `nothing to commit`, exits 0, and syncs the index onto the worktree, so the draft is gone. It is the one thing `fu commit` can destroy, and it is deliberate: without that sync the skill would report as pending forever. The subject line is generated (`commit: <name>`, or `commit: <skills>[, fu.yaml][, store]`, collapsing to `N skills` past five); `-m` becomes the body. Without a name, anything already staged with git directly is recorded first as `external: manual modifications`; if that consumes the whole difference, fu reports that commit and says `-m` went unused, rather than claiming there was nothing to commit. Nothing pending prints `nothing to commit` and exits 0 — with a name, that means nothing pending under that skill. Read that as "nothing to record" rather than "nothing happened": the index convergence above runs on exactly this path. Either form records indiscriminately within its range, untracked and `.gitignore`d files included, the same projection a sweep uses — a name narrows the range, not the projection. |
 | `fu log [-n <count>]` | Show first-parent history, newest first, 20 entries by default. Each revertible operation carries the number `fu revert n` would use; sweeps, `init`, and a recovery compensation together with the operation it cancels are listed without one, as is any commit whose verb fu does not recognise — a plain `git commit` of your own, for instance. Read-only. |
+| `fu remote [url]` | Show the store's remote, or set it. One remote, named `origin`, kept in `store/.git/config` like any git remote; setting it again reports the url it replaced. |
+| `fu push` | Record pending hand edits, then push the store's branch. Refuses when the remote is ahead: run `fu pull` first. |
+| `fu pull` | Fetch and fast-forward the store's branch, then rebuild agent links from the `fu.yaml` that arrived. Pending hand edits are recorded first, so a remote that moved as well means the branches have diverged; fu never merges, it names the store path and leaves that to git. An empty remote is not an error. |
+| `fu clone <url>` | On a new machine: clone the store into `$FU_HOME/store` and rebuild every link. Refuses when a store is already there, and when the repository is not a fu store. |
 | `fu enable <name> [--agent <a>]` | Turn a skill on, globally or for one agent. |
 | `fu disable <name> [--agent <a>]` | Turn a skill off, globally or for one agent. |
 
@@ -471,14 +478,22 @@ exclusively. If another Git process replaces a control file such as
 transient "filesystem entry changed externally" or "regular file changed while
 being opened" error; retry after the other Git process finishes.
 
+**A local-path remote needs git installed.** `fu remote /path/to/store.git`
+works, but go-git reaches a local path through `git-upload-pack` and
+`git-receive-pack`, which it runs as subprocesses. `ssh://`, `https://` and
+`git://` remotes need no git binary.
+
+**Private HTTPS remotes are not supported.** fu offers no credentials over
+HTTPS, so a private remote must use an SSH url; SSH authenticates through
+ssh-agent. This is the same scope `fu add` has for skill sources.
+
 ## Roadmap
 
 Designed in [DESIGN.md](DESIGN.md), not yet built:
 
 | | |
 |---|---|
-| `clone`, `push`, `pull` | Move the store between machines. |
-| `remote`, `agent` | Configure the store's remote, and inspect or configure agent adapters. |
+| `agent` | Inspect or configure agent adapters. |
 
 [SPEC.md](SPEC.md) states the product in full; [DESIGN.md](DESIGN.md) is the
 implementation design, including the known gaps. Both are written in Chinese.

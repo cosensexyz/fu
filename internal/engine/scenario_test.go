@@ -229,3 +229,82 @@ func TestScenarioBrokenLinksAreReportedThenRepaired(t *testing.T) {
 		t.Fatal("beta's foreign occupant must still be reported as a conflict after restore")
 	}
 }
+
+// TestScenarioMachineMigration is SPEC §3 scenario 4: machine A pushes its
+// store, machine B clones it and gets the same links and switch matrix,
+// then follows A's later changes with pull. Both machines hold identical
+// history afterwards, so `fu log` numbers operations the same way on each.
+func TestScenarioMachineMigration(t *testing.T) {
+	bare := newEmptyBareRepo(t)
+
+	a, _ := setupStore(t)
+	aClaude, aCodex := t.TempDir(), t.TempDir()
+	aAgents := []agent.Agent{fakeAgent{"claude", aClaude}, fakeAgent{"codex", aCodex}}
+	if _, err := NewSkill(a, aAgents, "writer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetAgentSwitch(a, aAgents, "writer", "codex", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.SetRemote(bare); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PushOperations(a, aAgents); err != nil {
+		t.Fatal(err)
+	}
+
+	homeB := t.TempDir()
+	bClaude, bCodex := t.TempDir(), t.TempDir()
+	bAgents := []agent.Agent{fakeAgent{"claude", bClaude}, fakeAgent{"codex", bCodex}}
+	cloned, err := CloneStore(homeB, bare, bAgents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cloned.Skills != 1 {
+		t.Fatalf("clone must report the one skill, got %+v", cloned)
+	}
+	if _, err := os.Readlink(filepath.Join(bClaude, "writer")); err != nil {
+		t.Fatalf("machine B must link writer for claude: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(bCodex, "writer")); !os.IsNotExist(err) {
+		t.Fatal("the codex override must travel with the store")
+	}
+
+	if _, err := NewSkill(a, aAgents, "reviewer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PushOperations(a, aAgents); err != nil {
+		t.Fatal(err)
+	}
+	b, err := store.Open(homeB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pulled, err := PullOperations(b, bAgents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pulled.UpToDate {
+		t.Fatal("machine B must have something to pull")
+	}
+	if _, err := os.Readlink(filepath.Join(bClaude, "reviewer")); err != nil {
+		t.Fatalf("pull must link the skill that arrived: %v", err)
+	}
+
+	aLog, err := a.Log(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bLog, err := b.Log(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aLog) != len(bLog) {
+		t.Fatalf("both machines must hold the same history, got %d vs %d entries", len(aLog), len(bLog))
+	}
+	for i := range aLog {
+		if aLog[i].Hash != bLog[i].Hash || aLog[i].Ordinal != bLog[i].Ordinal {
+			t.Fatalf("entry %d differs: %+v vs %+v", i, aLog[i], bLog[i])
+		}
+	}
+}

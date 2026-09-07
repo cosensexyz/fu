@@ -230,9 +230,9 @@ func (s *Store) checkTargetNoAbsoluteSymlinks(target map[string]worktreeTarget) 
 // satisfy every rule written down here -- the path set would still be
 // union(index, target) -- and destroy untracked content anyway.
 //
-// The set is complete for both callers without a third source: restore's
-// target is HEAD, so HEAD is a subset of it, and revert sweeps first, so the
-// index equals HEAD.
+// The set is complete for all three callers without a third source: restore's
+// target is HEAD, so HEAD is a subset of it, and revert and pull sweep before
+// applying their target trees, so the index equals HEAD.
 func (s *Store) applyTreeToWorktree(target map[string]worktreeTarget) (changed []string, err error) {
 	if s.worktreeFS == nil {
 		return nil, errUnpinnedWorktree

@@ -3,15 +3,18 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/go-git/go-git/v5"
 	"github.com/spf13/cobra"
 
 	"github.com/cosensexyz/fu/internal/engine"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 // runExitCode is exitcode_test.go's own small helper (distinct from the
@@ -743,5 +746,121 @@ func TestExitCodeUpdateWithNoTargetsReportsThePrologueReconcileFailure(t *testin
 	}
 	if strings.Contains(out, "nothing to update") {
 		t.Fatalf("a run that failed must not also claim there was nothing to do: %q", out)
+	}
+}
+
+func TestExitCodeRemoteSyncArgumentErrorsAreUsageErrors(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, args := range [][]string{
+		{"remote", "a", "b"},
+		{"remote", ""},
+		{"clone"},
+		{"clone", ""},
+		{"clone", "a", "b"},
+		{"push", "extra"},
+		{"pull", "extra"},
+	} {
+		if code := Run(args); code != 2 {
+			t.Errorf("fu %v exit = %d, want 2", args, code)
+		}
+	}
+}
+
+func TestExitCodeRemoteSyncConfirmsCompletedWorkDespiteReconcileFailure(t *testing.T) {
+	for _, verb := range []string{"push", "pull"} {
+		t.Run(verb, func(t *testing.T) {
+			fuHome, home := t.TempDir(), t.TempDir()
+			t.Setenv("FU_HOME", fuHome)
+			t.Setenv("HOME", home)
+			s, err := store.Init(fuHome)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := engine.NewSkill(s, nil, "alpha"); err != nil {
+				t.Fatal(err)
+			}
+			bare := t.TempDir()
+			remote, err := git.PlainInit(bare, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.SetRemote(bare); err != nil {
+				t.Fatal(err)
+			}
+			confirmation := "pushed "
+			if verb == "pull" {
+				if _, err := s.Push(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				other, err := store.Clone(context.Background(), t.TempDir(), bare)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := engine.NewSkill(other, nil, "beta"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := other.Push(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				confirmation = "fast-forwarded "
+			}
+			// Agent discovery succeeds, but scanning its skills path fails.
+			if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(home, ".claude", "skills"), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{confirmation, "already up to date with " + bare} {
+				code, out := runExitCode(t, verb)
+				if code != 1 {
+					t.Errorf("%s must exit 1 on a per-agent failure, got %d: %s", verb, code, out)
+				}
+				diagnostic, confirmed := strings.Index(out, "failed: claude:"), strings.Index(out, want)
+				if diagnostic < 0 || confirmed < diagnostic {
+					t.Errorf("%s must print its diagnostic before %q: %s", verb, want, out)
+				}
+				head, err := s.Repo.Head()
+				if err != nil {
+					t.Fatal(err)
+				}
+				remoteHead, err := remote.Reference(head.Name(), true)
+				if err != nil || remoteHead.Hash() != head.Hash() {
+					t.Fatalf("%s must synchronize the branch despite the link failure, remote=%v local=%v err=%v", verb, remoteHead, head, err)
+				}
+			}
+			if verb == "pull" {
+				if _, err := os.Stat(filepath.Join(s.SkillsDir(), "beta", "SKILL.md")); err != nil {
+					t.Fatalf("the pulled skill must be on disk: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestExitCodeRelativeRemoteWorksAfterChangingDirectory(t *testing.T) {
+	isolateExitCodeEnvironment(t)
+	t.Chdir(t.TempDir())
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare := filepath.Join(cwd, "R.git")
+	if _, err := git.PlainInit(bare, true); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := runExitCode(t, "init"); code != 0 {
+		t.Fatalf("init: exit=%d out=%q", code, out)
+	}
+	code, out := runExitCode(t, "remote", "./R.git/")
+	if code != 0 || !strings.Contains(out, "remote set to "+bare) {
+		t.Errorf("remote must confirm the saved absolute path: exit=%d out=%q", code, out)
+	}
+	t.Chdir(t.TempDir())
+	for _, verb := range []string{"remote", "push", "pull"} {
+		code, out := runExitCode(t, verb)
+		if code != 0 || !strings.Contains(out, bare) {
+			t.Errorf("%s from another directory: exit=%d out=%q", verb, code, out)
+		}
 	}
 }

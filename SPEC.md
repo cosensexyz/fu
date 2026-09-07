@@ -152,9 +152,9 @@ v1 以下列七个场景全程可走通为完成标志：
 | 命令 | 状态 | 说明 |
 |------|------|------|
 | `fu init` | 已交付 | 初始化空 store |
-| `fu clone <url>` | 规划 | 新机恢复：克隆远端 store 并按记录状态重建全部链接 |
-| `fu remote [url]` | 规划 | 无参数查看、带参数设定远端（单远端简化） |
-| `fu push` / `fu pull` | 规划 | 与远端同步；pull 仅做获取与快进合并，分支分歧时不做包装，提示用户以 git 自行处理（store 是标准 git repo） |
+| `fu clone <url>` | 已交付 | 新机恢复：完整克隆远端 store 到 `$FU_HOME/store` 并按记录状态重建全部链接。先落在 `staging/` 下的临时目录，校验其 HEAD 跟踪 `fu.yaml` 后才改名到位，故中断不留半个 store；`$FU_HOME/store` 已存在即拒绝；远端为空或不是 fu 的 store 即拒绝 |
+| `fu remote [url]` | 已交付 | 无参数查看、带参数设定远端（单远端简化，固定名 `origin`，只写 `store/.git/config`，不入 `fu.yaml`）；覆盖时报出被替换的 URL。本地路径远端经 git 的 file transport，须本机装有 git；私有 HTTPS 不支持，改用 SSH |
+| `fu push` / `fu pull` | 已交付 | 与远端同步，执行前先 sweep（§5.3）。push 推送 HEAD 所在分支，远端领先时拒绝并提示先 pull；pull 仅做获取与快进合并，快进后立即对账重建链接，分支分歧时不做包装，报错附 store 路径与建议命令，提示用户以 git 自行处理（store 是标准 git repo）；远端为空时 pull 不是错误（此时不取锁、不 sweep，手工修改留待下一条写命令记录），远端有提交但没有本地同名分支时报错。二者都不产生提交、不计入 `fu revert n`；未设远端时二者都报错并提示 `fu remote <url>` |
 
 **agent**
 
