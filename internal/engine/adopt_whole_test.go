@@ -1312,25 +1312,18 @@ func TestAdoptWholeDirRejectsParentEntryReplacementBeforeArchive(t *testing.T) {
 	defer parent.Close()
 	var after store.FileIdentity
 	foreignMarker := filepath.Join(skillsDir, "foreign.txt")
+	var reuse testenv.InodeReuse
 	h := hooks{beforeDirSwitchArchive: func() error {
-		attempts := 1
-		if testenv.FileHandlesRequired() {
-			attempts = 32
+		// The directory must take the symlink's inode number, or the handle
+		// is never the discriminator (testenv.ReplaceOnSameInode explains how).
+		var err error
+		reuse, err = testenv.ReplaceOnSameInode(filepath.Dir(skillsDir), filepath.Base(skillsDir), true)
+		if err != nil {
+			return err
 		}
-		for range attempts {
-			if err := os.Remove(skillsDir); err != nil {
-				return err
-			}
-			if err := os.Mkdir(skillsDir, 0o755); err != nil {
-				return err
-			}
-			after, _, err = store.EntryIdentityAt(int(parent.Fd()), filepath.Base(skillsDir))
-			if err != nil {
-				return err
-			}
-			if after.Device == before.Device && after.Inode == before.Inode {
-				break
-			}
+		after, _, err = store.EntryIdentityAt(int(parent.Fd()), filepath.Base(skillsDir))
+		if err != nil {
+			return err
 		}
 		return os.WriteFile(foreignMarker, []byte("foreign\n"), 0o644)
 	}}
@@ -1344,7 +1337,7 @@ func TestAdoptWholeDirRejectsParentEntryReplacementBeforeArchive(t *testing.T) {
 	}
 	if testenv.FileHandlesRequired() &&
 		(before.Device != after.Device || before.Inode != after.Inode || before.Handle == "" || after.Handle == "" || before.Handle == after.Handle) {
-		t.Fatalf("engine replacement coverage did not reuse the inode with a new handle: before=%+v after=%+v", before, after)
+		t.Fatalf("engine replacement coverage did not reuse the inode with a new handle: reuse=%+v before=%+v after=%+v", reuse, before, after)
 	}
 	if got, err := os.ReadFile(foreignMarker); err != nil || string(got) != "foreign\n" {
 		t.Fatalf("foreign replacement = %q, %v; want preserved", got, err)

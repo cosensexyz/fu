@@ -1832,28 +1832,21 @@ func TestStatusDoesNotPromiseCollectionBlockedByAForeignStagingEntry(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	attempts := 1
-	if testenv.FileHandlesRequired() {
-		attempts = 32
+	// The replacement must take fu's orphan's inode number, or the handle
+	// is never the discriminator (testenv.ReplaceOnSameInode explains how).
+	reuse, err := testenv.ReplaceOnSameInode(filepath.Dir(staging), filepath.Base(staging), true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var afterIdentity store.FileIdentity
-	for range attempts {
-		if err := os.RemoveAll(staging); err != nil {
-			t.Fatal(err)
-		}
-		writeSkillBody(t, staging, "alpha", "mine, not fu's")
-		afterIdentity, _, err = store.EntryIdentityAt(int(stagingParent.Fd()), filepath.Base(staging))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if afterIdentity.Device == beforeIdentity.Device && afterIdentity.Inode == beforeIdentity.Inode {
-			break
-		}
+	writeSkillBody(t, staging, "alpha", "mine, not fu's")
+	afterIdentity, _, err := store.EntryIdentityAt(int(stagingParent.Fd()), filepath.Base(staging))
+	if err != nil {
+		t.Fatal(err)
 	}
 	if testenv.FileHandlesRequired() &&
 		(beforeIdentity.Device != afterIdentity.Device || beforeIdentity.Inode != afterIdentity.Inode ||
 			beforeIdentity.Handle == "" || afterIdentity.Handle == "" || beforeIdentity.Handle == afterIdentity.Handle) {
-		t.Fatalf("gc replacement coverage did not reuse the inode with a new handle: before=%+v after=%+v", beforeIdentity, afterIdentity)
+		t.Fatalf("gc replacement coverage did not reuse the inode with a new handle: reuse=%+v before=%+v after=%+v", reuse, beforeIdentity, afterIdentity)
 	}
 
 	after, err := Status(s, cfg, nil)

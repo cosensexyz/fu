@@ -1775,21 +1775,13 @@ func TestConfigExchangeRestoresATargetReplacedUnderItsNameWithMatchingBytes(t *t
 	var afterIdentity FileIdentity
 	err = checked.installConfigExpecting(before, append(before, []byte("\n# fu\n")...), configExchangeHooks{
 		beforeExchange: func() {
-			afterIdentity = captureSameNameReplacement(t, beforeIdentity, func() FileIdentity {
-				if err := os.Remove(target); err != nil {
-					t.Fatal(err)
-				}
-				// Recreated under the identical name with byte-identical content,
-				// not written elsewhere and renamed into place: only this shape can
-				// land on the same freed inode number.
+			afterIdentity = captureSameNameReplacement(t, target, false, beforeIdentity, func() {
+				// Written into the fresh file under the identical name, not
+				// written elsewhere and renamed into place: only this shape
+				// keeps the reused inode number.
 				if err := os.WriteFile(target, before, 0o644); err != nil {
 					t.Fatal(err)
 				}
-				identity, _, identityErr := entryIdentityAt(unixAtFDCWD, target)
-				if identityErr != nil {
-					t.Fatal(identityErr)
-				}
-				return identity
 			})
 		},
 	})

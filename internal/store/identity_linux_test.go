@@ -35,18 +35,10 @@ func TestLinuxHandleDistinguishesAReusedInode(t *testing.T) {
 	if first.Handle == "" {
 		t.Fatal("a filesystem that reports handle support must yield a handle")
 	}
-	second := captureSameNameReplacement(t, first, func() FileIdentity {
-		if err := os.Remove(path); err != nil {
-			t.Fatal(err)
-		}
+	second := captureSameNameReplacement(t, path, false, first, func() {
 		if err := os.WriteFile(path, []byte("two"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		identity, _, err := entryIdentityAt(int(parent.Fd()), "entry")
-		if err != nil {
-			t.Fatal(err)
-		}
-		return identity
 	})
 	if first.Same(second) {
 		t.Fatalf("replacement must not be Same as the original (inode reused: %v): %+v vs %+v",
@@ -201,6 +193,9 @@ var handleExportingFilesystemMagics = map[int64]string{
 
 // inodeReusingFilesystemMagics are the handle-exporting filesystems on which
 // CI can exercise the original defect rather than merely the handle path.
+// testenv.ReplaceOnSameInode steers the replacement by ext4's lowest-free
+// ordering; XFS allocates nearest to the parent instead, so a required run
+// there may miss and would say so rather than prove the handle path.
 var inodeReusingFilesystemMagics = map[int64]string{
 	int64(unix.EXT4_SUPER_MAGIC): "EXT4_SUPER_MAGIC",
 	int64(unix.XFS_SUPER_MAGIC):  "XFS_SUPER_MAGIC",
@@ -269,18 +264,10 @@ func TestEntryIdentityAtRejectsARealReplacementBetweenSecondStatAndSecondHandle(
 	var replacement FileIdentity
 	_, _, err = entryIdentityAtWithHooks(int(parent.Fd()), "entry", identityHooks{
 		afterSecondStat: func(string) error {
-			replacement = captureSameNameReplacement(t, original, func() FileIdentity {
-				if err := os.Remove(path); err != nil {
-					t.Fatal(err)
-				}
+			replacement = captureSameNameReplacement(t, path, false, original, func() {
 				if err := os.WriteFile(path, []byte("replacement"), 0o644); err != nil {
 					t.Fatal(err)
 				}
-				identity, _, err := entryIdentityAt(int(parent.Fd()), "entry")
-				if err != nil {
-					t.Fatal(err)
-				}
-				return identity
 			})
 			return nil
 		},

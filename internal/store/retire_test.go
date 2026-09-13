@@ -156,18 +156,15 @@ func TestWriteFileAtomicNoReplaceRejectsTemporaryReplacementBeforeRename(t *test
 			if err != nil {
 				return err
 			}
-			after = captureSameNameReplacement(t, before, func() FileIdentity {
-				if err := root.Remove(name); err != nil {
-					t.Fatal(err)
-				}
+			after = captureSameNameReplacement(t, filepath.Join(dir, name), false, before, func() {
+				// The helper created the file 0o644 and WriteFile keeps an
+				// existing mode, so the foreign 0o600 is set explicitly.
 				if err := os.WriteFile(filepath.Join(dir, name), []byte(foreign), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				identity, _, err := entryIdentityAt(int(parent.Fd()), name)
-				if err != nil {
+				if err := os.Chmod(filepath.Join(dir, name), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				return identity
 			})
 			return nil
 		},

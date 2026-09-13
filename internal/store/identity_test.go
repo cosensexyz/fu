@@ -116,21 +116,29 @@ func TestFileIdentityJSONRoundTrip(t *testing.T) {
 	}
 }
 
-func captureSameNameReplacement(t *testing.T, original FileIdentity, replace func() FileIdentity) FileIdentity {
+func captureSameNameReplacement(t *testing.T, path string, dir bool, original FileIdentity, populate func()) FileIdentity {
 	t.Helper()
-	attempts := 1
-	if testenv.FileHandlesRequired() {
-		attempts = 32
+	// A stale original would turn every outcome into a confusing miss.
+	live, _, err := entryIdentityAt(unixAtFDCWD, path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var replacement FileIdentity
-	for range attempts {
-		replacement = replace()
-		if replacement.Device == original.Device && replacement.Inode == original.Inode {
-			return replacement
-		}
+	if live.Device != original.Device || live.Inode != original.Inode {
+		t.Fatalf("%s is %+v on disk, not the recorded original %+v", path, live, original)
 	}
-	if testenv.FileHandlesRequired() {
-		t.Fatalf("required regression coverage did not reuse inode %d after %d same-name replacements", original.Inode, attempts)
+	reuse, err := testenv.ReplaceOnSameInode(filepath.Dir(path), filepath.Base(path), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if populate != nil {
+		populate()
+	}
+	replacement, _, err := entryIdentityAt(unixAtFDCWD, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if testenv.FileHandlesRequired() && !reuse.Reused {
+		t.Fatalf("required regression coverage did not reuse inode %d for %s: %s; replacement=%+v", original.Inode, path, reuse.Miss, replacement)
 	}
 	return replacement
 }

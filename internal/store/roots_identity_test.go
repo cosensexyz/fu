@@ -53,32 +53,15 @@ func TestPairPinnedRootRejectsAReplacementWhileTheOriginalIsOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer parent.Close()
-	// The failed pairing closed the old descriptor. Recreate once before
-	// sampling so the allocator can select that newly released inode instead
-	// of asking it to reuse the alternate inode from the pinned phase.
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(path, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// The failed pairing closed the old descriptor, so the pinned inode is
+	// free again; testenv.ReplaceOnSameInode fills such holes before it
+	// recreates the entry, and the replacement lands on this directory's
+	// own number.
 	originalIdentity, _, err := EntryIdentityAt(int(parent.Fd()), "root")
 	if err != nil {
 		t.Fatal(err)
 	}
-	replacementIdentity := captureSameNameReplacement(t, originalIdentity, func() FileIdentity {
-		if err := os.Remove(path); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Mkdir(path, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		identity, _, err := EntryIdentityAt(int(parent.Fd()), "root")
-		if err != nil {
-			t.Fatal(err)
-		}
-		return identity
-	})
+	replacementIdentity := captureSameNameReplacement(t, path, true, originalIdentity, nil)
 	// Only required Linux coverage proves allocator reuse. An optional local
 	// run still checks pinned-root rejection but need not observe inode reuse.
 	if testenv.FileHandlesRequired() {
