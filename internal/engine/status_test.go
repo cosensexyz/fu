@@ -76,7 +76,7 @@ func TestStatusReportsSymlinkedAgentDirWithoutTouchingIt(t *testing.T) {
 
 // TestStatusIsolatesAScanFailureToOneAgent mirrors Reconcile's own per-agent
 // isolation (finding I3): a broken scan for one agent -- here, a skills
-// "directory" that is actually a plain file, so os.ReadDir fails -- must be
+// "directory" that is actually a plain file, which ScanAgent refuses -- must be
 // recorded on that agent alone, in ScanErr, without preventing a healthy
 // agent listed alongside it from being reported normally.
 func TestStatusIsolatesAScanFailureToOneAgent(t *testing.T) {

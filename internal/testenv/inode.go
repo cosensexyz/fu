@@ -32,6 +32,29 @@ type InodeReuse struct {
 	Miss string
 }
 
+// Replacement says what kind of entry ReplaceOnSameInodeWith installs: a
+// directory, a symlink to SymlinkTarget, or (the zero value) an empty
+// regular file. Placeholders are of the same kind, so they draw from the
+// same allocation group the replacement will.
+type Replacement struct {
+	Dir           bool
+	SymlinkTarget string
+}
+
+func (r Replacement) create(path string) error {
+	switch {
+	case r.Dir:
+		return os.Mkdir(path, 0o755)
+	case r.SymlinkTarget != "":
+		return os.Symlink(r.SymlinkTarget, path)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
 // ReplaceOnSameInode replaces parent/name with a fresh, empty entry of the
 // requested kind -- a directory or a regular file -- and makes it land on
 // the inode number the original held, on any filesystem that hands freed
@@ -66,7 +89,13 @@ type InodeReuse struct {
 // reports the miss with its reason when the deadline passes; elsewhere one
 // attempt is all the filesystem gets, since APFS never hands a number back
 // and waiting would only slow every caller down.
-func ReplaceOnSameInode(parent, name string, dir bool) (reuse InodeReuse, err error) {
+func ReplaceOnSameInode(parent, name string, dir bool) (InodeReuse, error) {
+	return ReplaceOnSameInodeWith(parent, name, Replacement{Dir: dir})
+}
+
+// ReplaceOnSameInodeWith is ReplaceOnSameInode for any kind of replacement
+// entry (see Replacement).
+func ReplaceOnSameInodeWith(parent, name string, with Replacement) (reuse InodeReuse, err error) {
 	path := filepath.Join(parent, name)
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -103,7 +132,7 @@ func ReplaceOnSameInode(parent, name string, dir bool) (reuse InodeReuse, err er
 	fill := func() (landed string, capped bool, err error) {
 		for len(fillers) < maxInodeFillers {
 			filler := filepath.Join(parent, fmt.Sprintf(".inode-filler-%d", len(fillers)))
-			if err := createEmpty(filler, dir); err != nil {
+			if err := with.create(filler); err != nil {
 				return "", false, err
 			}
 			fillers = append(fillers, filler)
@@ -131,7 +160,7 @@ func ReplaceOnSameInode(parent, name string, dir bool) (reuse InodeReuse, err er
 	if err := os.Remove(path); err != nil {
 		return InodeReuse{}, err
 	}
-	if err := createEmpty(path, dir); err != nil {
+	if err := with.create(path); err != nil {
 		return InodeReuse{}, err
 	}
 	got, err := inodeNumber(path)
@@ -173,17 +202,6 @@ func ReplaceOnSameInode(parent, name string, dir bool) (reuse InodeReuse, err er
 
 func cappedMiss(fillers int, original uint64) string {
 	return fmt.Sprintf("filled %d placeholders without reaching inode %d: the allocator is not handing out the lowest free number from the original's group", fillers, original)
-}
-
-func createEmpty(path string, dir bool) error {
-	if dir {
-		return os.Mkdir(path, 0o755)
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return err
-	}
-	return f.Close()
 }
 
 func inodeNumber(path string) (uint64, error) {

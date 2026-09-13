@@ -82,17 +82,17 @@ func pairPinnedRoot(dir *os.File, path string) (*checkedRoot, error) {
 	return &checkedRoot{root: root, dir: dir, display: path}, nil
 }
 
-func openCheckedTop(path string, want os.FileInfo) (*checkedRoot, error) {
+func openCheckedTop(path string, want FileIdentity) (*checkedRoot, error) {
 	root, err := openPinnedTop(path)
 	if err != nil {
 		return nil, fmt.Errorf("open validated logical root %s: %w", path, err)
 	}
-	opened, err := root.dir.Stat()
+	opened, _, err := openIdentity(int(root.dir.Fd()))
 	if err != nil {
 		_ = root.close()
-		return nil, fmt.Errorf("stat validated logical root %s: %w", path, err)
+		return nil, fmt.Errorf("identify validated logical root %s: %w", path, err)
 	}
-	if want == nil || !os.SameFile(want, opened) {
+	if !want.Valid() || !opened.Same(want) {
 		_ = root.close()
 		return nil, fmt.Errorf("%s no longer names the logical root validated when the store was opened", path)
 	}
@@ -120,17 +120,17 @@ func openPinnedChild(parent *checkedRoot, name, display string) (*checkedRoot, e
 	return pairPinnedRoot(dir, display)
 }
 
-func openCheckedChild(parent *checkedRoot, name, display string, want os.FileInfo) (*checkedRoot, error) {
+func openCheckedChild(parent *checkedRoot, name, display string, want FileIdentity) (*checkedRoot, error) {
 	root, err := openPinnedChild(parent, name, display)
 	if err != nil {
 		return nil, fmt.Errorf("open validated logical root %s: %w", display, err)
 	}
-	opened, err := root.dir.Stat()
+	opened, _, err := openIdentity(int(root.dir.Fd()))
 	if err != nil {
 		_ = root.close()
-		return nil, fmt.Errorf("stat validated logical root %s: %w", display, err)
+		return nil, fmt.Errorf("identify validated logical root %s: %w", display, err)
 	}
-	if want == nil || !os.SameFile(want, opened) {
+	if !want.Valid() || !opened.Same(want) {
 		_ = root.close()
 		return nil, fmt.Errorf("%s no longer names the logical root validated when the store was opened", display)
 	}

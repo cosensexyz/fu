@@ -244,3 +244,50 @@ func TestReplaceOnSameInodeReportsANumberThatNeverComesBack(t *testing.T) {
 		t.Fatalf("the replacement must be a fresh empty file, got %q", got)
 	}
 }
+
+// A symlink original replaced by a symlink: the kind fu's link retirement
+// deals in. The replacement carries the requested target and, on ext4, the
+// original's number.
+func TestReplaceOnSameInodeWithASymlink(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("inode reuse is a Linux filesystem behaviour")
+	}
+	dir := t.TempDir()
+	hole := filepath.Join(dir, "hole")
+	entry := filepath.Join(dir, "entry")
+	if err := os.WriteFile(hole, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/original/target", entry); err != nil {
+		t.Fatal(err)
+	}
+	original := inodeOf(t, entry)
+	if err := os.Remove(hole); err != nil {
+		t.Fatal(err)
+	}
+
+	reuse, err := ReplaceOnSameInodeWith(dir, "entry", Replacement{SymlinkTarget: "/replacement/target"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if target, err := os.Readlink(entry); err != nil || target != "/replacement/target" {
+		t.Fatalf("replacement = %q, %v; want a symlink to the requested target", target, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "entry" {
+		t.Fatalf("the helper must leave nothing but the replacement behind, got %d entries", len(entries))
+	}
+	if !reuse.Reused {
+		if FileHandlesRequired() {
+			t.Fatalf("symlink replacement landed on inode %d, not the original %d: %s", inodeOf(t, entry), original, reuse.Miss)
+		}
+		t.Skipf("filesystem did not hand inode %d back: %s", original, reuse.Miss)
+	}
+	if got := inodeOf(t, entry); got != original {
+		t.Fatalf("reuse reported but the replacement sits on inode %d, original %d", got, original)
+	}
+}

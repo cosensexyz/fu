@@ -4,7 +4,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"go/types"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,10 +13,11 @@ import (
 	"github.com/cosensexyz/fu/internal/identityguard"
 )
 
-// TestSourceIdentityConstructionStaysBehindStorePrimitives keeps new source
-// construction on the shared FileIdentity capture path. It rejects raw
-// device/inode reads outside sourceScratchIdentity, but does not track new
-// calls to that helper, constant scratchIdentity literals, or os.SameFile.
+// TestSourceIdentityConstructionStaysBehindStorePrimitives keeps source
+// identity construction on the shared FileIdentity capture path. Since batch
+// 4 no source file reads a device or inode directly, so every raw read is a
+// finding; os.SameFile is allowed only where both descriptors stay open
+// across the comparison (the os.Root pairings), and reported elsewhere.
 func TestSourceIdentityConstructionStaysBehindStorePrimitives(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -50,41 +50,48 @@ func TestSourceIdentityConstructionStaysBehindStorePrimitives(t *testing.T) {
 }
 
 func sourceIdentityFindings(file *ast.File, name string) []identityguard.Finding {
-	allow := map[string]map[string]bool{"scratch.go": {"sourceScratchIdentity": true}}
+	// os.SameFile is legitimate only where both descriptors stay open across
+	// the observations and the comparison, so an inode cannot be recycled in
+	// between: the os.Root pairings in these two constructors.
+	sameFileAllow := map[string]map[string]bool{
+		"scratch.go": {"newOwnedScratchWithIdentityHooks": true},
+		"git.go":     {"openPreparedRoot": true},
+	}
 	var findings []identityguard.Finding
 	for _, finding := range identityguard.Findings(file) {
-		if finding.Kind != identityguard.InodeRead || !identityguard.InsideAllowedFunction(file, finding.Pos, allow[name]) {
-			findings = append(findings, finding)
+		if finding.Kind == identityguard.SameFileCall && identityguard.InsideAllowedFunction(file, finding.Pos, sameFileAllow[name]) {
+			continue
 		}
+		findings = append(findings, finding)
 	}
 	return findings
 }
 
-func TestSourceScratchAllowanceOnlyCoversRawStatReads(t *testing.T) {
-	for _, test := range []struct {
-		name, body string
-		want       int
+// TestSourceSameFileAllowanceCoversOnlyThePinnedPairings proves the
+// os.SameFile allowance is scoped to the two constructors whose descriptors
+// stay open across the comparison, by function and by file: the same call in
+// another function of scratch.go, or in the allowed function's name under
+// another file, is reported.
+func TestSourceSameFileAllowanceCoversOnlyThePinnedPairings(t *testing.T) {
+	const source = `package p
+type FileInfo interface{}
+var os struct{ SameFile func(FileInfo, FileInfo) bool }
+func newOwnedScratchWithIdentityHooks(a, b FileInfo) bool { return os.SameFile(a, b) }
+func elsewhere(a, b FileInfo) bool { return os.SameFile(a, b) }`
+	for _, tc := range []struct {
+		filename string
+		want     int
 	}{
-		{"stat", `_ = stat.Dev; _ = stat.Ino`, 0},
-		{"literal", `_ = FileIdentity{Device:1,Inode:2}`, 1},
-		{"field", `var id FileIdentity; id.Inode=1`, 1},
-		{"handle", `var id FileIdentity; id.Handle=""`, 1},
+		{"scratch.go", 1},
+		{"other.go", 2},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			fset := token.NewFileSet()
-			file, err := parser.ParseFile(fset, "scratch.go", `package p; type FileIdentity struct{Device,Inode uint64;Handle string}; func sourceScratchIdentity(stat struct{Dev,Ino uint64}) {`+test.body+`}`, 0)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := (&types.Config{}).Check("fixture", fset, []*ast.File{file}, nil); err != nil {
-				t.Fatalf("fixture must compile: %v", err)
-			}
-			if got := sourceIdentityFindings(file, "scratch.go"); len(got) != test.want {
-				t.Fatalf("findings=%v, want %d", got, test.want)
-			}
-			if test.name == "stat" && len(sourceIdentityFindings(file, "other.go")) != 2 {
-				t.Fatal("scratch allowance leaked into another file")
-			}
-		})
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, tc.filename, source, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := sourceIdentityFindings(file, tc.filename); len(got) != tc.want {
+			t.Errorf("%s: findings=%v, want %d", tc.filename, got, tc.want)
+		}
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/cache"
 	"github.com/go-git/go-git/v5/storage/filesystem"
+	"golang.org/x/sys/unix"
 )
 
 var bootstrapConfig = []byte("version: 1\nskills: {}\n")
@@ -29,12 +30,17 @@ type Store struct {
 	Home string
 	Repo *git.Repository
 
-	homeIdentity     os.FileInfo
-	storeIdentity    os.FileInfo
-	skillsIdentity   os.FileInfo
-	gitIdentity      os.FileInfo
-	stagingIdentity  os.FileInfo
-	recoveryIdentity os.FileInfo
+	// The six logical roots' identities, captured by Init (by name, sealed)
+	// or Open (from the pinned descriptors) and re-checked by BeginWrite,
+	// StagingIdentity and CheckCanonicalPath. On Linux they carry the file
+	// handle, so a root replaced on a reused inode number after Open
+	// released its descriptors is still told apart.
+	homeIdentity     FileIdentity
+	storeIdentity    FileIdentity
+	skillsIdentity   FileIdentity
+	gitIdentity      FileIdentity
+	stagingIdentity  FileIdentity
+	recoveryIdentity FileIdentity
 	writeRoots       *checkedRoots
 	worktreeFS       *rootFilesystem
 }
@@ -52,8 +58,8 @@ type WriteSession struct {
 // validates the identities captured by Init or Open, and reopens go-git on
 // the pinned store and Git descriptors.
 func (s *Store) BeginWrite() (*WriteSession, error) {
-	if s.homeIdentity == nil || s.storeIdentity == nil || s.skillsIdentity == nil ||
-		s.gitIdentity == nil || s.stagingIdentity == nil || s.recoveryIdentity == nil {
+	if !s.homeIdentity.Valid() || !s.storeIdentity.Valid() || !s.skillsIdentity.Valid() ||
+		!s.gitIdentity.Valid() || !s.stagingIdentity.Valid() || !s.recoveryIdentity.Valid() {
 		return nil, errors.New("store has no validated filesystem identity; reopen it before writing")
 	}
 	roots := &checkedRoots{}
@@ -164,7 +170,7 @@ func (s *Store) StagingRoot() (*os.Root, error) {
 // opened. Source preparation compares it with the staging pathname before it
 // creates scratch content there.
 func (s *Store) StagingIdentity() (FileIdentity, error) {
-	if s.stagingIdentity == nil {
+	if !s.stagingIdentity.Valid() {
 		return FileIdentity{}, errors.New("store has no validated staging directory identity; reopen it before writing")
 	}
 	root, err := openCheckedTop(s.StagingDir(), s.stagingIdentity)
@@ -195,7 +201,7 @@ func (s *Store) RecoveryRoot() (*os.Root, error) {
 func (ws *WriteSession) CheckCanonicalPath() error {
 	checks := []struct {
 		path string
-		want os.FileInfo
+		want FileIdentity
 	}{
 		{ws.original.Home, ws.original.homeIdentity},
 		{ws.original.Dir(), ws.original.storeIdentity},
@@ -205,11 +211,13 @@ func (ws *WriteSession) CheckCanonicalPath() error {
 		{ws.original.RecoveryDir(), ws.original.recoveryIdentity},
 	}
 	for _, check := range checks {
-		info, err := os.Lstat(check.path)
+		// A sealed capture by name: the final component is not followed, so
+		// a symlink planted at the root's name shows as one.
+		current, stat, err := entryIdentityAt(unixAtFDCWD, check.path)
 		if err != nil {
 			return fmt.Errorf("verify logical root %s after write: %w", check.path, err)
 		}
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || check.want == nil || !os.SameFile(check.want, info) {
+		if stat.Mode&unix.S_IFMT != unix.S_IFDIR || !check.want.Valid() || !current.Same(check.want) {
 			return fmt.Errorf("%s was replaced while the write was in progress; validated data was updated through pinned descriptors, but agent links were not reconciled", check.path)
 		}
 	}
@@ -229,7 +237,7 @@ func (ws *WriteSession) Close() error {
 func (s *Store) rememberIdentity() error {
 	identities := []struct {
 		path string
-		dest *os.FileInfo
+		dest *FileIdentity
 	}{
 		{s.Home, &s.homeIdentity},
 		{s.Dir(), &s.storeIdentity},
@@ -239,11 +247,12 @@ func (s *Store) rememberIdentity() error {
 		{s.RecoveryDir(), &s.recoveryIdentity},
 	}
 	for _, identity := range identities {
-		info, err := os.Stat(identity.path)
+		// By name and sealed, as CheckCanonicalPath will re-capture it.
+		captured, _, err := entryIdentityAt(unixAtFDCWD, identity.path)
 		if err != nil {
-			return fmt.Errorf("stat logical store root %s: %w", identity.path, err)
+			return fmt.Errorf("identify logical store root %s: %w", identity.path, err)
 		}
-		*identity.dest = info
+		*identity.dest = captured
 	}
 	return nil
 }
@@ -251,7 +260,7 @@ func (s *Store) rememberIdentity() error {
 func (s *Store) rememberCheckedIdentities(roots *checkedRoots) error {
 	identities := []struct {
 		root *checkedRoot
-		dest *os.FileInfo
+		dest *FileIdentity
 	}{
 		{roots.home, &s.homeIdentity},
 		{roots.store, &s.storeIdentity},
@@ -264,11 +273,11 @@ func (s *Store) rememberCheckedIdentities(roots *checkedRoots) error {
 		if identity.root == nil || identity.root.dir == nil {
 			return errors.New("cannot capture identity for an unavailable logical root")
 		}
-		info, err := identity.root.dir.Stat()
+		captured, _, err := openIdentity(int(identity.root.dir.Fd()))
 		if err != nil {
-			return fmt.Errorf("fstat pinned logical root %s: %w", identity.root.display, err)
+			return fmt.Errorf("identify pinned logical root %s: %w", identity.root.display, err)
 		}
-		*identity.dest = info
+		*identity.dest = captured
 	}
 	return nil
 }
@@ -278,17 +287,18 @@ func verifyCheckedRootsStillNamed(roots *checkedRoots) error {
 		if root == nil || root.dir == nil {
 			return errors.New("cannot verify an unavailable logical root")
 		}
-		opened, err := root.dir.Stat()
+		opened, _, err := openIdentity(int(root.dir.Fd()))
 		if err != nil {
-			return fmt.Errorf("fstat pinned logical root %s: %w", root.display, err)
+			return fmt.Errorf("identify pinned logical root %s: %w", root.display, err)
 		}
-		current, err := os.Lstat(root.display)
+		current, stat, err := entryIdentityAt(unixAtFDCWD, root.display)
 		if err != nil {
 			return fmt.Errorf("verify logical root %s before returning it: %w", root.display, err)
 		}
-		// root.dir stays open from Stat through this comparison, keeping its
-		// inode allocated even if the pathname is removed and recreated.
-		if !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(opened, current) {
+		// root.dir stays open from the capture through this comparison,
+		// keeping its inode allocated even if the pathname is removed and
+		// recreated; the handle makes the comparison exact regardless.
+		if stat.Mode&unix.S_IFMT != unix.S_IFDIR || !opened.Same(current) {
 			return fmt.Errorf("logical root %s was replaced while the store was being opened", root.display)
 		}
 	}

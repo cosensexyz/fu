@@ -167,9 +167,10 @@ func storeGuardCallName(call *ast.CallExpr) string {
 // without a handle. It also rejects field-by-field identity construction and
 // FileIdentity literals, including pointer and recursively type-elided
 // container elements, outside the capture primitive and narrowly allowlisted
-// decoding paths. It does not claim to detect os.SameFile calls, cross-file
-// named declarations, serialization, whole-identity assignment, or whole-stat
-// comparisons.
+// decoding paths, and os.SameFile calls outside pairPinnedRoot, the one place
+// where both compared descriptors stay open across the comparison. It does
+// not claim to detect cross-file named declarations, serialization,
+// whole-identity assignment, or whole-stat comparisons.
 func TestStatInodeIsReadOnlyByTheIdentityPrimitive(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -177,7 +178,8 @@ func TestStatInodeIsReadOnlyByTheIdentityPrimitive(t *testing.T) {
 	}
 	assertInodeSelectorsOnlyIn(t, filepath.Dir(currentFile), map[string]bool{"identity.go": true},
 		"capture identities through entryIdentityAt or openIdentity in identity.go",
-		map[string]map[string]bool{"config_exchange.go": {"parseConfigArchiveName": true}})
+		map[string]map[string]bool{"config_exchange.go": {"parseConfigArchiveName": true}},
+		map[string]map[string]bool{"roots.go": {"pairPinnedRoot": true}})
 }
 
 // assertInodeSelectorsOnlyIn reports every selector named Dev or Ino in the
@@ -188,6 +190,7 @@ func assertInodeSelectorsOnlyIn(
 	allowed map[string]bool,
 	remedy string,
 	downgradeAllowlist map[string]map[string]bool,
+	sameFileAllowlist map[string]map[string]bool,
 ) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -212,6 +215,10 @@ func assertInodeSelectorsOnlyIn(
 			switch finding.Kind {
 			case identityguard.InodeRead:
 				t.Errorf("%s:%d reads a Stat_t inode directly; %s", name, fset.Position(finding.Pos).Line, remedy)
+			case identityguard.SameFileCall:
+				if !identityguard.InsideAllowedFunction(file, finding.Pos, sameFileAllowlist[name]) {
+					t.Errorf("%s:%d compares identities with os.SameFile outside a pinned pairing; %s", name, fset.Position(finding.Pos).Line, remedy)
+				}
 			case identityguard.HandleAssignment:
 				if !downgradeAllowed {
 					t.Errorf("%s:%d strips or replaces a captured file handle", name, fset.Position(finding.Pos).Line)

@@ -14,11 +14,10 @@ import (
 	"github.com/cosensexyz/fu/internal/store"
 )
 
-type scratchIdentity struct {
-	device uint64
-	inode  uint64
-}
-
+// ownedScratch is a private scratch directory under the validated staging
+// parent. Both the parent and the root are identified through the store's
+// capture primitives (store.FileIdentity), so on Linux every recheck carries
+// the file handle and a replacement on a reused inode number is told apart.
 type ownedScratch struct {
 	parent     *os.File
 	rootDir    *os.File
@@ -27,7 +26,7 @@ type ownedScratch struct {
 	name       string
 	path       string
 	parentID   store.FileIdentity
-	identity   scratchIdentity
+	identity   store.FileIdentity
 	parentIDAt func(int) (store.FileIdentity, unix.Stat_t, error)
 	quarantine string
 	closed     bool
@@ -40,7 +39,7 @@ type scratchCleanupHooks struct {
 
 type scratchCreateHooks struct {
 	afterMkdir            func(parentFD int, name string) error
-	inspectCreated        func(parentFD int, name string, stat *unix.Stat_t) error
+	inspectCreated        func(parentFD int, name string) (store.FileIdentity, unix.Stat_t, error)
 	captureParentIdentity func(int) (store.FileIdentity, unix.Stat_t, error)
 }
 
@@ -105,28 +104,28 @@ func newOwnedScratchWithIdentityHooks(stagingDir string, expected store.FileIden
 		return nil, fmt.Errorf("create source scratch directory: %w", err)
 	}
 	created := true
-	var createdIdentity scratchIdentity
+	var createdIdentity store.FileIdentity
 	defer func() {
 		if retErr == nil || !created {
 			return
 		}
-		if createdIdentity.inode != 0 {
+		if createdIdentity.Valid() {
 			_ = cleanupCreatedScratch(parent, parentPath, name, createdIdentity, nil)
 			return
 		}
 		_ = cleanupUnidentifiedEmptyScratch(parent, parentPath, name)
 	}()
-	var createdStat unix.Stat_t
-	var inspectErr error
+	// A sealed capture by name (store.EntryIdentityAt): nothing holds the
+	// new directory open yet, so the descriptor opened below must prove it
+	// is this very object, handle included.
+	inspectCreated := store.EntryIdentityAt
 	if hooks.inspectCreated != nil {
-		inspectErr = hooks.inspectCreated(parentFD, name, &createdStat)
-	} else {
-		inspectErr = unix.Fstatat(parentFD, name, &createdStat, unix.AT_SYMLINK_NOFOLLOW)
+		inspectCreated = hooks.inspectCreated
 	}
+	createdIdentity, _, inspectErr := inspectCreated(parentFD, name)
 	if inspectErr != nil {
 		return nil, fmt.Errorf("inspect created source scratch directory: %w", inspectErr)
 	}
-	createdIdentity = sourceScratchIdentity(&createdStat)
 	if hooks.afterMkdir != nil {
 		if err := hooks.afterMkdir(parentFD, name); err != nil {
 			return nil, err
@@ -147,12 +146,11 @@ func newOwnedScratchWithIdentityHooks(stagingDir string, expected store.FileIden
 			_ = rootDir.Close()
 		}
 	}()
-	var stat unix.Stat_t
-	if err := unix.Fstat(rootFD, &stat); err != nil {
+	identity, _, err := store.OpenIdentity(rootFD)
+	if err != nil {
 		return nil, err
 	}
-	identity := sourceScratchIdentity(&stat)
-	if identity != createdIdentity {
+	if !identity.Same(createdIdentity) {
 		return nil, errors.New("source scratch directory was replaced while opening it")
 	}
 	path := filepath.Join(parentPath, name)
@@ -202,15 +200,14 @@ func cleanupUnidentifiedEmptyScratch(parent *os.File, parentPath, name string) e
 // constructor. It first retires the original name without replacement and
 // post-validates the moved inode, so a new occupant at the public name is
 // never the object removed by cleanup.
-func cleanupCreatedScratch(parent *os.File, parentPath, name string, expected scratchIdentity, beforeRemove func(string) error) error {
+func cleanupCreatedScratch(parent *os.File, parentPath, name string, expected store.FileIdentity, beforeRemove func(string) error) error {
 	defer keepScratchDescriptorOwnersAlive(parent)
 	retired, err := store.RetireNameAt(parent, name, ".fu-src-orphan-")
 	if err != nil {
 		return fmt.Errorf("retire failed source scratch %s: %w", filepath.Join(parentPath, name), err)
 	}
-	var moved unix.Stat_t
-	if err := unix.Fstatat(int(parent.Fd()), retired, &moved, unix.AT_SYMLINK_NOFOLLOW); err != nil ||
-		sourceScratchIdentity(&moved) != expected || uint32(moved.Mode)&uint32(unix.S_IFMT) != uint32(unix.S_IFDIR) {
+	moved, movedStat, err := store.EntryIdentityAt(int(parent.Fd()), retired)
+	if err != nil || !moved.Same(expected) || uint32(movedStat.Mode)&uint32(unix.S_IFMT) != uint32(unix.S_IFDIR) {
 		mismatch := fmt.Errorf("failed source scratch %s changed during retirement", filepath.Join(parentPath, name))
 		if err != nil {
 			mismatch = fmt.Errorf("inspect retired source scratch %s: %w", filepath.Join(parentPath, retired), err)
@@ -325,18 +322,18 @@ func (s *ownedScratch) validateNamed(name string) error {
 	if err := s.validateParentPath(); err != nil {
 		return err
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstatat(int(s.parent.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	current, stat, err := store.EntryIdentityAt(int(s.parent.Fd()), name)
+	if err != nil {
 		return fmt.Errorf("source scratch entry %s cannot be verified: %w", filepath.Join(s.parentPath, name), err)
 	}
-	if sourceScratchIdentity(&stat) != s.identity || uint32(stat.Mode)&uint32(unix.S_IFMT) != uint32(unix.S_IFDIR) {
+	if !current.Same(s.identity) || uint32(stat.Mode)&uint32(unix.S_IFMT) != uint32(unix.S_IFDIR) {
 		return fmt.Errorf("source scratch entry %s was replaced; preserving it", filepath.Join(s.parentPath, name))
 	}
-	var opened unix.Stat_t
-	if err := unix.Fstat(int(s.rootDir.Fd()), &opened); err != nil {
+	opened, _, err := store.OpenIdentity(int(s.rootDir.Fd()))
+	if err != nil {
 		return err
 	}
-	if sourceScratchIdentity(&opened) != s.identity {
+	if !opened.Same(s.identity) {
 		return errors.New("pinned source scratch descriptor changed identity")
 	}
 	return nil
@@ -377,8 +374,4 @@ func newScratchName(prefix string) (string, error) {
 		return "", err
 	}
 	return prefix + hex.EncodeToString(raw[:]), nil
-}
-
-func sourceScratchIdentity(stat *unix.Stat_t) scratchIdentity {
-	return scratchIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino)}
 }

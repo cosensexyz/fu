@@ -539,9 +539,15 @@ func reconcileCheckedWithHooks(st *store.Store, cfg *store.Config, agents []agen
 // is a test-only seam for the namespace-replacement window between those two
 // operations; production always passes nil.
 func createAndScanAgentDir(a agent.Agent, storeSkillsDir string, afterCreate func()) (AgentState, error) {
+	return createAndScanAgentDirWithHooks(a, storeSkillsDir, nil, afterCreate)
+}
+
+// createAndScanAgentDirWithHooks adds the test-only seam between anchor
+// inspection and creation (afterAnchor) to createAndScanAgentDir.
+func createAndScanAgentDirWithHooks(a agent.Agent, storeSkillsDir string, afterAnchor, afterCreate func()) (AgentState, error) {
 	// Anchored at the deepest component that already exists, so a symlink
 	// appearing at one of the missing ones cannot redirect creation.
-	created, err := mkdirAllAnchoredIdentity(a.SkillsDir())
+	created, err := mkdirAllAnchoredIdentityWithHooks(a.SkillsDir(), afterAnchor)
 	if err != nil {
 		return AgentState{}, err
 	}
@@ -554,7 +560,7 @@ func createAndScanAgentDir(a agent.Agent, storeSkillsDir string, afterCreate fun
 	if err != nil {
 		return AgentState{}, err
 	}
-	if state.dirInfo == nil || !os.SameFile(created, state.dirInfo) {
+	if !state.dirIdentity.Valid() || !created.Same(state.dirIdentity) {
 		return AgentState{}, fmt.Errorf("%s is not the directory fu just created: it was replaced before the verification scan, so refusing to reconcile it", a.SkillsDir())
 	}
 	return state, nil
@@ -681,28 +687,32 @@ func applyToAgent(st *store.Store, skillsRoot *os.Root, cfg *store.Config, a age
 }
 
 type agentDirReader interface {
-	Lstat(string) (os.FileInfo, error)
+	Identity(string) (store.FileIdentity, unix.Stat_t, error)
 	Readlink(string) (string, error)
 }
 
-func inspectFuLink(root agentDirReader, name, storeSkillsDir string) (os.FileInfo, string, bool, error) {
-	fi, err := root.Lstat(name)
+// inspectFuLink captures the entry's sealed identity and, for a symlink, its
+// target and whether fu owns it. The identity is what a later recheck
+// compares against: on Linux it carries the file handle, so a link planted
+// at the retired name on a reused inode number is still told apart.
+func inspectFuLink(root agentDirReader, name, storeSkillsDir string) (store.FileIdentity, string, bool, error) {
+	identity, stat, err := root.Identity(name)
 	if err != nil {
-		return nil, "", false, err
+		return store.FileIdentity{}, "", false, err
 	}
-	if fi.Mode()&os.ModeSymlink == 0 {
+	if stat.Mode&unix.S_IFMT != unix.S_IFLNK {
 		// A real file or directory: not fu's, and nothing went wrong in
 		// establishing that.
-		return fi, "", false, nil
+		return identity, "", false, nil
 	}
 	target, err := root.Readlink(name)
 	if err != nil {
-		return nil, "", false, err
+		return store.FileIdentity{}, "", false, err
 	}
 	// name is the entry's own name -- the same name ScanAgent read from the
 	// directory listing when it classified this entry, so this re-check asks
 	// ownsLink exactly the question the scan asked.
-	return fi, target, ownsLink(storeSkillsDir, name, target), nil
+	return identity, target, ownsLink(storeSkillsDir, name, target), nil
 }
 
 type linkRetireOutcome uint8
@@ -749,12 +759,12 @@ func retireFuLink(root *checkedAgentDir, name, storeSkillsDir string, beforeReti
 		afterRetire(retired)
 	}
 
-	moved, inspectErr := root.Lstat(retired)
+	moved, movedStat, inspectErr := root.Identity(retired)
 	movedTarget := ""
-	if inspectErr == nil && moved.Mode()&os.ModeSymlink != 0 {
+	if inspectErr == nil && movedStat.Mode&unix.S_IFMT == unix.S_IFLNK {
 		movedTarget, inspectErr = root.Readlink(retired)
 	}
-	if inspectErr != nil || moved.Mode()&os.ModeSymlink == 0 || !sameCheckedEntry(approved, moved) || movedTarget != approvedTarget {
+	if inspectErr != nil || movedStat.Mode&unix.S_IFMT != unix.S_IFLNK || !moved.Same(approved) || movedTarget != approvedTarget {
 		restoreErr := store.RestoreRetiredAt(root.file, retired, name)
 		if restoreErr != nil && !os.IsExist(restoreErr) {
 			if inspectErr != nil {
@@ -773,10 +783,4 @@ func retireFuLink(root *checkedAgentDir, name, storeSkillsDir string, beforeReti
 		return linkRetireConflict, retired, err
 	}
 	return linkRetireRemoved, "", nil
-}
-
-func sameCheckedEntry(left, right os.FileInfo) bool {
-	leftStat, leftOK := left.Sys().(*unix.Stat_t)
-	rightStat, rightOK := right.Sys().(*unix.Stat_t)
-	return leftOK && rightOK && leftStat.Dev == rightStat.Dev && leftStat.Ino == rightStat.Ino
 }

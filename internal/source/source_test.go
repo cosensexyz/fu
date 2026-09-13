@@ -811,11 +811,10 @@ func TestCreatedScratchErrorCleanupRetiresBeforeRemoval(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(parentPath, name), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	var stat unix.Stat_t
-	if err := unix.Fstatat(int(parent.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	expected, _, err := store.EntryIdentityAt(int(parent.Fd()), name)
+	if err != nil {
 		t.Fatal(err)
 	}
-	expected := sourceScratchIdentity(&stat)
 	marker := filepath.Join(parentPath, name, "foreign")
 
 	err = cleanupCreatedScratch(parent, parentPath, name, expected, func(retired string) error {
@@ -860,7 +859,9 @@ func TestOwnedScratchConstructorCleansDirectoryAfterCreatedStatFailure(t *testin
 	parent := t.TempDir()
 	want := errors.New("injected created-directory stat failure")
 	_, err := newOwnedScratchWithHooks(parent, scratchCreateHooks{
-		inspectCreated: func(_ int, _ string, _ *unix.Stat_t) error { return want },
+		inspectCreated: func(_ int, _ string) (store.FileIdentity, unix.Stat_t, error) {
+			return store.FileIdentity{}, unix.Stat_t{}, want
+		},
 	})
 	if !errors.Is(err, want) {
 		t.Fatalf("constructor error = %v, want %v", err, want)

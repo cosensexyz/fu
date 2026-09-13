@@ -21,22 +21,21 @@ import (
 
 // TestStatInodeIsReadOnlyByTheStoreIdentityPrimitive is the engine half of the
 // store guard of the same name. It rejects direct Stat_t.Dev/Ino selectors,
-// field-by-field identity construction, and FileIdentity literals, including
-// pointer and recursively type-elided container elements. It does not detect
-// os.SameFile calls, cross-file named declarations, serialization,
-// whole-identity assignment, or whole-stat comparisons. reconcile.go is
-// allowed currently only for sameCheckedEntry, the retired-link recheck that
-// still compares device and inode from two os.FileInfo snapshots. Shrink the
-// allowlist when that site moves onto the store identity primitive.
+// field-by-field identity construction, FileIdentity literals, including
+// pointer and recursively type-elided container elements, and every
+// os.SameFile call (the engine pins nothing open across such a comparison).
+// It does not detect cross-file named declarations, serialization,
+// whole-identity assignment, or whole-stat comparisons. No engine file reads
+// an inode directly any more: the retired-link recheck moved onto
+// store.EntryIdentityAt in batch 4, so the inode allowlist is empty and any
+// new raw read is a finding.
 func TestStatInodeIsReadOnlyByTheStoreIdentityPrimitive(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate the engine package directory")
 	}
 	dir := filepath.Dir(currentFile)
-	inodeAllowlist := map[string]map[string]bool{
-		"reconcile.go": {"sameCheckedEntry": true},
-	}
+	inodeAllowlist := map[string]map[string]bool{}
 	downgradeAllowlist := map[string]map[string]bool{
 		"adopt_link_archive.go": {"marshalAdoptLinkArchive": true},
 	}
@@ -66,6 +65,9 @@ func TestStatInodeIsReadOnlyByTheStoreIdentityPrimitive(t *testing.T) {
 					t.Errorf("%s:%d reads a Stat_t inode directly; capture identities through store.EntryIdentityAt or store.OpenIdentity",
 						name, fset.Position(finding.Pos).Line)
 				}
+			case identityguard.SameFileCall:
+				t.Errorf("%s:%d compares identities with os.SameFile; compare store.FileIdentity values with Same instead",
+					name, fset.Position(finding.Pos).Line)
 			case identityguard.HandleAssignment:
 				if !downgradeAllowed {
 					t.Errorf("%s:%d strips or replaces a captured file handle", name, fset.Position(finding.Pos).Line)
@@ -238,8 +240,8 @@ func validateDirSwitchSibling(...any) error { return nil }
 func validateDirSwitchLink(...any) error { return nil }
 func validateRetiredAdoptOriginal(...any) error { return nil }
 func observeDirSwitchBackup(any, any, *State, Identity) (Identity, error) { return Identity{}, nil }
+func (Info) Same(Info) bool { return true }
 func inspectFuLink(any, string, string) (Info, string, bool, error) { return Info{}, "", true, nil }
-func sameCheckedEntry(Info, Info) bool { return true }
 var store = struct { RetireNameAt func(any, string, string) (string, error) }{}
 func wrapperBad(parent any, sw *State) error {
 	if err := renameDirSwitchEntry(parent, "live", "retired", "retire"); err != nil { return err }
@@ -296,14 +298,14 @@ func retireRecordedBad(parent any, recorded Info) error {
 	approved, _, _, err := inspectFuLink(parent, "live", "store")
 	if err != nil { return err }
 	if _, err := store.RetireNameAt(parent, "live", ".retired-"); err != nil { return err }
-	if !sameCheckedEntry(recorded, approved) { return nil }
+	if !approved.Same(recorded) { return nil }
 	return nil
 }
 func retireLiveGood(parent any) error {
 	approved, _, _, err := inspectFuLink(parent, "live", "store")
 	if err != nil { return err }
 	if _, err := store.RetireNameAt(parent, "live", ".retired-"); err != nil { return err }
-	if !sameCheckedEntry(approved, approved) { return nil }
+	if !approved.Same(approved) { return nil }
 	return nil
 }
 func good(parent any, sw *State) error {
@@ -422,7 +424,6 @@ func TestPostActionIdentityIndicesMatchProductionHelperSignatures(t *testing.T) 
 		"observeDirSwitchSiblingWithCapture":        "expectedIdentity",
 		"observeDirSwitchLink":                      "expectedIdentity",
 		"observeDirSwitchLinkWithCapture":           "expectedIdentity",
-		"sameCheckedEntry":                          "left",
 	}
 	for _, filename := range engineProductionGoFiles(t, dir) {
 		file, err := parser.ParseFile(token.NewFileSet(), filepath.Join(dir, filename), nil, 0)
@@ -737,7 +738,7 @@ func postActionExpectedIdentityIndex(name string) int {
 		index = 3
 	case "openDirSwitchDirectory", "openDirSwitchDirectoryObservedWithCapture":
 		index = 3
-	case "Same", "sameCheckedEntry":
+	case "Same":
 		index = 0
 	}
 	return index

@@ -26,9 +26,10 @@ func identityPathError(path string, err error) error {
 //
 // Identities are captured only through entryIdentityAt and openIdentity below.
 // identity_guard_test.go rejects any other code in this package that reads a
-// Stat_t inode directly; internal/engine/identity_test.go enforces the same
-// rule for internal/engine, exempting reconcile.go, currently only for its
-// sameCheckedEntry recheck.
+// Stat_t inode directly; the engine, source, skill and agent guards enforce
+// the same rule for their packages with no exemptions, and every guard also
+// reports os.SameFile outside the three pairings that hold both descriptors
+// open across the comparison.
 type FileIdentity struct {
 	Device uint64 `json:"device"`
 	Inode  uint64 `json:"inode"`

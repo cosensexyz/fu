@@ -183,7 +183,7 @@ v1 不实现 GUI，仅交付 CLI。本地 web GUI（`fu web`）列入 roadmap；
 ## 6. 行为规则
 
 1. **重名冲突**：skill 名是唯一标识；按 Agent Skills 规范，SKILL.md frontmatter 的 name 必须与目录名一致，fu 以此名为准。`fu add` 遇同名即拒绝安装，提示先 `fu rm` 旧项；批量安装时重名项跳过并提示。fu 不提供改名能力——改名即修改 skill 内容，违反规则 5。
-2. **非纳管条目**：agent 目录中不是 fu 创建的内容，fu 绝不触碰；`fu status` 将其列为"未纳管"供参考，`fu adopt` 是唯一收编途径。唯一不可区分的残留是用户以同名手工创建、且原始目标恰与 fu 将创建的链接完全相同的 symlink；没有独立 link manifest 时它与 fu 自建链接无从区分，按 fu 所有处理（见 DESIGN §2）。
+2. **非纳管条目**：agent 目录中不是 fu 创建的内容，fu 绝不触碰；`fu status` 将其列为"未纳管"供参考，`fu adopt` 是唯一收编途径。唯一不可区分的残留是用户以同名手工创建、且原始目标恰与 fu 将创建的链接完全相同的 symlink；没有独立 link manifest 时它与 fu 自建链接无从区分，按 fu 所有处理（见 DESIGN §2）。fu 以文件身份判定「是否仍是它检查过的那个对象」：macOS 上 APFS 从不复用 inode 号；Linux 上以文件系统导出的文件句柄为准（承诺 ext4、XFS、btrfs、tmpfs 导出句柄，其中 ext4 已在验收环境验证），不导出句柄的文件系统退回 device+inode，此时同名替换若复用 inode 号将不可区分，属已接受的较弱保证（见 §9）。
 3. **本地修改与更新**：`fu update` 检测该 skill 自安装以来是否被本地修改；有则拒绝覆盖并提示差异，`--force` 强制，被覆盖内容留存于 git 历史。
 4. **agent 检测**：按特征路径探测（`~/.claude/`、`~/.codex/`），检测到即纳管，未检测到的 agent 不投放、不报错。新 agent 的首次投放由下一次任意写操作或 `restore` 完成，只读命令仅提示待投放。
 5. **专有元数据透明传递**：如 Codex 的 `openai.yaml`，随 skill 目录整体投放，fu 不解析、不修改。
@@ -225,7 +225,7 @@ How 层面仅约定以下边界，具体方案由实现规划文档承担：
 - store 目录布局与 `fu.yaml` 格式保持前向兼容；
 - 只读命令（list、show、status、log、outdated、agent、无参数的 remote）不修改 store 内容与 agent 目录；这些命令所做的远端访问一律仅作网络查询、不落盘——`outdated` 按规则 9 查询各 skill 来源的 ref（ls-remote，不取对象），`status` 的远端核对指 **store 自身远端**的领先/落后情形（尚未实现）。规则 9 已把来源侧的可达性判定统一归 `outdated`，故此处不得读作 `status` 会核对来源；
 - 所有破坏性操作均可恢复：已提交的 store 内容以 git 历史兜底，adopt 触及的本机原有条目以 recovery 归档兜底。`restore` 不写 recovery：它重建链接层时退休的断链或拼法过期的旧链接，改名到该 agent skills 目录内的兄弟名后随即删除，不归档；这类链接由 `restore` 依 `fu.yaml` 重建，故无需兜底。不可恢复的有两处，均为明示语义：其一是 `fu restore --hard` 丢弃的未提交改动——它们既未进入 git 历史，也不归档；其二是 `fu commit <name>` 覆盖掉的、该 skill 之内仅经 git 暂存过的中间版本——带 name 的提交以工作区为准，该中间版本不入历史。覆盖发生在公共 index 的同步处，而同步有两处：写出提交之后，以及候选树与 HEAD 同树、因而不写提交的提前返回处。前者与 `git commit <路径>` 一致；**后者恰与之相反**：两处都会丢掉该暂存版本，但只有后者是 git 本会保住它的地方——同样的状态下 git 报 `nothing to commit` 并原样保留该暂存版本，fu 报同一句话却把它同步掉。这是 §5.3 所需的那次同步（否则「暂存后又改回已提交内容」将永远报待提交）的代价，明示于此（省略 name 的形式仍先以「外部修改」把它记入历史，不受此影响）；
-- v1 平台：macOS 与 Linux。
+- v1 平台：macOS 与 Linux。Linux 上文件身份的完整保证以文件系统导出文件句柄为前提（承诺 ext4、XFS、btrfs、tmpfs 导出句柄，其中 ext4 已在验收环境验证）；不导出句柄的文件系统上退回 device+inode，同名替换复用 inode 号时不可区分。
 
 ## 10. 验收标准
 

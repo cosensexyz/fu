@@ -748,11 +748,12 @@ func TestVerifyFuLinkRejectsWhateverItIsNotStillOwned(t *testing.T) {
 	// verifyFuLink works relative to an open descriptor for the agent
 	// directory (round 7), so entries are addressed by name within it rather
 	// than by path.
-	agentRoot, err := os.OpenRoot(dir)
+	agentDir, err := os.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer agentRoot.Close()
+	defer agentDir.Close()
+	agentRoot := &checkedAgentDir{file: agentDir, display: dir}
 
 	// Named "alpha", pointing at the skill "alpha" -- the only shape fu ever
 	// creates, and since round 6 the only shape that verifies (see ownsLink).
@@ -1002,7 +1003,7 @@ func TestReconcileNeverTouchesUserSymlinkChainIntoStore(t *testing.T) {
 // ParentIsSymlink precondition the previous test covers) must likewise
 // not prevent Reconcile from processing the remaining agents. Before the
 // fix, ScanAgent's error for "broken-agent" (its skills dir is a plain
-// file, so os.ReadDir fails with "not a directory") made reconcile
+// file, which ScanAgent refuses as "not a directory") made reconcile
 // return immediately with that error, so "claude" -- with nothing wrong
 // with it -- never got its link either, and Reconcile's own caller
 // (NewSkill etc.) would see a hard error despite the config entry and
@@ -1524,12 +1525,13 @@ func TestMkdirAllAnchored(t *testing.T) {
 		target := filepath.Join(base, "cfgroot", "skills")
 
 		// Resolve the anchor first, as reconcile does...
-		anchor, rest, anchorInfo, err := deepestExistingAncestor(target)
+		anchor, anchorPath, rest, err := deepestExistingAncestor(target)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if anchor != base {
-			t.Fatalf("setup: want %s as the anchor, got %s", base, anchor)
+		defer anchor.Close()
+		if anchorPath != base {
+			t.Fatalf("setup: want %s as the anchor, got %s", base, anchorPath)
 		}
 		// ...then the race: a component that did not exist becomes a symlink
 		// into somebody else's tree before the creation happens.
@@ -1537,7 +1539,7 @@ func TestMkdirAllAnchored(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := mkdirAllUnder(anchor, rest, anchorInfo); err == nil {
+		if err := mkdirAllUnder(anchor, anchorPath, rest); err == nil {
 			t.Error("a symlink that appeared below the anchor must not be traversed")
 		}
 		ents, err := os.ReadDir(foreign)
@@ -1557,12 +1559,13 @@ func TestMkdirAllAnchored(t *testing.T) {
 		}
 		target := filepath.Join(base, "cfgroot", "skills")
 
-		anchor, rest, anchorInfo, err := deepestExistingAncestor(target)
+		anchor, anchorPath, rest, err := deepestExistingAncestor(target)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if anchor != base {
-			t.Fatalf("setup: want %s as the anchor, got %s", base, anchor)
+		defer anchor.Close()
+		if anchorPath != base {
+			t.Fatalf("setup: want %s as the anchor, got %s", base, anchorPath)
 		}
 		// Unlike an absolute target, this stays beneath os.Root and is
 		// followed by Root.MkdirAll unless each new component is opened with
@@ -1571,7 +1574,7 @@ func TestMkdirAllAnchored(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := mkdirAllUnder(anchor, rest, anchorInfo); err == nil {
+		if err := mkdirAllUnder(anchor, anchorPath, rest); err == nil {
 			t.Fatal("a relative symlink below the checked anchor must not be traversed")
 		}
 		if _, err := os.Lstat(filepath.Join(foreign, "skills")); !os.IsNotExist(err) {
@@ -1582,19 +1585,20 @@ func TestMkdirAllAnchored(t *testing.T) {
 		}
 	})
 
-	t.Run("replacement of the inspected anchor is refused", func(t *testing.T) {
+	t.Run("creation binds to the inspected anchor object, not its pathname", func(t *testing.T) {
 		base := t.TempDir()
 		anchorPath := filepath.Join(base, "cfgroot")
 		if err := os.Mkdir(anchorPath, 0o755); err != nil {
 			t.Fatal(err)
 		}
 		target := filepath.Join(anchorPath, "skills")
-		anchor, rest, anchorInfo, err := deepestExistingAncestor(target)
+		anchor, openedPath, rest, err := deepestExistingAncestor(target)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if anchor != anchorPath || rest != "skills" {
-			t.Fatalf("setup: got anchor=%q rest=%q", anchor, rest)
+		defer anchor.Close()
+		if openedPath != anchorPath || rest != "skills" {
+			t.Fatalf("setup: got anchor=%q rest=%q", openedPath, rest)
 		}
 
 		foreign := filepath.Join(base, "foreign")
@@ -1608,8 +1612,10 @@ func TestMkdirAllAnchored(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := mkdirAllUnder(anchor, rest, anchorInfo); err == nil {
-			t.Fatal("an anchor replaced after inspection must not be trusted by pathname")
+		// The inspected directory is held open and no longer linked at its
+		// pathname, so creation relative to it cannot reach the replacement.
+		if err := mkdirAllUnder(anchor, openedPath, rest); err == nil {
+			t.Fatal("creation must bind to the inspected object, which is gone, not to the pathname's new occupant")
 		}
 		ents, err := os.ReadDir(foreign)
 		if err != nil {

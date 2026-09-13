@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/cosensexyz/fu/internal/agent"
+	"github.com/cosensexyz/fu/internal/store"
 )
 
 // EntryKind classifies one entry in an agent skills directory.
@@ -39,11 +40,14 @@ type AgentState struct {
 	ParentMissing   bool // skills dir does not exist yet
 	ParentIsSymlink bool // precondition violation: never write through
 	Entries         []Entry
-	// dirInfo is the identity of the skills directory this scan actually
+	// dirIdentity is the identity of the skills directory this scan actually
 	// inspected, recorded so the apply phase can prove it is acting on that
 	// same directory and not one swapped in since (round 7 finding; see
-	// OpenCheckedDir). Nil when the directory did not exist or was refused.
-	dirInfo os.FileInfo
+	// OpenCheckedDir). Captured by name and sealed (store.EntryIdentityAt),
+	// so on Linux it carries the file handle and a replacement on a reused
+	// inode number is still told apart. Invalid when the directory did not
+	// exist or was refused.
+	dirIdentity store.FileIdentity
 }
 
 // OpenCheckedDir opens a descriptor for the skills directory this scan
@@ -74,12 +78,12 @@ func (st AgentState) OpenCheckedDir() (*checkedAgentDir, error) {
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("open skills directory %s: invalid file descriptor", dir)
 	}
-	opened, err := file.Stat()
+	opened, _, err := store.OpenIdentity(int(file.Fd()))
 	if err != nil {
 		_ = file.Close()
-		return nil, fmt.Errorf("stat opened skills directory %s: %w", dir, err)
+		return nil, fmt.Errorf("identify opened skills directory %s: %w", dir, err)
 	}
-	if st.dirInfo == nil || !os.SameFile(st.dirInfo, opened) {
+	if !st.dirIdentity.Valid() || !opened.Same(st.dirIdentity) {
 		_ = file.Close()
 		return nil, fmt.Errorf("%s is no longer the directory it was when scanned: it was replaced "+
 			"between the scan and this write, so nothing here can be assumed about what fu owns", dir)
@@ -115,6 +119,20 @@ func (d *checkedAgentDir) Lstat(name string) (os.FileInfo, error) {
 		return nil, &os.PathError{Op: "lstat", Path: filepath.Join(d.display, name), Err: err}
 	}
 	return checkedAgentFileInfo{name: name, stat: stat}, nil
+}
+
+// Identity captures one entry's identity relative to the checked directory,
+// sealed by store.EntryIdentityAt, with the stat the seal settled on.
+func (d *checkedAgentDir) Identity(name string) (store.FileIdentity, unix.Stat_t, error) {
+	defer keepDescriptorOwnersAlive(d)
+	if err := d.checkedName("identify", name); err != nil {
+		return store.FileIdentity{}, unix.Stat_t{}, err
+	}
+	identity, stat, err := store.EntryIdentityAt(int(d.file.Fd()), name)
+	if err != nil {
+		return store.FileIdentity{}, unix.Stat_t{}, &os.PathError{Op: "identify", Path: filepath.Join(d.display, name), Err: err}
+	}
+	return identity, stat, nil
 }
 
 func (d *checkedAgentDir) Readlink(name string) (string, error) {
@@ -469,100 +487,128 @@ func mkdirAllAnchored(dir string) error {
 }
 
 // mkdirAllAnchoredIdentity is mkdirAllAnchored plus the identity of the final
-// directory opened by the no-follow walk. Reconcile compares that identity
-// with its rescan so a replacement after creation cannot be adopted.
-func mkdirAllAnchoredIdentity(dir string) (os.FileInfo, error) {
-	anchor, rest, anchorInfo, err := deepestExistingAncestor(dir)
+// directory opened by the no-follow walk, captured while that directory is
+// still held open. Reconcile compares that identity with its rescan so a
+// replacement after creation cannot be adopted.
+func mkdirAllAnchoredIdentity(dir string) (store.FileIdentity, error) {
+	return mkdirAllAnchoredIdentityWithHooks(dir, nil)
+}
+
+// mkdirAllAnchoredIdentityWithHooks is mkdirAllAnchoredIdentity with a
+// test-only seam between inspecting the anchor and creating beneath it: the
+// window a pathname re-open would expose. Production passes nil.
+func mkdirAllAnchoredIdentityWithHooks(dir string, afterAnchor func()) (store.FileIdentity, error) {
+	anchor, anchorPath, rest, err := deepestExistingAncestor(dir)
 	if err != nil {
-		return nil, err
+		return store.FileIdentity{}, err
 	}
-	return mkdirAllUnderIdentity(anchor, rest, anchorInfo)
+	defer func() { _ = anchor.Close() }()
+	if afterAnchor != nil {
+		afterAnchor()
+	}
+	return mkdirAllUnderIdentity(anchor, anchorPath, rest)
 }
 
 // deepestExistingAncestor splits dir into the deepest ancestor that exists
-// on disk and the slash-separated remainder that does not. It also captures
-// the identity of the followed anchor so opening it later cannot silently
-// adopt a replacement. rest is empty when dir itself already exists.
-func deepestExistingAncestor(dir string) (anchor, rest string, anchorInfo os.FileInfo, err error) {
-	anchor = filepath.Clean(dir)
+// on disk and the slash-separated remainder that does not, and returns that
+// ancestor open: creation then proceeds relative to this very descriptor,
+// so there is no second lookup for a replacement to satisfy. The caller
+// closes it. rest is empty when dir itself already exists. Symlinks at or
+// above the anchor are the user's arrangement and are followed, as
+// mkdirAllAnchored's doc explains.
+func deepestExistingAncestor(dir string) (anchor *os.File, anchorPath, rest string, err error) {
+	anchorPath = filepath.Clean(dir)
 	for {
-		if _, err := os.Lstat(anchor); err == nil {
-			anchorInfo, err := os.Stat(anchor)
+		if _, err := os.Lstat(anchorPath); err == nil {
+			// Followed (the user's own arrangement above the anchor) but
+			// opened as a directory: a file or FIFO there fails at once.
+			fd, err := unix.Open(anchorPath, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 			if err != nil {
-				return "", "", nil, fmt.Errorf("inspect existing ancestor %s: %w", anchor, err)
+				return nil, "", "", fmt.Errorf("inspect existing ancestor %s: %w", anchorPath, &os.PathError{Op: "open", Path: anchorPath, Err: err})
 			}
-			return anchor, rest, anchorInfo, nil
+			opened := os.NewFile(uintptr(fd), anchorPath)
+			if opened == nil {
+				_ = unix.Close(fd)
+				return nil, "", "", fmt.Errorf("inspect existing ancestor %s: invalid file descriptor", anchorPath)
+			}
+			return opened, anchorPath, rest, nil
 		} else if !os.IsNotExist(err) {
-			return "", "", nil, fmt.Errorf("inspect %s: %w", anchor, err)
+			return nil, "", "", fmt.Errorf("inspect %s: %w", anchorPath, err)
 		}
-		parent := filepath.Dir(anchor)
-		if parent == anchor {
+		parent := filepath.Dir(anchorPath)
+		if parent == anchorPath {
 			// Reached the root without finding anything that exists, which
 			// on any real filesystem means the path was never usable.
-			return "", "", nil, fmt.Errorf("no existing ancestor of %s", dir)
+			return nil, "", "", fmt.Errorf("no existing ancestor of %s", dir)
 		}
 		if rest == "" {
-			rest = filepath.Base(anchor)
+			rest = filepath.Base(anchorPath)
 		} else {
-			rest = filepath.Join(filepath.Base(anchor), rest)
+			rest = filepath.Join(filepath.Base(anchorPath), rest)
 		}
-		anchor = parent
+		anchorPath = parent
 	}
 }
 
-// mkdirAllUnder creates rest beneath the same anchor that discovery inspected,
-// through directory descriptors, so neither replacement of the anchor nor a
-// symlink in any new component can redirect creation. os.Root alone is not
-// sufficient here: it follows relative symlinks that stay beneath its root.
-func mkdirAllUnder(anchor, rest string, anchorInfo os.FileInfo) error {
-	_, err := mkdirAllUnderIdentity(anchor, rest, anchorInfo)
+// mkdirAllUnder creates rest beneath the very anchor descriptor discovery
+// opened, so neither replacement of the anchor's pathname nor a symlink in
+// any new component can redirect creation. os.Root alone is not sufficient
+// here: it follows relative symlinks that stay beneath its root.
+func mkdirAllUnder(anchor *os.File, anchorPath, rest string) error {
+	_, err := mkdirAllUnderIdentity(anchor, anchorPath, rest)
 	return err
 }
 
-func mkdirAllUnderIdentity(anchor, rest string, anchorInfo os.FileInfo) (os.FileInfo, error) {
-	current, err := os.Open(anchor)
-	if err != nil {
-		return nil, err
+// mkdirAllUnderIdentity is mkdirAllUnder plus the identity of the final
+// directory, captured from its descriptor while it is still open. The anchor
+// descriptor is the caller's and stays open; only descriptors opened here
+// are closed here.
+func mkdirAllUnderIdentity(anchor *os.File, anchorPath, rest string) (store.FileIdentity, error) {
+	if anchor == nil {
+		return store.FileIdentity{}, fmt.Errorf("no open ancestor for creating %s", rest)
 	}
-	defer func() { _ = current.Close() }()
-	opened, err := current.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat opened ancestor %s: %w", anchor, err)
-	}
-	if anchorInfo == nil || !os.SameFile(anchorInfo, opened) {
-		return nil, fmt.Errorf("%s is no longer the directory inspected before creation: refusing to create %s through a replacement", anchor, rest)
-	}
-
 	if rest == "" {
-		return opened, nil
+		identity, _, err := store.OpenIdentity(int(anchor.Fd()))
+		if err != nil {
+			return store.FileIdentity{}, fmt.Errorf("identify existing directory %s: %w", anchorPath, err)
+		}
+		return identity, nil
 	}
+	current, owned := anchor, false
+	defer func() {
+		if owned {
+			_ = current.Close()
+		}
+	}()
 	for _, component := range strings.Split(filepath.Clean(rest), string(filepath.Separator)) {
 		if component == "" || component == "." || component == ".." {
-			return nil, fmt.Errorf("invalid missing path component %q beneath %s", component, anchor)
+			return store.FileIdentity{}, fmt.Errorf("invalid missing path component %q beneath %s", component, anchorPath)
 		}
 		parentFD := int(current.Fd())
 		if err := unix.Mkdirat(parentFD, component, 0o755); err != nil && !errors.Is(err, unix.EEXIST) {
-			return nil, fmt.Errorf("create %s beneath checked ancestor %s: %w", component, anchor, err)
+			return store.FileIdentity{}, fmt.Errorf("create %s beneath checked ancestor %s: %w", component, anchorPath, err)
 		}
 		fd, err := unix.Openat(parentFD, component,
 			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if err != nil {
-			return nil, fmt.Errorf("open created component %s beneath checked ancestor %s without following links: %w", component, anchor, err)
+			return store.FileIdentity{}, fmt.Errorf("open created component %s beneath checked ancestor %s without following links: %w", component, anchorPath, err)
 		}
 		next := os.NewFile(uintptr(fd), component)
 		if next == nil {
 			_ = unix.Close(fd)
-			return nil, fmt.Errorf("open created component %s beneath checked ancestor %s: invalid file descriptor", component, anchor)
+			return store.FileIdentity{}, fmt.Errorf("open created component %s beneath checked ancestor %s: invalid file descriptor", component, anchorPath)
 		}
-		if err := current.Close(); err != nil {
-			_ = next.Close()
-			return nil, fmt.Errorf("close parent while creating %s beneath %s: %w", rest, anchor, err)
+		if owned {
+			if err := current.Close(); err != nil {
+				_ = next.Close()
+				return store.FileIdentity{}, fmt.Errorf("close parent while creating %s beneath %s: %w", rest, anchorPath, err)
+			}
 		}
-		current = next
+		current, owned = next, true
 	}
-	created, err := current.Stat()
+	created, _, err := store.OpenIdentity(int(current.Fd()))
 	if err != nil {
-		return nil, fmt.Errorf("stat created directory %s: %w", filepath.Join(anchor, rest), err)
+		return store.FileIdentity{}, fmt.Errorf("identify created directory %s: %w", filepath.Join(anchorPath, rest), err)
 	}
 	return created, nil
 }
@@ -642,21 +688,28 @@ func ScanAgent(a agent.Agent, storeSkillsDir string) (AgentState, error) {
 		// no usable directory does not stop the rest.
 		return st, fmt.Errorf("agent %q has no skills directory (its home directory is not resolvable)", a.Name())
 	}
-	fi, err := os.Lstat(dir)
+	// One sealed capture decides everything about the directory itself:
+	// whether it exists, whether its final component is a symlink, and the
+	// identity the apply phase must find again (OpenCheckedDir). The type
+	// comes from the stat the seal settled on, never from an earlier
+	// observation a replacement could have outdated.
+	identity, stat, err := store.EntryIdentityAt(unix.AT_FDCWD, dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			st.ParentMissing = true
 			return st, nil
 		}
-		return st, err
+		return st, fmt.Errorf("identify skills directory %s: %w", dir, err)
 	}
-	if fi.Mode()&os.ModeSymlink != 0 {
+	switch stat.Mode & unix.S_IFMT {
+	case unix.S_IFLNK:
 		st.ParentIsSymlink = true
 		return st, nil
+	case unix.S_IFDIR:
+	default:
+		return st, fmt.Errorf("%s is not a directory", dir)
 	}
-	// Recorded so the apply phase can prove it operates on this very
-	// directory rather than one substituted afterwards (OpenCheckedDir).
-	st.dirInfo = fi
+	st.dirIdentity = identity
 	reserved := map[string]bool{}
 	for _, r := range a.Reserved() {
 		reserved[r] = true

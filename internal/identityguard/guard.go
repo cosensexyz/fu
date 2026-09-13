@@ -20,6 +20,11 @@ const (
 	HandleAssignment        Kind = "handle"
 	IdentityFieldAssignment Kind = "identity-field"
 	IdentityLiteral         Kind = "literal"
+	// SameFileCall is any call whose selector is SameFile (os.SameFile):
+	// a device+inode comparison of two FileInfo snapshots. It is legitimate
+	// only while both compared objects are held open, which the guard cannot
+	// see, so consuming tests allow the exact functions where that holds.
+	SameFileCall Kind = "same-file"
 )
 
 type Finding struct {
@@ -124,6 +129,9 @@ func directFinding(node ast.Node, namedTypes map[string]*ast.TypeSpec) Kind {
 			return IdentityLiteral
 		}
 	case *ast.CallExpr:
+		if selector, ok := node.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "SameFile" {
+			return SameFileCall
+		}
 		if len(node.Args) > 0 && fileIdentityTypeWithNamed(node.Fun, namedTypes) {
 			return IdentityLiteral
 		}

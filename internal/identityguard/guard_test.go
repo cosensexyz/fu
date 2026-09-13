@@ -37,6 +37,7 @@ func TestFirstFindingRecognizesCompilingIdentityConstruction(t *testing.T) {
 		{"identity struct conversion", `package p; type FileIdentity struct{ Device, Inode uint64; Handle string }; type weak struct{ Device, Inode uint64; Handle string }; var id = FileIdentity(weak{Device: 1, Inode: 2})`, IdentityLiteral},
 		{"identity pointer conversion", `package p; type FileIdentity struct{ Device, Inode uint64; Handle string }; type weak struct{ Device, Inode uint64; Handle string }; var source *weak; var id = (*FileIdentity)(source)`, IdentityLiteral},
 		{"empty identity literal", `package p; type FileIdentity struct{ Device uint64 }; var id = FileIdentity{}`, ""},
+		{"same file call", `package p; type FileInfo interface{}; var os struct{ SameFile func(FileInfo, FileInfo) bool }; func f(a, b FileInfo) bool { return os.SameFile(a, b) }`, SameFileCall},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
