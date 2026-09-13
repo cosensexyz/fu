@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -103,6 +104,17 @@ type CommitOutcome struct {
 	Changed         []string
 }
 
+// indexNotRefreshedWarning is what a commit reports when the public index
+// could not be refreshed to what it recorded (store.CommitOutcome.IndexSkipped,
+// with the store's reason). The commit stands; only the index is behind, and
+// the next write command's sweep records the difference.
+func indexNotRefreshedWarning(reason string) string {
+	if reason == store.IndexSkipReasonUnmerged {
+		return "git's index was left alone: " + reason + "; `fu status` lists the covered paths as pending, and once the merge is concluded the next write command records the difference"
+	}
+	return "git's index was left alone: " + reason + "; `fu status` lists the covered paths as pending until the next write command records the difference"
+}
+
 // CommitOperations records pending hand edits as one operation (SPEC §5.1
 // `fu commit`, §5.3). It is a write command that deliberately does not take
 // run's route (pipeline.go): run sweeps the whole worktree before anything
@@ -112,11 +124,25 @@ type CommitOutcome struct {
 // the writability and canonical-path checks, and a closing reconcile -- in
 // the same shape RevertOperations (restore.go) uses.
 //
-// Named, the candidate is PrepareCommitUnder(skills/<name>) and the public
-// index is never consulted for that subtree. Store-wide, it is Sweep's own
-// two layers: a snapshot the user staged with direct git is committed first
-// under ExternalCommitMessage, then the worktree under the derived subject.
-func CommitOperations(st *store.Store, agents []agent.Agent, scope CommitScope) (outcome CommitOutcome, retErr error) {
+// Named, the candidate is PrepareCommitUnder(skills/<name>): the skill's
+// subtree from the worktree, everything else from HEAD, so whatever the user
+// staged elsewhere with direct git is neither recorded nor disturbed.
+// Store-wide, it is Sweep's own two layers: a snapshot the user staged with
+// direct git is committed first under ExternalCommitMessage, then the
+// worktree under the derived subject.
+//
+// Concurrency (SPEC §5.3): the candidate is published only onto the HEAD it
+// was prepared against (store.ErrStaleCandidate otherwise); fu.yaml must
+// still hold the bytes read at the start, since the closing reconcile acts on
+// them (ErrConcurrentStoreChange otherwise, before anything is published);
+// and an index restaged meanwhile is left alone with a warning rather than
+// overwritten. Worktree edits arriving after preparation are simply not in
+// the commit and stay pending, as with git.
+func CommitOperations(st *store.Store, agents []agent.Agent, scope CommitScope) (CommitOutcome, error) {
+	return commitOperationsWithHooks(st, agents, scope, hooks{})
+}
+
+func commitOperationsWithHooks(st *store.Store, agents []agent.Agent, scope CommitScope, h hooks) (outcome CommitOutcome, retErr error) {
 	var res Result
 	defer func() { outcome.Result = res }()
 	session, err := st.BeginWrite()
@@ -139,7 +165,9 @@ func CommitOperations(st *store.Store, agents []agent.Agent, scope CommitScope) 
 		if err != nil {
 			return fmt.Errorf("recover pending transactions before commit: %w", err)
 		}
-		cfg, err := store.LoadConfigRoot(storeRoot, "fu.yaml", st.ConfigPath())
+		// The bytes cfg was parsed from are the baseline the pre-publish
+		// check below compares against, exactly as run does after its sweep.
+		cfg, configLoaded, err := store.LoadConfigRootBytes(storeRoot, "fu.yaml", st.ConfigPath())
 		if err != nil {
 			return fmt.Errorf("load config %s for commit: %w", st.ConfigPath(), err)
 		}
@@ -163,7 +191,7 @@ func CommitOperations(st *store.Store, agents []agent.Agent, scope CommitScope) 
 			}
 			prepared, err = checked.PrepareCommitUnder([]string{store.SkillsPrefix + scope.Name})
 			if err != nil {
-				return explainCommitScopeViolation(scope.Name, checked.Dir(), err)
+				return fmt.Errorf("prepare commit for %s: %w", scope.Name, err)
 			}
 		} else {
 			// The first of the two layers store.Sweep records, through the
@@ -180,6 +208,27 @@ func CommitOperations(st *store.Store, agents []agent.Agent, scope CommitScope) 
 			}
 			if prepared, err = checked.PrepareCommit(); err != nil {
 				return fmt.Errorf("prepare commit: %w", err)
+			}
+		}
+		if err := h.fire(h.afterCommitPrepare); err != nil {
+			return err
+		}
+		// fu.yaml is not rewritten by this command, but the reconcile at the
+		// end acts on the cfg parsed above: a change that arrived since is
+		// refused here, before anything is published, rather than acted on
+		// from a model that no longer describes the file. The store-wide
+		// candidate additionally carries fu.yaml itself, which must be those
+		// same bytes.
+		currentConfig, err := store.ReadConfigFileRoot(storeRoot, "fu.yaml")
+		if err != nil {
+			return fmt.Errorf("read config %s before publishing: %w", st.ConfigPath(), err)
+		}
+		if !bytes.Equal(currentConfig, configLoaded) {
+			return fmt.Errorf("%w: %s changed while the commit was being prepared", ErrConcurrentStoreChange, st.ConfigPath())
+		}
+		if scope.Name == "" {
+			if err := checked.ValidatePreparedFile(prepared, "fu.yaml", configLoaded); err != nil {
+				return fmt.Errorf("%w: %v", ErrConcurrentStoreChange, err)
 			}
 		}
 		outcome.Changed = prepared.ChangedPaths()
@@ -212,11 +261,15 @@ func CommitOperations(st *store.Store, agents []agent.Agent, scope CommitScope) 
 			// message at all (review 2026-09-03, Minor). The honest subject
 			// costs nothing.
 			settled, err := checked.CommitPrepared(commitSubject(scope.Name, nil), prepared)
+			outcome.Written = settled.Written
 			if err != nil {
 				return err
 			}
 			if settled.Written {
 				return fmt.Errorf("internal: a candidate with no changes published commit %s", settled.Hash)
+			}
+			if settled.IndexSkipped {
+				res.Warnings = append(res.Warnings, indexNotRefreshedWarning(settled.IndexSkipReason))
 			}
 		} else {
 			outcome.Subject = commitSubject(scope.Name, outcome.Changed)
@@ -234,6 +287,9 @@ func CommitOperations(st *store.Store, agents []agent.Agent, scope CommitScope) 
 			if err != nil {
 				return err
 			}
+			if committed.IndexSkipped {
+				res.Warnings = append(res.Warnings, indexNotRefreshedWarning(committed.IndexSkipReason))
+			}
 		}
 
 		// Content changed or not, topology did not; still reconciled, so this
@@ -246,84 +302,3 @@ func CommitOperations(st *store.Store, agents []agent.Agent, scope CommitScope) 
 	})
 	return outcome, retErr
 }
-
-// explainCommitScopeViolation turns PrepareCommitUnder's containment refusal
-// into something a user can act on.
-//
-// The refusal is genuinely reachable, not merely defensive: PrepareCommitUnder
-// fills every path outside the requested prefix from the *public* index, and
-// its changed-path set is a HEAD-to-index projection. So `git add fu.yaml`
-// followed by `fu commit alpha` lands fu.yaml in the candidate's changed set
-// on account of being staged, not on account of anything alpha did, and the
-// containment check fires. Refusing is correct -- committing would silently
-// fold the user's staged fu.yaml into a commit whose subject claims to be
-// about alpha -- but PrepareCommitUnder's own message ("candidate
-// unexpectedly changes fu.yaml") names the paths and stops there, which
-// reads as an internal invariant tripping rather than something the user
-// did. This wraps it with the paths, why they are blocking, and both ways
-// forward, while keeping PrepareCommitUnder's own error in the chain through
-// commitScopeRefusal.Unwrap, so errors.Is/errors.As still see it. Not %w:
-// see the comment on the return below for why that verb could not be used
-// here (review 2026-09-03 round 5, Minor).
-//
-// The offending paths come from store.CommitScopeViolationError via
-// errors.As, not from scanning the rendered message for a marker substring
-// as this once did (final review, finding 2): scraping failed *wrong* rather
-// than safe if the message grew a suffix, mangled any path containing the
-// marker text, and could only ever surface the first path -- so a user with
-// three staged paths was refused three times, once per path. All of them are
-// now named at once.
-//
-// storeDir is where the suggested command must be run: `git restore --staged`
-// only works inside the store under $FU_HOME, which is rarely where the user
-// was standing when they typed `fu commit <name>`.
-//
-// The claim that the paths are "staged in git's index" is exact, and depends
-// on final review finding 1: before that fix an untracked path elsewhere in
-// the store also reached this refusal, and calling it staged was false.
-func explainCommitScopeViolation(name, storeDir string, err error) error {
-	var violation *store.CommitScopeViolationError
-	if !errors.As(err, &violation) || len(violation.Paths) == 0 {
-		return fmt.Errorf("prepare commit for %s: %w", name, err)
-	}
-	// The paths are named once, in the command that acts on them, rather than
-	// listed as a subject and then repeated as arguments: one of three staged
-	// paths appearing twice in a single sentence reads as two findings
-	// (review 2026-09-02 round 1, Minor).
-	//
-	// Getting to *once* takes a type rather than another fmt.Errorf. The %w
-	// that keeps PrepareCommitUnder's error reachable also splices its text
-	// -- which ends in the same path list -- onto the end of this message, so
-	// an earlier attempt at this fix removed one of three renderings and left
-	// two (review 2026-09-03 round 4, Minor). commitScopeRefusal separates
-	// the two jobs: Error returns only the sentence, Unwrap keeps the chain.
-	subject, pronoun := "a path is", "it"
-	if len(violation.Paths) > 1 {
-		subject, pronoun = fmt.Sprintf("%d paths are", len(violation.Paths)), "them"
-	}
-	return &commitScopeRefusal{
-		message: fmt.Sprintf(
-			"%s staged in git's index outside skill %q being recorded; unstage %s with "+
-				"`git restore --staged %s` in the store at %s, or run `fu commit` with no name "+
-				"to record everything",
-			subject, name, pronoun, strings.Join(violation.Paths, " "), storeDir,
-		),
-		err: err,
-	}
-}
-
-// commitScopeRefusal carries explainCommitScopeViolation's sentence without
-// letting the wrapped error render itself into it.
-//
-// fmt.Errorf's %w has no way to keep an error reachable without also printing
-// it, and the store error's text ends in the very path list this message
-// already names. Error and Unwrap split what %w conflates, so errors.Is and
-// errors.As behave exactly as they did before while each path is named once.
-type commitScopeRefusal struct {
-	message string
-	err     error
-}
-
-func (e *commitScopeRefusal) Error() string { return e.message }
-
-func (e *commitScopeRefusal) Unwrap() error { return e.err }

@@ -235,6 +235,7 @@ type hooks struct {
 	beforePublish               func() error
 	afterPublish                func() error
 	afterCommit                 func() error
+	afterCommitPrepare          func() error // commit: candidate frozen, nothing published yet
 	commit                      func(*store.Store, string, store.PreparedCommit) (store.CommitOutcome, error)
 }
 

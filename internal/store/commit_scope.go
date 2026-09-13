@@ -7,9 +7,12 @@ import (
 	"io/fs"
 	"path"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	indexformat "github.com/go-git/go-git/v5/plumbing/format/index"
 )
 
 // SkillsPrefix is the store-relative git path prefix every skill's content
@@ -23,9 +26,12 @@ const SkillsPrefix = "skills/"
 // PrepareCommitUnder is PrepareCommit restricted to the given store-relative
 // path prefixes: the candidate takes the worktree's state for every path
 // under a prefix -- modified, added, deleted, and .gitignored alike, the same
-// indiscriminate projection a sweep records -- and the public index's state
-// for everything else. It is what lets `fu commit <name>` record one skill
-// while leaving the rest of the worktree pending.
+// indiscriminate projection a sweep records -- and HEAD's tree for everything
+// else. It is what lets `fu commit <name>` record one skill while leaving the
+// rest of the worktree pending, including whatever a direct-git user staged
+// elsewhere: that is neither recorded by this candidate nor disturbed by its
+// install, which replaces only the in-prefix entries of the public index
+// (syncPreparedPublicIndex).
 //
 // A prefix is a clean slash-separated relative path with no trailing slash,
 // no leading slash and no ".." component, and admits exactly itself and its
@@ -40,10 +46,30 @@ func (s *Store) PrepareCommitUnder(prefixes []string) (PreparedCommit, error) {
 			return PreparedCommit{}, err
 		}
 	}
+	// The branch state the candidate is frozen against: its tree seeds every
+	// out-of-prefix entry, and CommitPrepared publishes onto it alone.
+	parent, err := s.capturePreparedCommitReference()
+	if err != nil {
+		return PreparedCommit{}, err
+	}
+	seedTree, seed, err := s.seedFromReference(parent)
+	if err != nil {
+		return PreparedCommit{}, err
+	}
 	baseline, err := s.capturePublicIndex()
 	if err != nil {
 		return PreparedCommit{}, err
 	}
+	// A store mid-merge is refused here for the whole index, not just the
+	// prefix: preparedEntriesFromIndex refuses the store-wide shape the same
+	// way, and a scoped commit published over an unmerged index would be
+	// undone by the eventual merge commit until a later sweep re-recorded it.
+	if err := checkNoUnmergedEntries(baseline.Entries); err != nil {
+		return PreparedCommit{}, err
+	}
+	// The private index starts as the public one so go-git's stat cache
+	// applies to unchanged in-prefix files; only its in-prefix entries are
+	// read back below.
 	private, wt, err := s.privateWorktree(baseline)
 	if err != nil {
 		return PreparedCommit{}, err
@@ -94,7 +120,6 @@ func (s *Store) PrepareCommitUnder(prefixes []string) (PreparedCommit, error) {
 	if err != nil {
 		return PreparedCommit{}, err
 	}
-	removed := false
 	for _, e := range baseline.Entries {
 		if !underAnyPrefix(e.Name, prefixes) {
 			continue
@@ -107,82 +132,177 @@ func (s *Store) PrepareCommitUnder(prefixes []string) (PreparedCommit, error) {
 		// "nothing to commit" over a skill that had just been destroyed.
 		switch _, err := fs.Lstat(storeFS, e.Name); {
 		case errors.Is(err, fs.ErrNotExist):
-			if _, err := idx.Remove(e.Name); err == nil {
-				removed = true
-			}
+			_, _ = idx.Remove(e.Name)
 		case err != nil:
 			return PreparedCommit{}, s.explainStagingFailure(err)
 		}
 	}
-	if removed {
-		if err := private.Storer.SetIndex(idx); err != nil {
-			return PreparedCommit{}, err
-		}
-	}
-	prepared, err := s.freezePrepared(private, wt, baseline)
+	inScope, err := preparedEntriesFromIndex(entriesUnder(idx.Entries, prefixes))
 	if err != nil {
 		return PreparedCommit{}, err
 	}
-	// The role Op.AllowedChanges plays for pipeline operations: nothing
-	// outside the prefixes may have reached the candidate. Not defensive,
-	// though it reads that way -- the branch is user-reachable, for the
-	// reason CommitScopeViolationError's own doc gives, and today it also
-	// guards the unconditional sync below (DESIGN's known-gap list). Every
-	// offending path is collected, not just the first: the one caller that
-	// renders this for a user (explainCommitScopeViolation, engine/commit.go)
-	// can then name them all at once instead of refusing once per path
-	// (final review, finding 2).
+	entries := append(outsideEntries(seed, prefixes), inScope...)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	changed := scopedChangedPaths(seed, inScope, prefixes)
+	// By construction nothing outside the prefixes can differ from HEAD; the
+	// assertion stays as the defensive check Op.AllowedChanges is for
+	// pipeline operations, and is no longer a user-reachable refusal.
 	var outside []string
-	for _, changed := range prepared.changed {
-		if !underAnyPrefix(changed, prefixes) {
-			outside = append(outside, changed)
+	for _, c := range changed {
+		if !underAnyPrefix(c, prefixes) {
+			outside = append(outside, c)
 		}
 	}
 	if len(outside) != 0 {
 		return PreparedCommit{}, &CommitScopeViolationError{Prefixes: slices.Clone(prefixes), Paths: outside}
 	}
-	// Refresh the public index even though the baseline did not equal HEAD.
-	//
-	// freezePrepared's rule -- sync only when the public index equalled HEAD
-	// at capture -- keeps a full-store candidate from installing itself over
-	// work a direct-git user had staged, and it is right for that shape. It
-	// is too coarse for this one. A scoped candidate *is* the baseline with
-	// only in-prefix entries replaced: the adds, the untracked pass and the
-	// removal loop above all refuse to touch anything outside the prefixes.
-	// That is what makes it safe, and it is the construction that establishes
-	// it -- the containment check just above is a guard on the changed set,
-	// not a proof about every entry (review 2026-09-03, Minor). So writing it
-	// back updates exactly the entries this commit superseded, and leaves
-	// every other entry at bytes syncPreparedPublicIndex has already
-	// confirmed are unchanged.
-	//
-	// Without this, staging a file inside the named skill and then editing it
-	// further left the public index pinned to the superseded version: the
-	// commit recorded the worktree, `fu status` went on reporting that skill
-	// as uncommitted, and no fu command could clear it -- the next ordinary
-	// write then swept the stale index entry back in, rolling the skill
-	// backwards and forwards across two commits (review 2026-09-02,
-	// Critical). git's own path-limited commit discards a superseded staged
-	// version the same way; the cost, accepted deliberately, is that the
-	// scoped form does not preserve a staged-only intermediate in history the
-	// way the store-wide form's external layer does.
-	prepared.syncPublic = true
-	return prepared, nil
+	return PreparedCommit{
+		entries:        entries,
+		changed:        changed,
+		fingerprint:    fingerprintPreparedEntries(entries),
+		candidateIndex: cloneIndex(idx),
+		publicBaseline: cloneIndex(baseline),
+		// Always installed, over the live index: the in-prefix entries are
+		// replaced so that a version staged inside the prefix and then
+		// edited further does not keep the skill reported pending forever
+		// (review 2026-09-02, Critical). git's own path-limited commit
+		// discards such a superseded staged version the same way; the cost,
+		// accepted deliberately, is that the scoped form does not preserve a
+		// staged-only intermediate in history the way the store-wide form's
+		// external layer does (SPEC §9).
+		syncPublic: true,
+		parent:     parent,
+		scope:      slices.Clone(prefixes),
+		seedTree:   seedTree,
+	}, nil
+}
+
+// seedFromReference flattens the tree of the commit a captured branch state
+// points at. An unborn branch seeds nothing.
+func (s *Store) seedFromReference(ref preparedCommitReference) (plumbing.Hash, map[string]worktreeTarget, error) {
+	if ref.before == nil {
+		return plumbing.ZeroHash, map[string]worktreeTarget{}, nil
+	}
+	commit, err := s.Repo.CommitObject(ref.before.Hash())
+	if err != nil {
+		return plumbing.ZeroHash, nil, fmt.Errorf("read commit %s to seed the candidate: %w", ref.before.Hash(), err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		return plumbing.ZeroHash, nil, fmt.Errorf("read tree of %s to seed the candidate: %w", ref.before.Hash(), err)
+	}
+	paths, err := targetTreePaths(tree)
+	if err != nil {
+		return plumbing.ZeroHash, nil, err
+	}
+	return commit.TreeHash, paths, nil
+}
+
+// seedEntriesOutside returns the sorted entries of the given tree that lie
+// outside every prefix, as the frozen candidate must carry them.
+func (s *Store) seedEntriesOutside(seedTree plumbing.Hash, prefixes []string) ([]preparedEntry, error) {
+	if seedTree.IsZero() {
+		return nil, nil
+	}
+	tree, err := s.Repo.TreeObject(seedTree)
+	if err != nil {
+		return nil, fmt.Errorf("read seed tree %s: %w", seedTree, err)
+	}
+	paths, err := targetTreePaths(tree)
+	if err != nil {
+		return nil, err
+	}
+	return outsideEntries(paths, prefixes), nil
+}
+
+// outsideEntries is the sorted subset of a flattened tree that lies outside
+// every prefix; nil when there is none.
+func outsideEntries(paths map[string]worktreeTarget, prefixes []string) []preparedEntry {
+	var entries []preparedEntry
+	for path, target := range paths {
+		if !underAnyPrefix(path, prefixes) {
+			entries = append(entries, preparedEntry{Path: path, Mode: target.Mode, Hash: target.Hash})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	return entries
+}
+
+// scopedChangedPaths is the in-prefix difference between the seed tree and
+// the candidate: added, removed, and entries whose mode or blob changed.
+func scopedChangedPaths(seed map[string]worktreeTarget, inScope []preparedEntry, prefixes []string) []string {
+	var changed []string
+	seen := make(map[string]bool, len(inScope))
+	for _, e := range inScope {
+		seen[e.Path] = true
+		if want, ok := seed[e.Path]; !ok || want.Mode != e.Mode || want.Hash != e.Hash {
+			changed = append(changed, e.Path)
+		}
+	}
+	for path := range seed {
+		if underAnyPrefix(path, prefixes) && !seen[path] {
+			changed = append(changed, path)
+		}
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+// splitPreparedEntries partitions sorted entries into those under a prefix
+// and the rest, preserving order.
+func splitPreparedEntries(entries []preparedEntry, prefixes []string) (in, out []preparedEntry) {
+	for _, e := range entries {
+		if underAnyPrefix(e.Path, prefixes) {
+			in = append(in, e)
+		} else {
+			out = append(out, e)
+		}
+	}
+	return in, out
+}
+
+// entriesUnder returns the index entries under any prefix; never nil, so two
+// empty selections compare equal.
+func entriesUnder(entries []*indexformat.Entry, prefixes []string) []*indexformat.Entry {
+	out := []*indexformat.Entry{}
+	for _, e := range entries {
+		if underAnyPrefix(e.Name, prefixes) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// entriesNotUnder is the complement of entriesUnder; never nil either.
+func entriesNotUnder(entries []*indexformat.Entry, prefixes []string) []*indexformat.Entry {
+	out := []*indexformat.Entry{}
+	for _, e := range entries {
+		if !underAnyPrefix(e.Name, prefixes) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// cloneIndexEntries copies entries so an install never aliases the frozen
+// candidate.
+func cloneIndexEntries(entries []*indexformat.Entry) []*indexformat.Entry {
+	out := make([]*indexformat.Entry, 0, len(entries))
+	for _, e := range entries {
+		copied := *e
+		out = append(out, &copied)
+	}
+	return out
 }
 
 // CommitScopeViolationError reports that the candidate PrepareCommitUnder
 // froze would change Paths, none of which lie under Prefixes. Paths is
 // non-empty and sorted, in the changed set's own order.
 //
-// It is a named type rather than a fmt.Errorf string because the branch is
-// user-reachable, not merely defensive -- the scoped candidate takes the
-// public index's state outside the prefixes, so anything the user staged
-// there with direct git lands in the changed set -- and the engine has to
-// recover the paths to say what to do about them. Recovering them by
-// scanning the rendered message for a marker substring is what this replaces
-// (final review, finding 2): that failed *wrong* rather than safe if the
-// message ever grew a suffix, could only ever surface one path, and
-// mis-parsed a path that happened to contain the marker text.
+// Since the candidate is seeded from HEAD outside the prefixes and its
+// changed set is computed only over in-prefix paths, this cannot happen by
+// construction; the check is kept as the defensive assertion Op.AllowedChanges
+// is for pipeline operations, and no caller interprets the type for a user.
 type CommitScopeViolationError struct {
 	Prefixes []string
 	Paths    []string
@@ -219,4 +339,21 @@ func underAnyPrefix(rel string, prefixes []string) bool {
 		}
 	}
 	return false
+}
+
+// sameIndexContent reports whether two entry selections agree on every
+// content-bearing field: name, blob, mode, stage and the flags git reads.
+// Stat fields are deliberately left out -- a refresh rewrites them without
+// changing what is staged.
+func sameIndexContent(a, b []*indexformat.Entry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].Hash != b[i].Hash || a[i].Mode != b[i].Mode ||
+			a[i].Stage != b[i].Stage || a[i].SkipWorktree != b[i].SkipWorktree || a[i].IntentToAdd != b[i].IntentToAdd {
+			return false
+		}
+	}
+	return true
 }

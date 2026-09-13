@@ -13,7 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -45,7 +45,50 @@ func fuSignature() *object.Signature {
 type CommitOutcome struct {
 	Hash    plumbing.Hash
 	Written bool
+	// IndexSkipped reports that the public index was meant to be refreshed
+	// to the committed candidate but was left alone; IndexSkipReason is one
+	// of the IndexSkipReason constants and says why. The commit itself, if
+	// Written, stands regardless.
+	IndexSkipped    bool
+	IndexSkipReason string
 }
+
+// Why an install of the committed candidate was skipped.
+const (
+	// IndexSkipReasonRestaged: the entries the candidate supersedes were
+	// restaged by direct git after it was prepared.
+	IndexSkipReasonRestaged = "the paths this candidate covers were restaged by direct git meanwhile"
+	// IndexSkipReasonUnmerged: the live index holds conflict-stage entries.
+	// go-git's encoder re-sorts entries by name alone with an unstable sort,
+	// so fu cannot promise to write such an index in the name-then-stage
+	// order git requires, and does not try.
+	IndexSkipReasonUnmerged = "the index holds unmerged entries, which fu cannot rewrite faithfully"
+)
+
+// ErrUnmergedIndex means the public index holds conflict-stage entries: the
+// store is mid-merge. Like git, fu records nothing until the merge is
+// concluded -- a scoped commit published over such an index would be undone
+// by the eventual merge commit until a later sweep re-recorded it, and fu
+// cannot rewrite such an index faithfully in any case (IndexSkipReasonUnmerged).
+var ErrUnmergedIndex = errors.New("the store's index holds unmerged entries; conclude or abort the merge with git first")
+
+// checkNoUnmergedEntries refuses an index with any conflict-stage entry.
+func checkNoUnmergedEntries(entries []*indexformat.Entry) error {
+	for _, e := range entries {
+		// An ordinary entry decodes as stage 0; go-git's Merged constant is 1.
+		if e.Stage != 0 {
+			return fmt.Errorf("%w: %q is at stage %d", ErrUnmergedIndex, e.Name, e.Stage)
+		}
+	}
+	return nil
+}
+
+// ErrStaleCandidate means the branch moved between preparing a candidate and
+// publishing it. The candidate's tree was frozen against the earlier HEAD --
+// for a scoped candidate its out-of-prefix entries were even copied from
+// that HEAD -- so publishing it onto the newer commit would silently revert
+// whatever that commit changed. Nothing is written when this is returned.
+var ErrStaleCandidate = errors.New("the store changed after the commit candidate was prepared")
 
 type preparedEntry struct {
 	Path string
@@ -68,6 +111,19 @@ type PreparedCommit struct {
 	candidateIndex *indexformat.Index
 	publicBaseline *indexformat.Index
 	syncPublic     bool
+	// parent is the branch state captured while preparing. CommitPrepared
+	// publishes only onto it (ErrStaleCandidate otherwise): the entries were
+	// frozen against that HEAD, and a scoped candidate even copied its
+	// out-of-scope entries from it.
+	parent preparedCommitReference
+	// scope lists the path prefixes a scoped candidate took from the
+	// worktree; nil means the whole store. Out-of-scope entries come from
+	// seedTree, HEAD's tree at preparation (zero for an unborn branch), and
+	// candidateIndex then holds the public baseline with only the in-scope
+	// entries replaced -- the shape the install writes back over whatever
+	// the live index holds outside the scope.
+	scope    []string
+	seedTree plumbing.Hash
 }
 
 // privateIndexStorer delegates objects, references, and configuration to the
@@ -100,14 +156,14 @@ func (p PreparedCommit) TreeFingerprint() string { return p.fingerprint }
 // Commit stages everything and records one commit. An empty worktree
 // (nothing changed) is not an error.
 //
-// The branch ref is captured inside CommitPrepared, at publish time rather
-// than before staging, and updated with a compare-and-swap, so a concurrent
-// direct-git commit cannot be overwritten. Note what that ordering does not
-// buy: a direct-git commit landing between prepare and publish becomes the
-// captured "before" ref, so the CAS succeeds and the racer's commit becomes
-// the parent of a tree frozen without its changes. DESIGN's known-gap list
-// books that window; the scoped preparer widens it, because its out-of-prefix
-// entries come from the prepare-time index rather than being re-read.
+// The branch ref is captured while preparing and again inside CommitPrepared
+// at publish time: the two must agree (checkPreparedParent, ErrStaleCandidate
+// otherwise), and the branch is then updated with a compare-and-swap against
+// the same reference, so a direct-git commit landing anywhere between
+// preparation and publication is reported rather than overwritten or, worse,
+// adopted as the parent of a tree frozen without its changes -- which the
+// scoped preparer would even revert, its out-of-prefix entries being copies
+// of the earlier HEAD.
 // The commit tree is built from PreparedCommit's immutable entries rather
 // than rereading the mutable index after validation. Fu's lock serializes fu
 // processes, but these two checks also protect the supported direct-Git path.
@@ -147,11 +203,19 @@ func (s *Store) withdrawPreparedIndex(prepared PreparedCommit) error {
 // in-memory index and freezes the result. Changes arriving afterward stay
 // outside this candidate, and direct Git never sees temporary Fu staging.
 func (s *Store) PrepareCommit() (PreparedCommit, error) {
+	// The branch state comes first, before the index is captured and the
+	// worktree staged: a HEAD move during staging would tear the projection,
+	// and it is this state, not whatever HEAD says later, that CommitPrepared
+	// publishes onto and that decides whether the baseline matched HEAD.
+	parent, err := s.capturePreparedCommitReference()
+	if err != nil {
+		return PreparedCommit{}, err
+	}
 	baseline, err := s.capturePublicIndex()
 	if err != nil {
 		return PreparedCommit{}, err
 	}
-	return s.prepareCommit(baseline)
+	return s.prepareCommit(baseline, parent)
 }
 
 func (s *Store) capturePublicIndex() (*indexformat.Index, error) {
@@ -167,7 +231,7 @@ func (s *Store) capturePublicIndex() (*indexformat.Index, error) {
 	return baseline, err
 }
 
-func (s *Store) prepareCommit(baseline *indexformat.Index) (PreparedCommit, error) {
+func (s *Store) prepareCommit(baseline *indexformat.Index, parent preparedCommitReference) (PreparedCommit, error) {
 	private, wt, err := s.privateWorktree(baseline)
 	if err != nil {
 		return PreparedCommit{}, err
@@ -175,7 +239,7 @@ func (s *Store) prepareCommit(baseline *indexformat.Index) (PreparedCommit, erro
 	if err := s.stageAll(private, wt); err != nil {
 		return PreparedCommit{}, err
 	}
-	return s.freezePrepared(private, wt, baseline)
+	return s.freezePrepared(private, wt, baseline, parent)
 }
 
 // changedPathsFromStatus projects a worktree status into the HEAD-to-index
@@ -276,7 +340,7 @@ func (s *Store) headTreePaths() (map[string]bool, error) {
 // candidate CommitPrepared writes: entries, the HEAD-to-index changed set,
 // the tree fingerprint, and the public baseline retained for the conditional
 // sync CommitPrepared performs at both of its exits.
-func (s *Store) freezePrepared(private *git.Repository, wt *git.Worktree, baseline *indexformat.Index) (PreparedCommit, error) {
+func (s *Store) freezePrepared(private *git.Repository, wt *git.Worktree, baseline *indexformat.Index, parent preparedCommitReference) (PreparedCommit, error) {
 	idx, err := private.Storer.Index()
 	if err != nil {
 		return PreparedCommit{}, err
@@ -299,7 +363,8 @@ func (s *Store) freezePrepared(private *git.Repository, wt *git.Worktree, baseli
 		fingerprint:    fingerprintPreparedEntries(entries),
 		candidateIndex: cloneIndex(idx),
 		publicBaseline: cloneIndex(baseline),
-		syncPublic:     s.indexMatchesHEAD(baseline),
+		syncPublic:     s.indexMatchesReference(baseline, parent),
+		parent:         parent,
 	}, nil
 }
 
@@ -341,6 +406,10 @@ func (s *Store) CommitStagedSnapshot() (CommitOutcome, error) {
 // commits this snapshot before separately recording later worktree bytes, so a
 // staged-only version remains recoverable in history.
 func (s *Store) PrepareStagedSnapshot() (PreparedCommit, error) {
+	parent, err := s.capturePreparedCommitReference()
+	if err != nil {
+		return PreparedCommit{}, err
+	}
 	baseline, err := s.capturePublicIndex()
 	if err != nil {
 		return PreparedCommit{}, err
@@ -371,6 +440,7 @@ func (s *Store) PrepareStagedSnapshot() (PreparedCommit, error) {
 		// preserves a concurrent later writer and gives normal Git commit
 		// semantics when it remains unchanged.
 		syncPublic: false,
+		parent:     parent,
 	}, nil
 }
 
@@ -396,20 +466,20 @@ func (s *Store) privateWorktree(index *indexformat.Index) (*git.Repository, *git
 	return private, worktree, nil
 }
 
-func (s *Store) indexMatchesHEAD(index *indexformat.Index) bool {
+// indexMatchesReference reports whether an index projects the same tree as
+// the commit a captured branch state points at (an unborn branch: the empty
+// tree). The captured state is used rather than HEAD as it is now, so the
+// answer belongs to the same instant as the rest of the candidate.
+func (s *Store) indexMatchesReference(index *indexformat.Index, ref preparedCommitReference) bool {
 	entries, err := preparedEntriesFromIndex(index.Entries)
 	if err != nil {
 		return false
 	}
 	want := fingerprintPreparedEntries(entries)
-	head, err := s.Repo.Head()
-	if errors.Is(err, plumbing.ErrReferenceNotFound) {
+	if ref.before == nil {
 		return want == fingerprintPreparedEntries(nil)
 	}
-	if err != nil {
-		return false
-	}
-	commit, err := s.Repo.CommitObject(head.Hash())
+	commit, err := s.Repo.CommitObject(ref.before.Hash())
 	if err != nil {
 		return false
 	}
@@ -523,12 +593,20 @@ func (s *Store) commitPreparedWithReference(msg string, prepared PreparedCommit,
 	if prepared.fingerprint == "" {
 		return CommitOutcome{}, errors.New("prepared commit has no tree fingerprint")
 	}
-	if err := validatePreparedCommit(prepared); err != nil {
+	if err := s.validatePreparedCommit(prepared); err != nil {
 		return CommitOutcome{}, err
 	}
 	refState, err := s.capturePreparedCommitReference()
 	if err != nil {
 		return CommitOutcome{}, err
+	}
+	// A candidate is published only onto the branch state it was prepared
+	// against. revert brings its own starting reference (expected) and
+	// checks it below instead.
+	if expected == nil && prepared.parent.head != nil {
+		if err := checkPreparedParent(refState, prepared.parent); err != nil {
+			return CommitOutcome{}, err
+		}
 	}
 	if expected != nil {
 		if refState.before == nil || expected.before == nil ||
@@ -542,7 +620,7 @@ func (s *Store) commitPreparedWithReference(msg string, prepared PreparedCommit,
 	if beforeWrite != nil {
 		beforeWrite()
 	}
-	if err := validatePreparedCommit(prepared); err != nil {
+	if err := s.validatePreparedCommit(prepared); err != nil {
 		return CommitOutcome{}, err
 	}
 	treeHash, err := s.storePreparedTree(prepared.entries)
@@ -567,7 +645,8 @@ func (s *Store) commitPreparedWithReference(msg string, prepared PreparedCommit,
 	// 2026-09-03, Minor).
 	if refState.before == nil {
 		if len(prepared.entries) == 0 {
-			return CommitOutcome{}, s.syncPreparedPublicIndex(prepared)
+			skipped, err := s.syncPreparedPublicIndex(prepared)
+			return CommitOutcome{IndexSkipped: skipped != "", IndexSkipReason: skipped}, err
 		}
 	} else {
 		parent, err := s.Repo.CommitObject(refState.before.Hash())
@@ -575,7 +654,8 @@ func (s *Store) commitPreparedWithReference(msg string, prepared PreparedCommit,
 			return CommitOutcome{}, fmt.Errorf("read commit parent %s: %w", refState.before.Hash(), err)
 		}
 		if parent.TreeHash == treeHash {
-			return CommitOutcome{}, s.syncPreparedPublicIndex(prepared)
+			skipped, err := s.syncPreparedPublicIndex(prepared)
+			return CommitOutcome{IndexSkipped: skipped != "", IndexSkipReason: skipped}, err
 		}
 		parents = []plumbing.Hash{refState.before.Hash()}
 	}
@@ -616,40 +696,121 @@ func (s *Store) commitPreparedWithReference(msg string, prepared PreparedCommit,
 		return outcome, fmt.Errorf("concurrent write to %s detected after fu wrote commit %s: branch now points at %s; fu's commit remains in the object database and the later branch target was not overwritten",
 			refState.target, hash.String()[:7], current.Hash().String()[:7])
 	}
-	if err := s.syncPreparedPublicIndex(prepared); err != nil {
+	skipped, err := s.syncPreparedPublicIndex(prepared)
+	if err != nil {
 		return outcome, fmt.Errorf("commit %s was published but its public index could not be synchronized: %w", hash.String()[:7], err)
 	}
+	outcome.IndexSkipped, outcome.IndexSkipReason = skipped != "", skipped
 	return outcome, nil
 }
 
-func validatePreparedCommit(prepared PreparedCommit) error {
-	if prepared.candidateIndex == nil || prepared.publicBaseline == nil {
-		return errors.New("prepared commit has no private-index provenance")
+// checkPreparedParent refuses to publish a candidate onto any branch state
+// other than the one it was prepared against.
+func checkPreparedParent(current, prepared preparedCommitReference) error {
+	if current.target != prepared.target {
+		return fmt.Errorf("%w: HEAD now points at %s, not %s; nothing was committed", ErrStaleCandidate, current.target, prepared.target)
 	}
-	entries, err := preparedEntriesFromIndex(prepared.candidateIndex.Entries)
-	if err != nil {
-		return err
-	}
-	if got := fingerprintPreparedEntries(entries); got != prepared.fingerprint || !reflect.DeepEqual(entries, prepared.entries) {
-		return errors.New("prepared commit's private index no longer matches its frozen tree")
+	switch {
+	case current.before == nil && prepared.before == nil:
+		return nil
+	case current.before == nil || prepared.before == nil:
+		return fmt.Errorf("%w: branch %s was born or unborn meanwhile; nothing was committed", ErrStaleCandidate, current.target)
+	case current.before.Hash() != prepared.before.Hash():
+		return fmt.Errorf("%w: branch %s moved from %s to %s; nothing was committed",
+			ErrStaleCandidate, current.target, prepared.before.Hash().String()[:7], current.before.Hash().String()[:7])
 	}
 	return nil
 }
 
-func (s *Store) syncPreparedPublicIndex(prepared PreparedCommit) error {
-	if !prepared.syncPublic {
+// validatePreparedCommit checks a candidate's provenance before anything is
+// written from it. A store-wide candidate's entries must be exactly what its
+// private index holds. A scoped candidate is checked both ways: its in-scope
+// entries against the private index, and its out-of-scope entries against
+// the HEAD tree it was seeded from (an immutable object, so the check does
+// not depend on where the branch points now).
+func (s *Store) validatePreparedCommit(prepared PreparedCommit) error {
+	if prepared.candidateIndex == nil || prepared.publicBaseline == nil {
+		return errors.New("prepared commit has no private-index provenance")
+	}
+	if got := fingerprintPreparedEntries(prepared.entries); got != prepared.fingerprint {
+		return errors.New("prepared commit's frozen tree no longer matches its fingerprint")
+	}
+	if prepared.scope == nil {
+		entries, err := preparedEntriesFromIndex(prepared.candidateIndex.Entries)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(entries, prepared.entries) {
+			return errors.New("prepared commit's private index no longer matches its frozen tree")
+		}
 		return nil
 	}
-	return s.withIndexLock(func() error {
+	inScope, err := preparedEntriesFromIndex(entriesUnder(prepared.candidateIndex.Entries, prepared.scope))
+	if err != nil {
+		return err
+	}
+	frozenIn, frozenOut := splitPreparedEntries(prepared.entries, prepared.scope)
+	if !slices.Equal(inScope, frozenIn) {
+		return errors.New("prepared commit's private index no longer matches its frozen in-scope entries")
+	}
+	seed, err := s.seedEntriesOutside(prepared.seedTree, prepared.scope)
+	if err != nil {
+		return err
+	}
+	if !slices.Equal(seed, frozenOut) {
+		return errors.New("prepared commit's out-of-scope entries no longer match the HEAD tree it was seeded from")
+	}
+	return nil
+}
+
+// syncPreparedPublicIndex installs the committed candidate into the public
+// index, and returns the IndexSkipReason when it left the index alone ("" when
+// it installed or had nothing to install).
+//
+// A store-wide candidate replaces the whole index and so requires the live
+// index to still hold the captured baseline's content. A scoped candidate is
+// merged over the live index instead: only its in-scope entries are
+// replaced, so whatever a direct-git user staged elsewhere in the meantime
+// is kept, and the install is skipped only when the in-scope entries
+// themselves moved. Either way the comparison is by content-bearing fields
+// (sameIndexContent): a stat refresh -- `git status` rewrites those fields
+// constantly -- is not a restage. An index holding unmerged entries is never
+// rewritten (IndexSkipReasonUnmerged). Nothing is written in the skipped
+// cases; the commit, if any, stands.
+func (s *Store) syncPreparedPublicIndex(prepared PreparedCommit) (skipped string, err error) {
+	if !prepared.syncPublic {
+		return "", nil
+	}
+	err = s.withIndexLock(func() error {
 		current, err := s.Repo.Storer.Index()
 		if err != nil {
 			return err
 		}
-		if !reflect.DeepEqual(current, prepared.publicBaseline) {
+		if checkNoUnmergedEntries(current.Entries) != nil {
+			skipped = IndexSkipReasonUnmerged
 			return nil
 		}
-		return s.writePublicIndexAtomically(prepared.candidateIndex)
+		if prepared.scope == nil {
+			if !sameIndexContent(current.Entries, prepared.publicBaseline.Entries) {
+				skipped = IndexSkipReasonRestaged
+				return nil
+			}
+			return s.writePublicIndexAtomically(prepared.candidateIndex)
+		}
+		if !sameIndexContent(entriesUnder(current.Entries, prepared.scope), entriesUnder(prepared.publicBaseline.Entries, prepared.scope)) {
+			skipped = IndexSkipReasonRestaged
+			return nil
+		}
+		install := cloneIndex(current)
+		install.Entries = append(entriesNotUnder(install.Entries, prepared.scope), cloneIndexEntries(entriesUnder(prepared.candidateIndex.Entries, prepared.scope))...)
+		// Every entry is at the merged stage here, so ordering by name is
+		// the order git wants; go-git's encoder re-sorts by name as well.
+		slices.SortStableFunc(install.Entries, func(a, b *indexformat.Entry) int {
+			return strings.Compare(a.Name, b.Name)
+		})
+		return s.writePublicIndexAtomically(install)
 	})
+	return skipped, err
 }
 
 // writePublicIndexAtomically installs a new .git/index by rename rather than by
@@ -849,11 +1010,11 @@ func (s *Store) storePreparedTreeNode(node *preparedTreeNode) (plumbing.Hash, er
 }
 
 func preparedEntriesFromIndex(indexEntries []*indexformat.Entry) ([]preparedEntry, error) {
+	if err := checkNoUnmergedEntries(indexEntries); err != nil {
+		return nil, err
+	}
 	entries := make([]preparedEntry, 0, len(indexEntries))
 	for _, entry := range indexEntries {
-		if entry.Stage != 0 {
-			return nil, fmt.Errorf("cannot prepare unmerged index entry %q at stage %d", entry.Name, entry.Stage)
-		}
 		entries = append(entries, preparedEntry{Path: entry.Name, Mode: entry.Mode, Hash: entry.Hash})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
@@ -1215,9 +1376,12 @@ func (s *Store) ChangedPathsIncludingIgnored() ([]string, error) {
 // UnstagedPathsIncludingIgnored reports filesystem changes that are not in a
 // private prepared candidate. It is used after PrepareCommit to detect writers
 // that landed before the operation commit without consulting or mutating the
-// unrelated public index.
+// unrelated public index. It measures against candidateIndex, which for a
+// scoped candidate is the public baseline with only the in-scope entries
+// replaced; no scoped caller uses it, and its answer there would include
+// every out-of-scope pending edit by design.
 func (s *Store) UnstagedPathsIncludingIgnored(prepared PreparedCommit) ([]string, error) {
-	if err := validatePreparedCommit(prepared); err != nil {
+	if err := s.validatePreparedCommit(prepared); err != nil {
 		return nil, err
 	}
 	_, wt, err := s.privateWorktree(prepared.candidateIndex)

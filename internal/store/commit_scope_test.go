@@ -283,56 +283,6 @@ func unstagePublicIndex(t *testing.T, s *Store, names ...string) {
 	}
 }
 
-// TestPrepareCommitUnderRefusesAStagedDeletionOutsideThePrefix pins the
-// regression that skipping every Untracked path introduced. go-git's status
-// reports Staging == Untracked for two genuinely different states: a file
-// that is in neither HEAD nor the index -- new, and rightly outside a
-// candidate that never staged it -- and a file removed from the index with
-// `git rm --cached` while still on disk, which is a real HEAD-to-index
-// deletion (the index-to-worktree loop overwrites the Deleted the HEAD-to-index
-// loop set). Skipping both dropped the deletion from the changed set, so the
-// containment check never saw it and CommitPrepared wrote a tree with the
-// path gone.
-//
-// With fu.yaml that destroys the store: store identity is "fu.yaml tracked at
-// HEAD", so `fu log`, `fu list` and `fu status` all failed with "store not
-// initialized" and `fu init` with "store already initialized". With another
-// skill it is silent data loss -- exit 0, only the named skill reported, and
-// `fu list` still showing the skill from the untouched on-disk fu.yaml, while
-// the committed tree no longer holds its content.
-func TestPrepareCommitUnderRefusesAStagedDeletionOutsideThePrefix(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		unstage []string
-	}{
-		{name: "config", unstage: []string{"fu.yaml"}},
-		{name: "another skill", unstage: []string{"skills/beta/SKILL.md"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := scopedFixture(t)
-			unstagePublicIndex(t, s, tc.unstage...)
-			writeStoreFile(t, s, "skills/alpha/SKILL.md", "alpha edited")
-
-			prepared, err := s.PrepareCommitUnder([]string{"skills/alpha"})
-			var violation *CommitScopeViolationError
-			if !errors.As(err, &violation) {
-				t.Fatalf("a staged deletion of %v outside the prefix must be refused; got err=%v over a candidate changing %v",
-					tc.unstage, err, prepared.ChangedPaths())
-			}
-			if !slices.Equal(violation.Paths, tc.unstage) {
-				t.Fatalf("refusal names %v, want %v", violation.Paths, tc.unstage)
-			}
-			// Refusing leaves the store usable: nothing was committed, so the
-			// path is still in HEAD and fu still recognises its own store.
-			for _, name := range tc.unstage {
-				if _, err := headCommit(t, s).File(name); err != nil {
-					t.Fatalf("%s must still be in HEAD after the refusal: %v", name, err)
-				}
-			}
-		})
-	}
-}
-
 // publicIndexHashes reads the on-disk index and returns path to blob hash for
 // every entry the predicate admits. Used to state what a scoped commit may and
 // may not touch there.
@@ -393,21 +343,12 @@ func TestPrepareCommitUnderConvergesWhenAnInPrefixPathWasStagedThenEdited(t *tes
 }
 
 // TestPrepareCommitUnderLeavesThePublicIndexAloneOutsideThePrefix states the
-// other half of that rule: refreshing in-prefix entries may not disturb an
-// entry the user staged elsewhere.
-//
-// It is a statement of the invariant, not a regression test for it. Staging a
-// path whose content equals HEAD leaves the index fingerprint equal to HEAD,
-// so syncPublic would have been set anyway and removing the scoped-sync line
-// leaves this green (review 2026-09-02 round 2, Minor). The safety proof is
-// the containment check rather than this test: whenever a scoped commit
-// succeeds with a baseline that differs from HEAD, every out-of-prefix entry
-// necessarily equals HEAD, or the refusal would have fired first.
-//
-// beta is staged with content equal to HEAD, which is the out-of-prefix staged
-// state that does not trip the containment refusal -- a staged path that
-// differs is refused before any commit, so this is the only shape in which an
-// out-of-prefix index entry can survive into the sync.
+// other half of the convergence rule: refreshing in-prefix entries may not
+// disturb an entry the user staged elsewhere. The install merges the
+// candidate's in-prefix entries over the live index, so out-of-prefix
+// entries survive whether or not they equal HEAD;
+// TestPrepareCommitUnderLeavesOutOfPrefixStagingAloneAndUncommitted covers the
+// differing case, this one the equal-to-HEAD case.
 func TestPrepareCommitUnderLeavesThePublicIndexAloneOutsideThePrefix(t *testing.T) {
 	s := scopedFixture(t)
 	wt, err := s.Repo.Worktree()

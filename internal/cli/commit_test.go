@@ -182,3 +182,17 @@ func TestCommitCommandReportsExternalWrittenBeforeAnError(t *testing.T) {
 		t.Fatalf("the -m note must not appear under an error, since the second candidate's emptiness is not actually known:\n%s", out)
 	}
 }
+
+func TestCommitCommandPrintsTheOutcomeWarnings(t *testing.T) {
+	app := &fakeCommitApplication{outcome: engine.CommitOutcome{
+		Written: true, Subject: "commit: alpha", Changed: []string{"skills/alpha/SKILL.md"},
+		Result: engine.Result{Warnings: []string{"git's index changed while fu was committing"}},
+	}}
+	out, err := runCommit(t, app, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "warning: git's index changed while fu was committing") {
+		t.Fatalf("the warning must reach the user:\n%s", out)
+	}
+}
