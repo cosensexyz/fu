@@ -967,3 +967,31 @@ func TestStatusReportsAReservedInvalidNameWhenItsAgentCouldNotBeScanned(t *testi
 		t.Fatalf("an invalid name no per-agent finding could cover must reach stderr:\nstdout=%q\nstderr=%q", stdout, stderr)
 	}
 }
+
+// An entry the scan could not inspect is listed under a fixed label with its
+// reason after the locator, so the label column keeps its width.
+func TestStatusCommandListsAnUninspectableEntryWithItsReason(t *testing.T) {
+	outcome := engine.StatusOutcome{Report: engine.StatusReport{
+		Agents: []engine.AgentStatus{{
+			Name: "claude",
+			Drift: []engine.Action{
+				{Type: engine.ReportFailed, AgentName: "claude", Skill: "loop", Err: errors.New("too many levels of symbolic links")},
+				{Type: engine.ReportForeign, AgentName: "claude", Skill: "notes"},
+			},
+		}},
+	}}
+	cmd := newStatusCmd(fakeStatusApplication{outcome: outcome})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("an uninspectable entry is a finding, not a failure: %v", err)
+	}
+	if !strings.Contains(out.String(), "cannot inspect claude/loop: too many levels of symbolic links") {
+		t.Fatalf("output must label the entry and give its reason after the locator:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "unmanaged      claude/notes") {
+		t.Fatalf("the label column must keep its width:\n%s", out.String())
+	}
+}

@@ -628,14 +628,25 @@ func TestScanAgentBrokenVsUnreadableTarget(t *testing.T) {
 		t.Fatalf("chmod failed: %v", err)
 	}
 
-	// Case 2: scan should fail with an error, not silently mark it as Broken
+	// Case 2: the entry is recorded as uninspectable with its error, not
+	// silently marked Broken, and the scan itself still succeeds so the
+	// agent's other entries are processed (batch 5, entry-level isolation).
 	st, err = ScanAgent(fakeAgent{"claude", agentDir}, storeSkills)
-	if err == nil {
-		t.Fatal("scan must return an error when target is unreadable")
+	if err != nil {
+		t.Fatalf("one unreadable target must not fail the scan: %v", err)
+	}
+	var unreadable *Entry
+	for i := range st.Entries {
+		if st.Entries[i].Name == "unreadable" {
+			unreadable = &st.Entries[i]
+		}
+	}
+	if unreadable == nil || unreadable.Kind != KindUnknown || unreadable.Err == nil {
+		t.Fatalf("unreadable must be recorded as KindUnknown with its error, got %+v", unreadable)
 	}
 	// Verify the error message references the unreadable symlink
-	if !strings.Contains(err.Error(), "unreadable") {
-		t.Fatalf("error must reference the unreadable symlink: %v", err)
+	if !strings.Contains(unreadable.Err.Error(), "unreadable") {
+		t.Fatalf("error must reference the unreadable symlink: %v", unreadable.Err)
 	}
 }
 

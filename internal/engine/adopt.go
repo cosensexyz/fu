@@ -269,6 +269,16 @@ func scanAdoptEntriesWithHooks(st *store.Store, agents []agent.Agent, h hooks) (
 			continue
 		}
 		for _, e := range state.Entries {
+			if e.Kind == KindUnknown {
+				// Not classified, so neither moved nor copied, and the
+				// agent's other entries still go through. Not rejected here
+				// either: the closing reconcile reports the entry as a failure
+				// of that agent and entry (ReportFailed), which is the right
+				// class -- an I/O failure, not an invalid candidate -- and is
+				// neither deduped by bare name across agents nor suppressed
+				// when another agent supplies the same name.
+				continue
+			}
 			if e.Kind == KindFuLink {
 				continue
 			}

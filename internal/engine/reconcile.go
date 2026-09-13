@@ -500,11 +500,12 @@ func reconcileCheckedWithHooks(st *store.Store, cfg *store.Config, agents []agen
 		state, err := ScanAgent(a, st.SkillsDir())
 		if err != nil {
 			// Isolated per agent (finding I3): a broken scan for this agent
-			// (e.g. ELOOP from a self-referential symlink under the store, or
-			// this agent's skills dir being unreadable or a plain file) must
-			// not starve every other, perfectly healthy agent in the same
-			// pass. There is no Action yet -- Diff never ran for this agent --
-			// so the placeholder carries only the agent's name.
+			// (its skills dir being unreadable, being a plain file, or its
+			// identity not capturable -- a single entry that cannot be
+			// inspected is isolated to that entry instead, see KindUnknown)
+			// must not starve every other, perfectly healthy agent in the
+			// same pass. There is no Action yet -- Diff never ran for this
+			// agent -- so the placeholder carries only the agent's name.
 			res.Failed = append(res.Failed, FailedAction{Action{AgentName: a.Name()}, err})
 			continue
 		}
@@ -677,6 +678,11 @@ func applyToAgent(st *store.Store, skillsRoot *os.Root, cfg *store.Config, a age
 			res.DisabledForeign = append(res.DisabledForeign, act)
 		case ReportInvalid:
 			res.Invalid = append(res.Invalid, act)
+		case ReportFailed:
+			// Diff's own finding for an entry the scan could not inspect:
+			// isolated to that entry, and an operation failure like every
+			// other Failed.
+			res.Failed = append(res.Failed, FailedAction{act, act.Err})
 		default:
 			// Every action Diff can emit is handled above. A new one arriving
 			// here is a bug, and silently dropping it would make the report

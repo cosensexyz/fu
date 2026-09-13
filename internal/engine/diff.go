@@ -36,6 +36,9 @@ type Action struct {
 	// "CreateLink only" made the one field two front ends rely on look like a
 	// field one of them was misusing.
 	Target string
+	// Err is set on a ReportFailed that Diff emits for a KindUnknown entry:
+	// the scan's own reason the entry could not be inspected.
+	Err error
 }
 
 // Diff computes actions turning actual into desired for one agent
@@ -83,7 +86,7 @@ func Diff(desired map[string]bool, state AgentState, storeSkillsDir string) []Ac
 		// isolation, the same reasoning isSinglePathComponent's own comment
 		// below already documents for itself.
 		if err := skill.ValidateName(skillName); err != nil || !isSinglePathComponent(skillName) {
-			acts = append(acts, Action{ReportInvalid, name, skillName, "", ""})
+			acts = append(acts, Action{ReportInvalid, name, skillName, "", "", nil})
 			continue
 		}
 		on := desired[skillName]
@@ -91,19 +94,24 @@ func Diff(desired map[string]bool, state AgentState, storeSkillsDir string) []Ac
 		link := filepath.Join(agentDir, skillName)
 		want := filepath.Join(storeSkillsDir, skillName)
 		switch {
+		// An entry the scan could not inspect is reported as failed whatever
+		// fu.yaml wants: creating over it, removing it, or calling it foreign
+		// would all be decisions about an object nothing has classified.
+		case present && e.Kind == KindUnknown:
+			acts = append(acts, Action{Type: ReportFailed, AgentName: name, Skill: skillName, LinkPath: link, Err: e.Err})
 		case on && !present:
-			acts = append(acts, Action{CreateLink, name, skillName, link, want})
+			acts = append(acts, Action{CreateLink, name, skillName, link, want, nil})
 		// The `present` guards below are not redundant with the case above:
 		// KindFuLink is EntryKind's zero value, so an absent entry would
 		// otherwise match the rebuild case if these arms were ever reordered.
 		case on && present && e.Kind == KindFuLink && (e.Broken || e.LinkTarget != want):
 			acts = append(acts,
-				Action{RemoveLink, name, skillName, link, ""},
-				Action{CreateLink, name, skillName, link, want})
+				Action{RemoveLink, name, skillName, link, "", nil},
+				Action{CreateLink, name, skillName, link, want, nil})
 		case on && present && e.Kind == KindForeign:
-			acts = append(acts, Action{ReportConflict, name, skillName, link, ""})
+			acts = append(acts, Action{ReportConflict, name, skillName, link, "", nil})
 		case !on && present && e.Kind == KindFuLink:
-			acts = append(acts, Action{RemoveLink, name, skillName, link, ""})
+			acts = append(acts, Action{RemoveLink, name, skillName, link, "", nil})
 		// DESIGN §2's state matrix row six ("link undesired | unmanaged
 		// entry | ReportForeign") does not distinguish "no entry in desired"
 		// from "present but explicitly off" -- both mean no link is desired. The
@@ -138,7 +146,7 @@ func Diff(desired map[string]bool, state AgentState, storeSkillsDir string) []Ac
 		// surfaced without also dumping the trailing loop's inventory on every
 		// command.
 		case !on && present && e.Kind == KindForeign:
-			acts = append(acts, Action{ReportDisabledForeign, name, skillName, link, ""})
+			acts = append(acts, Action{ReportDisabledForeign, name, skillName, link, "", nil})
 		}
 	}
 	// Every name here is, by construction, absent from desired entirely --
@@ -153,10 +161,13 @@ func Diff(desired map[string]bool, state AgentState, storeSkillsDir string) []Ac
 			continue
 		}
 		link := filepath.Join(agentDir, e.Name)
-		if e.Kind == KindFuLink {
-			acts = append(acts, Action{RemoveLink, name, e.Name, link, ""})
-		} else {
-			acts = append(acts, Action{ReportForeign, name, e.Name, link, ""})
+		switch e.Kind {
+		case KindFuLink:
+			acts = append(acts, Action{RemoveLink, name, e.Name, link, "", nil})
+		case KindUnknown:
+			acts = append(acts, Action{Type: ReportFailed, AgentName: name, Skill: e.Name, LinkPath: link, Err: e.Err})
+		default:
+			acts = append(acts, Action{ReportForeign, name, e.Name, link, "", nil})
 		}
 	}
 	return acts

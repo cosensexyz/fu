@@ -35,6 +35,8 @@ func driftLabel(action engine.Action) string {
 		return "invalid name, never linked"
 	case engine.ReportForeign:
 		return "unmanaged"
+	case engine.ReportFailed:
+		return "cannot inspect"
 	}
 	return "unknown"
 }
@@ -120,6 +122,13 @@ func printAgentSection(out io.Writer, agents []engine.AgentStatus) bool {
 		}
 		for _, action := range agentStatus.Drift {
 			if suppressProjection && action.Type == engine.CreateLink {
+				continue
+			}
+			// An entry the scan could not inspect carries its reason; it
+			// goes after the locator, as the agent-level line does, so the
+			// label column keeps its width.
+			if action.Type == engine.ReportFailed && action.Err != nil {
+				fmt.Fprintf(out, "  %-*s %s/%s: %v\n", width, driftLabel(action), agentStatus.Name, action.Skill, action.Err)
 				continue
 			}
 			fmt.Fprintf(out, "  %-*s %s/%s\n", width, driftLabel(action), agentStatus.Name, action.Skill)

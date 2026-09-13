@@ -20,7 +20,7 @@ func TestDiffStateMatrix(t *testing.T) {
 	}{
 		{"desired+absent → create",
 			map[string]bool{"alpha": true}, nil,
-			[]Action{{CreateLink, "claude", "alpha", link("alpha"), target("alpha")}}},
+			[]Action{{CreateLink, "claude", "alpha", link("alpha"), target("alpha"), nil}}},
 		{"desired+correct → noop",
 			map[string]bool{"alpha": true},
 			[]Entry{{Name: "alpha", Kind: KindFuLink, LinkTarget: target("alpha")}},
@@ -28,24 +28,24 @@ func TestDiffStateMatrix(t *testing.T) {
 		{"desired+broken → rebuild",
 			map[string]bool{"alpha": true},
 			[]Entry{{Name: "alpha", Kind: KindFuLink, LinkTarget: target("alpha"), Broken: true}},
-			[]Action{{RemoveLink, "claude", "alpha", link("alpha"), ""},
-				{CreateLink, "claude", "alpha", link("alpha"), target("alpha")}}},
+			[]Action{{RemoveLink, "claude", "alpha", link("alpha"), "", nil},
+				{CreateLink, "claude", "alpha", link("alpha"), target("alpha"), nil}}},
 		{"desired+foreign → conflict, never overwrite",
 			map[string]bool{"alpha": true},
 			[]Entry{{Name: "alpha", Kind: KindForeign}},
-			[]Action{{ReportConflict, "claude", "alpha", link("alpha"), ""}}},
+			[]Action{{ReportConflict, "claude", "alpha", link("alpha"), "", nil}}},
 		{"undesired+fu link → remove",
 			map[string]bool{"alpha": false},
 			[]Entry{{Name: "alpha", Kind: KindFuLink, LinkTarget: target("alpha")}},
-			[]Action{{RemoveLink, "claude", "alpha", link("alpha"), ""}}},
+			[]Action{{RemoveLink, "claude", "alpha", link("alpha"), "", nil}}},
 		{"unknown fu link (skill removed) → remove",
 			map[string]bool{},
 			[]Entry{{Name: "ghost", Kind: KindFuLink, LinkTarget: target("ghost"), Broken: true}},
-			[]Action{{RemoveLink, "claude", "ghost", link("ghost"), ""}}},
+			[]Action{{RemoveLink, "claude", "ghost", link("ghost"), "", nil}}},
 		{"unknown foreign → report only",
 			map[string]bool{},
 			[]Entry{{Name: "manual", Kind: KindForeign}},
-			[]Action{{ReportForeign, "claude", "manual", link("manual"), ""}}},
+			[]Action{{ReportForeign, "claude", "manual", link("manual"), "", nil}}},
 	}
 	for _, c := range cases {
 		got := Diff(c.desired, AgentState{Agent: a, Entries: c.entries}, store)
@@ -81,8 +81,8 @@ func TestDiffSelfReviewCases(t *testing.T) {
 		{"desired+intact fu link but stale target (rename leftover) → rebuild",
 			map[string]bool{"alpha": true},
 			[]Entry{{Name: "alpha", Kind: KindFuLink, LinkTarget: target("old-alpha")}},
-			[]Action{{RemoveLink, "claude", "alpha", link("alpha"), ""},
-				{CreateLink, "claude", "alpha", link("alpha"), target("alpha")}}},
+			[]Action{{RemoveLink, "claude", "alpha", link("alpha"), "", nil},
+				{CreateLink, "claude", "alpha", link("alpha"), target("alpha"), nil}}},
 		// Round 2 finding 2: this case used to assert "left alone, no
 		// report" -- that was the exact gap the finding names, the state
 		// matrix's sixth row (DESIGN §2: "不应有链接 | 未纳管条目 |
@@ -109,7 +109,7 @@ func TestDiffSelfReviewCases(t *testing.T) {
 		{"desired+disabled with foreign content → reported as disabled-foreign, still left alone",
 			map[string]bool{"alpha": false},
 			[]Entry{{Name: "alpha", Kind: KindForeign}},
-			[]Action{{ReportDisabledForeign, "claude", "alpha", link("alpha"), ""}}},
+			[]Action{{ReportDisabledForeign, "claude", "alpha", link("alpha"), "", nil}}},
 		{"empty desired and empty actual → no actions, no panic",
 			map[string]bool{}, nil, nil},
 	}
@@ -156,9 +156,9 @@ func TestDiffDisabledForeignDistinctFromUnknownForeign(t *testing.T) {
 		{Name: "mystery", Kind: KindForeign},
 	}
 	want := []Action{
-		{ReportDisabledForeign, "claude", "alpha", link("alpha"), ""},
-		{ReportConflict, "claude", "beta", link("beta"), ""},
-		{ReportForeign, "claude", "mystery", link("mystery"), ""},
+		{ReportDisabledForeign, "claude", "alpha", link("alpha"), "", nil},
+		{ReportConflict, "claude", "beta", link("beta"), "", nil},
+		{ReportForeign, "claude", "mystery", link("mystery"), "", nil},
 	}
 
 	got := Diff(desired, AgentState{Agent: a, Entries: entries}, store)
@@ -206,12 +206,12 @@ func TestDiffMultiSkillOrderingAndPairing(t *testing.T) {
 		{Name: "mango", Kind: KindFuLink, LinkTarget: target("mango")}, // off, present → remove
 	}
 	want := []Action{
-		{CreateLink, "claude", "alpha", link("alpha"), target("alpha")},
-		{RemoveLink, "claude", "mango", link("mango"), ""},
-		{RemoveLink, "claude", "zeta", link("zeta"), ""},
-		{CreateLink, "claude", "zeta", link("zeta"), target("zeta")},
-		{RemoveLink, "claude", "orphan", link("orphan"), ""},
-		{ReportForeign, "claude", "extra", link("extra"), ""},
+		{CreateLink, "claude", "alpha", link("alpha"), target("alpha"), nil},
+		{RemoveLink, "claude", "mango", link("mango"), "", nil},
+		{RemoveLink, "claude", "zeta", link("zeta"), "", nil},
+		{CreateLink, "claude", "zeta", link("zeta"), target("zeta"), nil},
+		{RemoveLink, "claude", "orphan", link("orphan"), "", nil},
+		{ReportForeign, "claude", "extra", link("extra"), "", nil},
 	}
 
 	got := Diff(desired, AgentState{Agent: a, Entries: entries}, store)
@@ -281,7 +281,7 @@ func TestDiffInvalidNameCheckDoesNotApplyToActualEntries(t *testing.T) {
 	got := Diff(map[string]bool{}, AgentState{Agent: a, Entries: []Entry{
 		{Name: ".hidden-real-dotfile", Kind: KindForeign},
 	}}, store)
-	want := []Action{{ReportForeign, "claude", ".hidden-real-dotfile", link(".hidden-real-dotfile"), ""}}
+	want := []Action{{ReportForeign, "claude", ".hidden-real-dotfile", link(".hidden-real-dotfile"), "", nil}}
 	if len(got) != len(want) || got[0] != want[0] {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}

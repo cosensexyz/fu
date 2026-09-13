@@ -26,6 +26,14 @@ const (
 	// KindForeign: everything else — real dirs/files and symlinks
 	// pointing elsewhere. Never touched (SPEC rule 2).
 	KindForeign
+	// KindUnknown: an entry the scan could not inspect (readlink failed, or
+	// a fu-shaped link whose target could not be stat'ed for a reason other
+	// than absence, such as ELOOP through a self-referencing store entry).
+	// Err says why. It is neither missing, nor foreign, nor a removable fu
+	// link: Diff reports it and plans nothing for it, adopt skips it and
+	// leaves the report to the closing reconcile, and the rest of the agent
+	// is processed as usual.
+	KindUnknown
 )
 
 type Entry struct {
@@ -33,6 +41,7 @@ type Entry struct {
 	Kind       EntryKind
 	LinkTarget string // raw readlink value for symlinks
 	Broken     bool   // fu link whose target no longer exists
+	Err        error  // KindUnknown only: why the entry could not be inspected
 }
 
 type AgentState struct {
@@ -671,6 +680,13 @@ func resolveLongestExisting(path string) string {
 // ScanAgent inventories one agent skills directory with lstat semantics
 // throughout; the parent symlink is never followed.
 func ScanAgent(a agent.Agent, storeSkillsDir string) (AgentState, error) {
+	return scanAgentWithHooks(a, storeSkillsDir, nil)
+}
+
+// scanAgentWithHooks is ScanAgent with a test-only seam between reading the
+// directory listing and inspecting its entries, the window in which an entry
+// can vanish or become unreadable. Production passes nil.
+func scanAgentWithHooks(a agent.Agent, storeSkillsDir string, afterReadDir func()) (AgentState, error) {
 	st := AgentState{Agent: a}
 	dir := a.SkillsDir()
 	if dir == "" {
@@ -718,6 +734,9 @@ func ScanAgent(a agent.Agent, storeSkillsDir string) (AgentState, error) {
 	if err != nil {
 		return st, err
 	}
+	if afterReadDir != nil {
+		afterReadDir()
+	}
 	for _, e := range ents {
 		if reserved[e.Name()] {
 			continue
@@ -727,7 +746,16 @@ func ScanAgent(a agent.Agent, storeSkillsDir string) (AgentState, error) {
 		if e.Type()&os.ModeSymlink != 0 {
 			target, err := os.Readlink(p)
 			if err != nil {
-				return st, err
+				// Gone since the listing: not an entry at all, the same
+				// reading os.ReadDir gives a dirent that vanished under it.
+				if errors.Is(err, fs.ErrNotExist) {
+					continue
+				}
+				// Recorded, not fatal: the rest of the directory is still
+				// classified, and Diff treats this entry as uninspectable.
+				entry.Kind, entry.Err = KindUnknown, err
+				st.Entries = append(st.Entries, entry)
+				continue
 			}
 			entry.LinkTarget = target
 			if ownsLink(storeSkillsDir, e.Name(), target) {
@@ -736,7 +764,8 @@ func ScanAgent(a agent.Agent, storeSkillsDir string) (AgentState, error) {
 					if errors.Is(err, fs.ErrNotExist) {
 						entry.Broken = true
 					} else {
-						return st, fmt.Errorf("stat fu-owned symlink %s: %w", p, err)
+						// os.Stat's own error already names the path.
+						entry.Kind, entry.Err = KindUnknown, fmt.Errorf("inspect fu-owned symlink target: %w", err)
 					}
 				}
 			}
