@@ -3,11 +3,14 @@ package engine
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
+	indexformat "github.com/go-git/go-git/v5/plumbing/format/index"
 
 	"github.com/cosensexyz/fu/internal/store"
 )
@@ -195,5 +198,84 @@ func TestCommitWarnsAtTheNoOpSiteWhenTheIndexWasNotRefreshed(t *testing.T) {
 	}
 	if index := indexBlobHashes(t, s); index["skills/alpha/SKILL.md"] != blobOf("another draft") {
 		t.Fatalf("the concurrently staged draft must not be overwritten: %v", index)
+	}
+}
+
+// An intent-to-add file (`git add -N`) is pending both to git, which lists it
+// as unstaged, and to fu status, which lists it as a dirty store path.
+func TestStatusListsAnIntentToAddFileAsPending(t *testing.T) {
+	s, cfg := setupStore(t)
+	if _, err := NewSkill(s, nil, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.LoadConfig(s.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "alpha", "notes.md"), []byte("notes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := s.Repo.Storer.Index()
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.Entries = append(idx.Entries, &indexformat.Entry{Name: "skills/alpha/notes.md", Hash: blobOf(""), Mode: filemode.Regular, IntentToAdd: true})
+	if err := s.Repo.Storer.SetIndex(idx); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := Status(s, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(report.Store.DirtyPaths, "skills/alpha/notes.md") {
+		t.Fatalf("dirty paths = %v, want the intent-to-add file listed", report.Store.DirtyPaths)
+	}
+}
+
+// A store-wide `fu commit` over an intent-to-add file records its content
+// under the derived subject and leaves git's index clean.
+func TestCommitAllRecordsAnIntentToAddFile(t *testing.T) {
+	s, _ := setupStore(t)
+	if _, err := NewSkill(s, nil, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.SkillsDir(), "alpha", "notes.md"), []byte("notes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	empty := s.Repo.Storer.NewEncodedObject()
+	empty.SetType(plumbing.BlobObject)
+	if _, err := s.Repo.Storer.SetEncodedObject(empty); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := s.Repo.Storer.Index()
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.Entries = append(idx.Entries, &indexformat.Entry{Name: "skills/alpha/notes.md", Hash: blobOf(""), Mode: filemode.Regular, IntentToAdd: true})
+	if err := s.Repo.Storer.SetIndex(idx); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome, err := CommitOperations(s, nil, CommitScope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.ExternalWritten || !outcome.Written || outcome.Subject != "commit: alpha" || !slices.Equal(outcome.Changed, []string{"skills/alpha/notes.md"}) {
+		t.Fatalf("outcome = %+v, want the note recorded under alpha's subject with no external snapshot", outcome)
+	}
+	if got := commitFileAt(t, s, 0, "skills/alpha/notes.md"); got != "notes" {
+		t.Fatalf("notes.md = %q", got)
+	}
+	idx, err = s.Repo.Storer.Index()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := idx.Entry("skills/alpha/notes.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.IntentToAdd || entry.Hash != blobOf("notes") {
+		t.Fatalf("the installed entry must be materialised: %+v", entry)
 	}
 }

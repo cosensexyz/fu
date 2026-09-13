@@ -137,7 +137,12 @@ func (s *Store) PrepareCommitUnder(prefixes []string) (PreparedCommit, error) {
 			return PreparedCommit{}, s.explainStagingFailure(err)
 		}
 	}
-	inScope, err := preparedEntriesFromIndex(entriesUnder(idx.Entries, prefixes))
+	// The prefix's content is now really staged, so its intent-to-add flags
+	// are cleared before the entries are frozen and installed; entries
+	// outside the prefix keep theirs, as they keep everything else.
+	inPrefix := entriesUnder(idx.Entries, prefixes)
+	clearIntentToAdd(inPrefix)
+	inScope, err := preparedEntriesFromIndex(inPrefix)
 	if err != nil {
 		return PreparedCommit{}, err
 	}

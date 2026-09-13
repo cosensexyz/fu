@@ -83,6 +83,31 @@ func checkNoUnmergedEntries(entries []*indexformat.Entry) error {
 	return nil
 }
 
+// withoutIntentToAdd drops the entries `git add -N` registers. Such an entry
+// carries the empty blob and the intent-to-add flag; git treats it as not
+// staged at all (`git status` shows it as unstaged, `git commit` ignores it),
+// and so must every reading of the index as staged content: the external
+// snapshot, and the question whether the index projects HEAD's tree.
+func withoutIntentToAdd(entries []*indexformat.Entry) []*indexformat.Entry {
+	out := make([]*indexformat.Entry, 0, len(entries))
+	for _, e := range entries {
+		if !e.IntentToAdd {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// clearIntentToAdd materialises intent-to-add entries: once fu has staged
+// the file's real content for a candidate the flag is a lie go-git leaves
+// behind (its Add never clears it), and an index installed with it makes git
+// report the recorded file as a staged deletion plus an unstaged addition.
+func clearIntentToAdd(entries []*indexformat.Entry) {
+	for _, e := range entries {
+		e.IntentToAdd = false
+	}
+}
+
 // ErrStaleCandidate means the branch moved between preparing a candidate and
 // publishing it. The candidate's tree was frozen against the earlier HEAD --
 // for a scoped candidate its out-of-prefix entries were even copied from
@@ -345,6 +370,10 @@ func (s *Store) freezePrepared(private *git.Repository, wt *git.Worktree, baseli
 	if err != nil {
 		return PreparedCommit{}, err
 	}
+	// stageAll staged every path's real content, so no intent-to-add flag
+	// tells the truth any more (clearIntentToAdd); the installed index must
+	// not carry it.
+	clearIntentToAdd(idx.Entries)
 	entries, err := preparedEntriesFromIndex(idx.Entries)
 	if err != nil {
 		return PreparedCommit{}, err
@@ -414,11 +443,19 @@ func (s *Store) PrepareStagedSnapshot() (PreparedCommit, error) {
 	if err != nil {
 		return PreparedCommit{}, err
 	}
-	entries, err := preparedEntriesFromIndex(baseline.Entries)
+	// What the user staged is the index minus its intent-to-add
+	// placeholders (withoutIntentToAdd): in the private worktree those paths
+	// then read as untracked. Absent from HEAD, changedPathsFromStatus leaves
+	// them out, so the snapshot neither records an empty file nor claims the
+	// path; present in HEAD (`git rm --cached p && git add -N p`), the
+	// snapshot records the deletion exactly as `git commit` would.
+	staged := cloneIndex(baseline)
+	staged.Entries = withoutIntentToAdd(staged.Entries)
+	entries, err := preparedEntriesFromIndex(staged.Entries)
 	if err != nil {
 		return PreparedCommit{}, err
 	}
-	_, wt, err := s.privateWorktree(baseline)
+	_, wt, err := s.privateWorktree(staged)
 	if err != nil {
 		return PreparedCommit{}, err
 	}
@@ -434,7 +471,7 @@ func (s *Store) PrepareStagedSnapshot() (PreparedCommit, error) {
 		entries:        entries,
 		changed:        changed,
 		fingerprint:    fingerprintPreparedEntries(entries),
-		candidateIndex: cloneIndex(baseline),
+		candidateIndex: staged,
 		publicBaseline: cloneIndex(baseline),
 		// The public index already is this candidate. Leaving it alone both
 		// preserves a concurrent later writer and gives normal Git commit
@@ -471,7 +508,9 @@ func (s *Store) privateWorktree(index *indexformat.Index) (*git.Repository, *git
 // tree). The captured state is used rather than HEAD as it is now, so the
 // answer belongs to the same instant as the rest of the candidate.
 func (s *Store) indexMatchesReference(index *indexformat.Index, ref preparedCommitReference) bool {
-	entries, err := preparedEntriesFromIndex(index.Entries)
+	// Intent-to-add placeholders are not staged content and must not make an
+	// otherwise HEAD-equal index look staged (withoutIntentToAdd).
+	entries, err := preparedEntriesFromIndex(withoutIntentToAdd(index.Entries))
 	if err != nil {
 		return false
 	}
