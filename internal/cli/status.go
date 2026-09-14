@@ -46,8 +46,57 @@ func driftLabel(action engine.Action) string {
 // thing to test. A heading with nothing under it is scaffold, not a report, so
 // every gate is computed before its heading is written.
 
+// remoteLine says where the store's branch stands against its remote, in the
+// terms the reader acts in: which command moves it, or why no command can yet.
+//
+// The unknown case is the one worth reading twice. `fu status` may not fetch
+// (SPEC §9), so when the remote names a commit this store has never seen, the
+// relation is genuinely unestablished -- almost certainly behind, but almost
+// is not a finding. The line says what is known (the remote's commit), what is
+// not (the relation), and what settles it (`fu pull`, which fetches).
+func remoteLine(status engine.RemoteStatus) string {
+	if status.Err != "" {
+		// Only a transport failure is reported as one. Every other way the
+		// comparison can stop is local -- a detached HEAD, a branch with no
+		// commit, a damaged object database -- and fu never asked the remote
+		// on those paths, so saying it could not be reached would assert
+		// exactly the kind of thing this command refuses to guess at.
+		if status.Unreachable {
+			return fmt.Sprintf("  remote       %s could not be reached: %s", status.URL, status.Err)
+		}
+		return fmt.Sprintf("  remote       %s not compared: %s", status.URL, status.Err)
+	}
+	switch status.Relation {
+	case engine.RemoteSynced:
+		return fmt.Sprintf("  remote       up to date with %s", status.URL)
+	case engine.RemoteAhead:
+		return fmt.Sprintf("  remote       %s is ahead of %s; send it with `fu push`", status.Branch, status.URL)
+	case engine.RemoteBehind:
+		return fmt.Sprintf("  remote       %s is behind %s; catch up with `fu pull`", status.Branch, status.URL)
+	case engine.RemoteDiverged:
+		return fmt.Sprintf("  remote       %s has diverged from %s; fu never merges, so git resolves this one", status.Branch, status.URL)
+	case engine.RemoteUnknown:
+		return fmt.Sprintf("  remote       %s is at %s, which this store does not hold, so fu cannot tell how the two relate without fetching; `fu pull` fetches and answers",
+			status.URL, shortHash(status.Remote))
+	case engine.RemoteEmpty:
+		return fmt.Sprintf("  remote       %s has no commits yet; `fu push` seeds it", status.URL)
+	case engine.RemoteNoBranch:
+		return fmt.Sprintf("  remote       %s has no branch %s; `fu push` creates it", status.URL, status.Branch)
+	}
+	return fmt.Sprintf("  remote       %s: unrecognised state %v", status.URL, status.Relation)
+}
+
+// shortHash abbreviates a commit the way git does in prose. The full hash is
+// in the structured report for anyone who needs it; a status line is read.
+func shortHash(hash string) string {
+	if len(hash) > 7 {
+		return hash[:7]
+	}
+	return hash
+}
+
 func printStoreSection(out io.Writer, status engine.StoreStatus) bool {
-	if len(status.DirtyPaths) == 0 && len(status.Pending) == 0 {
+	if len(status.DirtyPaths) == 0 && len(status.Pending) == 0 && status.Remote == nil {
 		return false
 	}
 	fmt.Fprintln(out, "store")
@@ -62,6 +111,14 @@ func printStoreSection(out io.Writer, status engine.StoreStatus) bool {
 		// two apart takes running recovery, which a read-only command must
 		// not do.
 		fmt.Fprintf(out, "  unfinished   %s %s (the next write command settles it, or says what needs repairing)\n", pending.Op, pending.Name)
+	}
+	// Last, and printed whenever a remote is configured -- including when it
+	// is up to date. The two lines above appear only when something is wrong,
+	// but "where am I against the remote" is a question with no wrong answer:
+	// a user who ran status to decide between push and pull needs to be told
+	// "neither" as much as either.
+	if status.Remote != nil {
+		fmt.Fprintln(out, remoteLine(*status.Remote))
 	}
 	return true
 }

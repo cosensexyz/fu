@@ -2,6 +2,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -118,6 +119,114 @@ type AgentStatus struct {
 type StoreStatus struct {
 	DirtyPaths []string
 	Pending    []PendingOperation
+	// Remote is nil when no remote is configured: there is no comparison to
+	// describe, and printing "unknown" for a store the user never connected
+	// would read as a failure to answer a question nobody asked.
+	Remote *RemoteStatus
+}
+
+// RemoteRelation restates store.RemoteRelation in the engine's own
+// vocabulary, so presentation never has to name a store type.
+//
+// The duplication is the boundary being explicit rather than waste: the CLI's
+// only core dependency is engine.Application (enforced by
+// TestProductionCLIUsesOnlyApplicationCoreBoundary), and without a value of
+// its own here, rendering a relation would have meant importing the store
+// layer into a package whose job is words. It is the same arrangement
+// ActionType already has, for the same reason.
+//
+// relationFromStore below maps every store value, and a test walks the store
+// enum to prove none is missed -- the one failure mode a hand-kept copy has.
+type RemoteRelation int
+
+const (
+	// RemoteRelationUnset is the zero value on purpose: a RemoteStatus that
+	// carries an Err established no relation at all, and with RemoteSynced at
+	// iota 0 such a status went out reading "up to date" beside the reason it
+	// had failed. Nothing renders this today -- remoteLine checks Err first --
+	// but the next consumer to switch on Relation would have reported an
+	// unreachable remote as in sync.
+	RemoteRelationUnset RemoteRelation = iota
+	RemoteSynced
+	RemoteAhead
+	RemoteBehind
+	RemoteDiverged
+	// RemoteUnknown: the remote named a commit this store does not hold, and a
+	// read-only command may not fetch one to judge it (SPEC §9). Not behind,
+	// though behind is the likeliest truth; not a failure, since the remote
+	// answered. See store.RemoteUnknown for the full argument.
+	RemoteUnknown
+	RemoteEmpty
+	RemoteNoBranch
+)
+
+// String names the relation. The store's copy has one and this did not, so a
+// fallback line and a failed assertion printed an integer for the enum the CLI
+// actually renders -- which is the one a reader is looking at.
+func (r RemoteRelation) String() string {
+	switch r {
+	case RemoteRelationUnset:
+		return "unset"
+	case RemoteSynced:
+		return "synced"
+	case RemoteAhead:
+		return "ahead"
+	case RemoteBehind:
+		return "behind"
+	case RemoteDiverged:
+		return "diverged"
+	case RemoteUnknown:
+		return "unknown"
+	case RemoteEmpty:
+		return "empty remote"
+	case RemoteNoBranch:
+		return "no matching branch"
+	}
+	return fmt.Sprintf("RemoteRelation(%d)", int(r))
+}
+
+func relationFromStore(relation store.RemoteRelation) RemoteRelation {
+	switch relation {
+	case store.RemoteSynced:
+		return RemoteSynced
+	case store.RemoteAhead:
+		return RemoteAhead
+	case store.RemoteBehind:
+		return RemoteBehind
+	case store.RemoteDiverged:
+		return RemoteDiverged
+	case store.RemoteUnknown:
+		return RemoteUnknown
+	case store.RemoteEmpty:
+		return RemoteEmpty
+	case store.RemoteNoBranch:
+		return RemoteNoBranch
+	}
+	// A store relation this build does not know is not "synced". Unknown is
+	// the value whose whole meaning is "fu cannot say", which is exactly the
+	// truth here.
+	return RemoteUnknown
+}
+
+// RemoteStatus is where the store's branch stands against its remote, or why
+// that could not be established.
+//
+// Err and Relation are alternatives: a failure means the remote was never
+// asked or never answered, so no relation was reached. Err costs the user
+// this one line and nothing else -- every other section of the report is a
+// local fact -- and never the command's exit code, on the same principle that
+// makes finding drift exit 0.
+type RemoteStatus struct {
+	URL      string
+	Branch   string
+	Local    string
+	Remote   string
+	Relation RemoteRelation
+	Err      string
+	// Unreachable distinguishes the one failure that is about the remote --
+	// fu asked and got no answer -- from every other, which are local and
+	// leave the remote unasked. See store.ErrRemoteUnreachable.
+	Unreachable bool
 }
 
 // PendingOperation names an unfinished transaction in the terms a user knows:
@@ -1244,5 +1353,98 @@ func Status(st *store.Store, cfg *store.Config, agents []agent.Agent) (StatusRep
 			report.Staging.Unmatched++
 		}
 	}
+	// Last, and for the same reason the store-side sections come after the
+	// agents: this is the only part of the report that leaves the machine, so
+	// every local fact is assembled before anything waits on a network. It
+	// cannot make the report appear sooner -- the CLI prints once Status
+	// returns -- but it does mean a slow remote delays only the printing of
+	// work already done, rather than the work itself.
+	report.Store.Remote = remoteStatus(st)
 	return report, errors.Join(problems...)
+}
+
+// remoteStatus asks the store's remote where it stands, and turns every way
+// that can go wrong into a line rather than an error.
+//
+// It is the only part of `fu status` that touches the network, and it is
+// deliberately the part that can fail hardest -- a remote may be down,
+// unreachable, or refuse the credentials go-git can offer. None of that is a
+// reason to withhold the local report, which is what the user came for and
+// what the other three sections are made of: the failure is accumulated into
+// this section's own Err, exactly as the store, recovery and staging sections
+// accumulate theirs.
+//
+// One ls-remote and nothing written (store.CompareRemote), so this stays
+// inside SPEC §9's read-only guarantee.
+//
+// The budget is its own, and short. remoteSyncTimeout is ten minutes because
+// `fu push` may be moving a large history and the user asked for a transfer;
+// `fu status` is the most-run command in the tool and asked for a report, so
+// a remote that does not answer promptly must cost a line rather than the
+// command. Measured before choosing: a black-holed host left `fu status`
+// silent for 75 seconds, because the whole report is printed only after
+// Status returns.
+//
+// **The dial is not bound by this context.** go-git's SSH transport dials on
+// context.Background() bounded only by its own config.Timeout, which fu does
+// not set, so an unroutable SSH host still costs the OS connect timeout
+// before this deadline can apply. The ceiling below binds everything after
+// the connection is made, and the residue is recorded in DESIGN §6.
+func remoteStatus(st *store.Store) *RemoteStatus {
+	ctx, cancel := context.WithTimeout(context.Background(), remoteStatusTimeout)
+	defer cancel()
+
+	// Run in a goroutine and give up on the deadline rather than on the call,
+	// because the deadline does not reach the whole call: go-git's SSH
+	// transport dials on context.Background(), so an unroutable SSH host --
+	// v1's primary transport (DESIGN §4) -- would otherwise hold `fu status`
+	// for the OS connect timeout with the budget above binding nothing a user
+	// can observe. Waiting on the context instead makes the ceiling real for
+	// every transport.
+	//
+	// Abandoning the goroutine is safe here and only here: CompareRemote
+	// writes nothing (SPEC §9), so the worst an abandoned one does is finish
+	// its dial, discover nobody is listening, and return into a buffered
+	// channel nobody reads. A write path could not be left running this way.
+	type answer struct {
+		comparison store.RemoteComparison
+		err        error
+	}
+	answers := make(chan answer, 1)
+	go func() {
+		comparison, err := st.CompareRemote(ctx)
+		answers <- answer{comparison, err}
+	}()
+
+	var comparison store.RemoteComparison
+	var err error
+	select {
+	case got := <-answers:
+		comparison, err = got.comparison, got.err
+	case <-ctx.Done():
+		url, _, _ := st.Remote()
+		return &RemoteStatus{
+			URL:         url,
+			Err:         fmt.Sprintf("no answer within %s", remoteStatusTimeout),
+			Unreachable: true,
+		}
+	}
+	if errors.Is(err, store.ErrNoRemoteConfigured) {
+		return nil
+	}
+	status := &RemoteStatus{
+		URL:    comparison.URL,
+		Branch: comparison.Branch,
+		Local:  comparison.Local,
+		Remote: comparison.Remote,
+	}
+	if err != nil {
+		// Relation stays unset: a failed comparison reached no relation, and
+		// mapping the zero RemoteComparison would have said "synced".
+		status.Err = err.Error()
+		status.Unreachable = errors.Is(err, store.ErrRemoteUnreachable)
+		return status
+	}
+	status.Relation = relationFromStore(comparison.Relation)
+	return status
 }

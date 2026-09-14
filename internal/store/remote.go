@@ -350,8 +350,7 @@ func retryCloneAfterUnresolvedHead(ctx context.Context, scratch, url string) (*g
 // anything: a bare git.Remote backed by an in-memory storage, the same
 // approach `git ls-remote` takes.
 func remoteBranches(ctx context.Context, url string) ([]plumbing.ReferenceName, error) {
-	remote := git.NewRemote(memory.NewStorage(), &config.RemoteConfig{Name: remoteName, URLs: []string{url}})
-	refs, err := remote.ListContext(ctx, &git.ListOptions{})
+	refs, err := listRemoteRefs(ctx, url)
 	if err != nil {
 		return nil, err
 	}
@@ -363,6 +362,19 @@ func remoteBranches(ctx context.Context, url string) ([]plumbing.ReferenceName, 
 	}
 	sort.Slice(branches, func(i, j int) bool { return branches[i] < branches[j] })
 	return branches, nil
+}
+
+// listRemoteRefs is one ls-remote: it asks the remote what it advertises and
+// keeps the whole answer, hashes included. It writes nothing -- the remote is
+// built on memory storage, so there is nowhere for an object or a tracking
+// ref to land even by accident.
+//
+// remoteBranches above wants names only; CompareRemote wants the commit each
+// branch points at. Both go through here so there is one place that decides
+// what a query to the remote costs.
+func listRemoteRefs(ctx context.Context, url string) ([]*plumbing.Reference, error) {
+	remote := git.NewRemote(memory.NewStorage(), &config.RemoteConfig{Name: remoteName, URLs: []string{url}})
+	return remote.ListContext(ctx, &git.ListOptions{})
 }
 
 // resetScratch empties scratch and recreates it with the mode Clone sets up

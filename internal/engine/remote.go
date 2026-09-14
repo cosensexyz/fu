@@ -12,7 +12,12 @@ import (
 	"github.com/cosensexyz/fu/internal/store"
 )
 
-// ErrNoRemote is the answer push and pull give before `fu remote <url>`.
+// ErrNoRemote is `fu push` and `fu pull` refusing for want of a remote.
+//
+// store.ErrNoRemoteConfigured says the same thing one layer down, for the
+// status comparison. Neither wraps the other: they are two layers each
+// refusing for their own reason, and the responses differ -- this one is a
+// command failure with a remedy, that one tells the report to print nothing.
 var ErrNoRemote = errors.New("no remote configured; set one with `fu remote <url>`")
 
 // ErrNoRemoteBranch means the remote has commits but none on the branch this
@@ -24,6 +29,15 @@ var ErrNoRemoteBranch = errors.New("remote has no branch matching the store's br
 // this is the user's own history rather than a third-party repository, and
 // no byte budget applies for the same reason.
 const remoteSyncTimeout = 10 * time.Minute
+
+// remoteStatusTimeout bounds `fu status`'s remote comparison, which is a
+// different kind of call from the transfers above: one ls-remote, a fixed and
+// tiny amount of data, on the most-run command in the tool, and the user
+// asked for a report rather than for a transfer. Ten minutes is the right
+// budget for moving a history and the wrong one for answering a question --
+// a remote that does not respond promptly should cost the line, not the
+// command.
+const remoteStatusTimeout = 10 * time.Second
 
 type RemoteOutcome struct {
 	URL        string
