@@ -77,6 +77,7 @@ func newAdoptCmd(app adoptApplication) *cobra.Command {
 				}
 			}
 			printResult(cmd, res.Reconcile)
+			printDeliveryHint(cmd.OutOrStdout(), res.Reconcile)
 			// Nothing was found or reported at all: say so, so an empty
 			// environment (or one where everything is already a fu link) is
 			// not indistinguishable from "never checked" (round 8 finding M1).

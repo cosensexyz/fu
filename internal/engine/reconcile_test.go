@@ -1893,9 +1893,19 @@ func TestAdoptResultEmptyCoversEveryReportedField(t *testing.T) {
 		"skipped":   {Skipped: []string{"alpha"}},
 		"warnings":  {Warnings: []string{"w"}},
 		"failed":    {Failed: []FailedAction{{Action{Skill: "alpha"}, errors.New("boom")}}},
+		"preflight conflicts": {PreflightConflicts: []FailedAction{
+			{Action{Skill: "alpha"}, errors.New("boom")},
+		}},
 		"reconcile disabled-foreign": {Reconcile: Result{
 			DisabledForeign: []Action{{AgentName: "claude", Skill: "alpha"}},
 		}},
+		// The counters, which are not findings: a run that projected a link
+		// has something to say even when it found nothing. Result.Empty
+		// deliberately ignores them (its subject is findings); this predicate
+		// must not, or adopt claims nothing happened after its prologue put a
+		// link in place.
+		"reconcile created": {Reconcile: Result{Created: 1}},
+		"reconcile removed": {Reconcile: Result{Removed: 1}},
 	}
 	if !(AdoptResult{}).Empty() {
 		t.Fatal("a zero AdoptResult must be empty")

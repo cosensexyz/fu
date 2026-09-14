@@ -40,8 +40,16 @@ type AdoptResult struct {
 }
 
 // Empty reports that the run produced nothing to say: nothing adopted, nothing
-// pending, nothing conflicted, skipped, warned, failed, and no reconcile
-// finding of any kind. It is the engine's verdict, not the CLI's.
+// pending, nothing conflicted, skipped, warned, failed, no reconcile finding
+// of any kind -- and no link created or removed. It is the engine's verdict,
+// not the CLI's.
+//
+// The counters are consulted here and not in Result.Empty, whose subject is
+// findings alone (see its own comment). This predicate's subject is the run:
+// adopt's prologue reconcile can project a link an agent was owed while
+// discovery turns up no candidate of its own, and reporting "nothing to
+// adopt" beside the sentence saying the change takes effect in new sessions
+// is the same self-contradiction round 18 finding I20 named.
 //
 // The CLI used to compute this as an eleven-field emptiness expression over
 // AdoptResult and AdoptResult.Reconcile. Any second front end had to reproduce
@@ -53,7 +61,7 @@ type AdoptResult struct {
 func (r AdoptResult) Empty() bool {
 	return len(r.Adopted) == 0 && len(r.Pending) == 0 && len(r.Conflicts) == 0 &&
 		len(r.Skipped) == 0 && len(r.Warnings) == 0 && len(r.Failed) == 0 && len(r.PreflightConflicts) == 0 &&
-		r.Reconcile.Empty()
+		r.Reconcile.Created == 0 && r.Reconcile.Removed == 0 && r.Reconcile.Empty()
 }
 
 // AdoptScope distinguishes an omitted agent selector from an explicitly
@@ -583,6 +591,21 @@ func adopt(st *store.Store, allAgents []agent.Agent, scope string, h hooks) (Ado
 						// The cached inventory describes the command's initial
 						// state. Advance only changes Fu itself completed; later
 						// capture still verifies the live directory identities.
+						if !completedWholeDirSwitch[a.Name()] {
+							// The switch builds the replacement directory and
+							// materialises its links inside the transaction,
+							// so reconcile finds nothing left to create and
+							// counts nothing -- the whole-directory form
+							// projected links and then reported no effect,
+							// while the per-entry form of the same adoption
+							// reported one. Counted once per agent, as the
+							// directory is switched once: the exact number of
+							// links inside it is not something any consumer
+							// of this counter asks for, and the later skills
+							// of the same run reach the now-real directory
+							// through reconcile and are counted there.
+							res.Reconcile.Created++
+						}
 						completedWholeDirSwitch[a.Name()] = true
 					}
 				}
@@ -625,6 +648,9 @@ func adopt(st *store.Store, allAgents []agent.Agent, scope string, h hooks) (Ado
 			if errors.Is(err, ErrTxnConflict) && !errors.Is(err, errAdoptPreflight) {
 				if !perSkillReconciled {
 					mergeResult(&res.Reconcile, prologueResult)
+				} else {
+					res.Reconcile.Created += prologueResult.Created
+					res.Reconcile.Removed += prologueResult.Removed
 				}
 				return res, err
 			}
@@ -684,6 +710,16 @@ func adopt(st *store.Store, allAgents []agent.Agent, scope string, h hooks) (Ado
 	// trailing reconcile), the prologue remains the only reconciliation result.
 	if !perSkillReconciled {
 		mergeResult(&res.Reconcile, prologueResult)
+	} else {
+		// Except the delivery counters, which are not a description of that
+		// state but a record of what this run did. A link the prologue created
+		// is already in place when the later pass looks, so that pass counts
+		// nothing for it -- dropping the prologue's count made a run that
+		// projected two links claim to have projected one, and a run whose
+		// only projection was the prologue's claim to have projected none.
+		// Same distinction restore --hard draws between its two passes.
+		res.Reconcile.Created += prologueResult.Created
+		res.Reconcile.Removed += prologueResult.Removed
 	}
 	if postCommitErr != nil {
 		return res, errors.Join(ErrOperationFailed, postCommitErr)

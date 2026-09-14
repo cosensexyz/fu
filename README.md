@@ -26,9 +26,9 @@ move, and every change is a commit.
 
 ## Status
 
-**Twenty-one commands ship today:** `init`, `new`, `list`, `show`, `status`,
-`restore`, `revert`, `commit`, `log`, `enable`, `disable`, `add`, `adopt`,
-`rm`, `outdated`, `update`, `gc`, `remote`, `push`, `pull`, `clone`.
+**Twenty-two commands ship today:** `init`, `new`, `list`, `show`, `status`,
+`agent`, `restore`, `revert`, `commit`, `log`, `enable`, `disable`, `add`,
+`adopt`, `rm`, `outdated`, `update`, `gc`, `remote`, `push`, `pull`, `clone`.
 
 `add` installs a skill from a git URL or a local directory and records the
 locked source; `adopt` takes skills that already live in an agent's directory
@@ -55,8 +55,8 @@ stop when a worktree, index, or HEAD check detects a conflict. If some paths
 were already changed, they list those paths and preserve the remaining state
 for inspection; a later write command records that state before proceeding.
 These checks do not make the multi-file update atomic against external editors.
-Still designed but not built: `agent`.
-See [Roadmap](#roadmap).
+`agent` lists the agents fu supports and how much of the projection each one
+has. Every command SPEC.md states is now built.
 
 **macOS and Linux.** fu relies on POSIX directory-relative syscalls and does not
 build on Windows.
@@ -102,7 +102,7 @@ detected agent straight away:
 
 ```sh
 $ fu new pdf-tools
-created pdf-tools
+created pdf-tools; takes effect in new agent sessions
 
 $ fu list
 SKILL      GLOBAL  claude  codex
@@ -162,6 +162,7 @@ than touching it:
 ```sh
 $ fu restore
 restored agent links
+takes effect in new agent sessions
 the store worktree was left alone; these changes are not committed:
   skills/pdf-tools/SKILL.md
 record them with `fu commit`, or with any write command other than `fu restore` and `fu gc`, which sweep nothing; or discard them with `fu restore --hard`
@@ -228,6 +229,7 @@ so a skill is never out of date in one agent and current in another.
 | `fu list` | Show every skill and the full switch matrix. |
 | `fu show <name>` | Show one skill's frontmatter, digest and per-agent state. |
 | `fu status` | Report how `fu.yaml`'s expectations and what's on disk differ, plus the store worktree's state, any unfinished transaction, and what `recovery/` and `staging/` are holding; read-only, and finding a difference is not a failure — it exits 0 with the report. Failing to read the store at all is still an error. Read-only means it writes no store content, takes no lock and creates no agent directory; opening `$FU_HOME` does recreate `staging/` and `recovery/` if they have gone missing, which every command does alike. |
+| `fu agent` | List the agents fu supports, one per row: whether this machine has it, how many links are delivered, how many are still pending, how many entries fu does not manage, and where its skills directory is. Notes under the table cover broken links, entries that cannot be inspected, names blocked by content fu did not create (including ones you have turned off but that something still occupies), enabled skills the store no longer holds, a directory not created yet, a skills directory that is a symlink, and a directory that could not be read at all. Read-only in the same sense `fu status` is: no lock, and no agent directory is created — an agent detected after its skills were registered is reported as pending, and the next write command or `fu restore` projects into it. Finding a problem is not a failure; only being unable to open the store is. |
 | `fu restore [--hard]` | Rebuild agent links from `fu.yaml`; an uncommitted store worktree is reported and never touched. `--hard` also resets the tracked part of it back to the last commit — those edits are then gone for good, in neither git history nor `recovery/`. Untracked files are outside its reach and are reported either way — but note that a `.gitignore`d file is only untracked until fu first records it: sweeps commit ignored content deliberately, and once committed such a file is tracked and `--hard` resets it like any other. |
 | `fu revert <n>` | Roll the store back `n` operations: any pending hand edit is committed first, then the store worktree converges to the tree from `n` operations ago and that becomes a new commit. |
 | `fu commit [name] [-m <message>]` | Record pending hand edits as one operation. With a name, only `skills/<name>/` is recorded and everything else stays pending; without one, the whole store is. The name must be a skill `fu.yaml` already registers. Paths outside the named skill — staged with `git` or not — are neither recorded nor touched. With a name the worktree wins: a version you staged inside that skill and then edited further is superseded and does not enter history. That matches `git commit <path>` wherever a commit is actually written — but the two invert when the tree does not move. Stage a draft, edit the file back to the committed bytes, and real git exits 1 with `nothing to commit, working tree clean` and keeps your staged draft; fu prints the shorter `nothing to commit`, exits 0, and syncs the index onto the worktree, so the draft is gone. It is the one thing `fu commit` can destroy, and it is deliberate: without that sync the skill would report as pending forever. The subject line is generated (`commit: <name>`, or `commit: <skills>[, fu.yaml][, store]`, collapsing to `N skills` past five); `-m` becomes the body. Without a name, anything already staged with git directly is recorded first as `external: manual modifications`; if that consumes the whole difference, fu reports that commit and says `-m` went unused, rather than claiming there was nothing to commit. Nothing pending prints `nothing to commit` and exits 0 — with a name, that means nothing pending under that skill. Read that as "nothing to record" rather than "nothing happened": the index convergence above runs on exactly this path. Either form records indiscriminately within its range, untracked and `.gitignore`d files included, the same projection a sweep uses — a name narrows the range, not the projection. If the branch moves under fu while it commits, the candidate is not published and the command says so (without a name, an already recorded `external: manual modifications` snapshot is reported); if `fu.yaml` changes meanwhile, the commit is refused before publishing (without a name, a snapshot you had staged with git may already have been recorded as `external: manual modifications` by then, and fu says so); if git's index is restaged on the recorded paths meanwhile, the commit stands and a warning says the index was left alone. A store mid-merge (unmerged entries in git's index) is refused outright, as `git commit` refuses it. |
@@ -494,11 +496,9 @@ ssh-agent. This is the same scope `fu add` has for skill sources.
 
 ## Roadmap
 
-Designed in [DESIGN.md](DESIGN.md), not yet built:
-
-| | |
-|---|---|
-| `agent` | Inspect or configure agent adapters. |
+Every command [SPEC.md](SPEC.md) states is built. A local web GUI (`fu web`)
+is designed but deliberately out of v1; the core library holds all the
+behaviour, so a second front end calls it rather than reimplementing it.
 
 [SPEC.md](SPEC.md) states the product in full; [DESIGN.md](DESIGN.md) is the
 implementation design, including the known gaps. Both are written in Chinese.

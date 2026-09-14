@@ -109,6 +109,7 @@ func newUpdateCmd(app updateApplication) *cobra.Command {
 				printDurableOutcome(cmd, "update", operation)
 			}
 			printResult(cmd, outcome.Reconcile)
+			printDeliveryHint(cmd.OutOrStdout(), outcome.Reconcile)
 			return err
 		},
 	}

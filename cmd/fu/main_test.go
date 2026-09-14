@@ -79,6 +79,9 @@ func TestBinarySmoke(t *testing.T) {
 	if out, code := run("list"); code != 0 || !strings.Contains(out, "writer") || !strings.Contains(out, "SKILL") {
 		t.Fatalf("fu list: exit=%d out=%q", code, out)
 	}
+	if out, code := run("agent"); code != 0 || !strings.Contains(out, "AGENT") || !strings.Contains(out, "claude") {
+		t.Fatalf("fu agent: exit=%d out=%q", code, out)
+	}
 
 	// Negative path: main.go's os.Exit(1) must actually fire for a real
 	// operation failure, not merely leave the success paths looking correct.

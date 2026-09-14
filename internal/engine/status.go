@@ -235,6 +235,17 @@ var (
 	}
 )
 
+// isRebuildPair answers whether actions[index] opens a rebuild -- a
+// RemoveLink immediately followed by a CreateLink for the same skill, which
+// Diff emits for one link fu will respell or replace, not two links changing.
+// Shared so the readers that must not double-count it (statusDrift here,
+// agentOverview's pending count) agree on what a pair is.
+func isRebuildPair(actions []Action, index int) bool {
+	next := index + 1
+	return actions[index].Type == RemoveLink && next < len(actions) &&
+		actions[next].Type == CreateLink && actions[next].Skill == actions[index].Skill
+}
+
 // statusDrift turns Diff's actions into findings a reader can act on. Diff
 // answers a broken or misspelled fu link with the pair that repairs it --
 // RemoveLink then CreateLink for the same entry (diff.go) -- which is a work
@@ -261,8 +272,7 @@ func statusDrift(actions []Action, state AgentState) []Action {
 	for index := 0; index < len(actions); index++ {
 		action := actions[index]
 		next := index + 1
-		if action.Type != RemoveLink || next == len(actions) ||
-			actions[next].Type != CreateLink || actions[next].Skill != action.Skill {
+		if !isRebuildPair(actions, index) {
 			drift = append(drift, storeSideMissing(action))
 			continue
 		}

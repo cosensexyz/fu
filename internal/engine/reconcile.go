@@ -258,6 +258,24 @@ type Result struct {
 	Invalid         []Action       // fu.yaml skill name fails validation (round 2 finding 3); computed by Desired so a genuine fu link recorded under the name is still reachable by Diff's removal loop (round 3 finding 2)
 	Skipped         []string       // agents skipped: skills dir is a symlink (SPEC rule 10)
 	Failed          []FailedAction // per-entry or per-agent failures isolated from the rest (finding I3)
+	// Created and Removed count the links this pass actually put in place or
+	// took away, across every agent. They exist so a command can tell a
+	// delivery that changed something from one that changed nothing: SPEC
+	// rule 8's "takes effect in new agent sessions" is a claim about a
+	// change, and printing it after a no-op says a session restart will do
+	// something it will not. Only the two successful paths in applyToAgent
+	// increment them -- a link the store could not supply (Missing) or that
+	// something else occupied (Conflicts) was never projected.
+	//
+	// One writer outside applyToAgent adds to Created: whole-directory adopt
+	// materialises its links inside its own switch transaction, so reconcile
+	// sees a directory with nothing left to do. It adds one per switched
+	// agent (adopt.go), which is what keeps the two adopt shapes from
+	// reporting the same outcome differently. Read the pair as "did this run
+	// change what a new session loads", which is the only question asked of
+	// them, rather than as an exact inventory of link operations.
+	Created int
+	Removed int
 }
 
 // Empty reports that a reconcile pass produced no finding a caller could act
@@ -265,6 +283,12 @@ type Result struct {
 // inventory, not a finding about this run. `fu status` reports the same state
 // from its own Diff pass, so nothing consumes this field.
 func (r Result) Empty() bool {
+	// Findings only, as the doc comment says, and deliberately not Created or
+	// Removed: `fu restore --hard`'s second pass resolves the findings of its
+	// first and then has nothing to report, which is exactly the state this
+	// predicate exists to recognise -- yet it certainly rebuilt a link on the
+	// way. A caller that needs "did this run change anything" reads the
+	// counters, and AdoptResult.Empty does.
 	return len(r.Warnings) == 0 && len(r.Conflicts) == 0 && len(r.DisabledForeign) == 0 && len(r.Missing) == 0 &&
 		len(r.Reserved) == 0 && len(r.Invalid) == 0 && len(r.Skipped) == 0 && len(r.Failed) == 0
 }
@@ -363,6 +387,8 @@ func mergeResult(dst *Result, src Result) {
 	dst.Invalid = append(dst.Invalid, src.Invalid...)
 	dst.Skipped = append(dst.Skipped, src.Skipped...)
 	dst.Failed = append(dst.Failed, src.Failed...)
+	dst.Created += src.Created
+	dst.Removed += src.Removed
 }
 
 // Reconcile loads the durable config and applies Diff for every given agent.
@@ -372,9 +398,8 @@ func mergeResult(dst *Result, src Result) {
 // (DESIGN §2).
 //
 // Every per-entry and per-agent failure is isolated into Failed rather
-// than aborting the pass mid-loop (finding I3): a self-referential symlink
-// under the store making one agent's ScanAgent fail with ELOOP, or one
-// agent's skills directory being unreadable or a plain file, used to make
+// than aborting the pass mid-loop (finding I3): one agent's skills
+// directory being unreadable or a plain file used to make
 // *every* action for *every remaining agent* silently not happen --
 // including agents with nothing wrong with them -- because the loop
 // below returned on the first error it saw. That is the same isolation
@@ -626,6 +651,7 @@ func applyToAgent(st *store.Store, skillsRoot *os.Root, cfg *store.Config, a age
 				}
 				continue
 			}
+			res.Created++
 		case RemoveLink:
 			// An entry that has vanished since Diff looked is not a
 			// conflict (round 5 finding): there is nothing left to
@@ -669,6 +695,12 @@ func applyToAgent(st *store.Store, skillsRoot *os.Root, cfg *store.Config, a age
 				}
 				res.Conflicts = append(res.Conflicts, conflict)
 				continue
+			}
+			if outcome == linkRetireRemoved {
+				// linkRetireAbsent is deliberately not counted: the link was
+				// already gone when apply looked, so this pass changed
+				// nothing at that name and has no effect to announce.
+				res.Removed++
 			}
 		case ReportConflict:
 			res.Conflicts = append(res.Conflicts, act)

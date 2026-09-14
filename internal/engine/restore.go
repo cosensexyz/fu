@@ -246,6 +246,26 @@ func Restore(st *store.Store, agents []agent.Agent, hard bool) (outcome RestoreO
 		// recovery finding silently dropped by a replacement it knows nothing
 		// about -- is silent by construction.
 		reconcileResult.Warnings = carryWarningsForward(outcome.Result.Warnings, reconcileResult.Warnings)
+		// The delivery counters are carried across for the same reason the
+		// warnings are, and the reason is stronger here: they record what this
+		// command did rather than what the store now holds, and the second
+		// pass provably cannot regenerate them -- a link the first pass
+		// created is in place by the time the second looks, so the second
+		// counts nothing. Replacing them made `fu restore --hard` rebuild a
+		// link and then tell the user nothing takes effect in a new session.
+		//
+		// Summing rather than netting leaves one case where the sentence is
+		// printed for no visible change: an uncommitted fu.yaml enabling a
+		// skill makes the first pass create the link and the reset makes the
+		// second pass remove it again, so Created and Removed are both 1 and
+		// a new session sees what it saw before. Accepted rather than netted,
+		// because the counters are per-agent totals with no name attached --
+		// netting them would equally cancel a link created for one agent
+		// against a different link removed for another, which is two real
+		// changes. Over-printing the sentence in one narrow case costs a
+		// pointless restart; cancelling two real changes hides them.
+		reconcileResult.Created += outcome.Result.Created
+		reconcileResult.Removed += outcome.Result.Removed
 		outcome.Result = reconcileResult
 		return err
 	})

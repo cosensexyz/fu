@@ -77,6 +77,13 @@ type ToggleOutcome struct {
 	DeliveryBlocked bool
 }
 
+// AgentsOutcome is `fu agent`'s whole result: one row per adapter fu knows
+// about, plus the config-level diagnostics every read-only command carries.
+type AgentsOutcome struct {
+	Agents      []AgentOverview
+	Diagnostics ReadDiagnostics
+}
+
 func (a *Application) home() (string, error) {
 	return store.Home()
 }
@@ -91,6 +98,14 @@ func (a *Application) openStore() (*store.Store, error) {
 
 func (a *Application) detectedAgents() []agent.Agent {
 	return agent.Detected()
+}
+
+// knownAgents is every adapter fu ships, detected or not. Only `fu agent`
+// uses it: naming an agent fu supports but that is not installed here is that
+// command's job, and letting an undetected agent anywhere near a command that
+// projects or reads a projection would contradict SPEC rule 4.
+func (a *Application) knownAgents() []agent.Agent {
+	return agent.All()
 }
 
 func (a *Application) Initialize() (InitOutcome, error) {
@@ -279,6 +294,23 @@ func inspectedAgents(agents []agent.Agent, report StatusReport) []agent.Agent {
 		}
 	}
 	return kept
+}
+
+// Agents describes every adapter fu knows about. Read-only: no lock, and no
+// directory is created for an agent that has none (SPEC rule 4, §9).
+func (a *Application) Agents() (AgentsOutcome, error) {
+	st, cfg, err := a.readStore()
+	if err != nil {
+		return AgentsOutcome{}, err
+	}
+	// nil agents, like ListSkills, ShowSkill and Outdated: the agent-level
+	// suppression in readDiagnostics stands down in favour of a per-agent
+	// reserved finding, and this command reports none -- agentOverview
+	// discards Desired's reserved and invalid findings deliberately. Passing
+	// the inspected agents instead suppressed the config-level `invalid:`
+	// line in favour of a report that never happens, leaving a name that is
+	// both reserved and invalid mentioned on neither stream.
+	return AgentsOutcome{Agents: AgentOverviews(st, cfg, a.knownAgents()), Diagnostics: readDiagnostics(st, cfg, nil)}, nil
 }
 
 func (a *Application) ListSkills() (ListOutcome, error) {

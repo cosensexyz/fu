@@ -74,6 +74,12 @@ func newCommitCmd(app commitApplication) *cobra.Command {
 				// "there was nothing left to record" would be a guess.
 				fmt.Fprintln(out, "your -m message was not recorded: there was nothing left to commit under it")
 			}
+			// commit reconciles like every other write command, so a hand
+			// edit to fu.yaml that it records can take a link away in the
+			// same run. Printed even after "nothing to commit", which speaks
+			// only about history: the reconcile still ran, and if it moved a
+			// link the two sentences are both true.
+			printDeliveryHint(out, outcome.Result)
 			return nil
 		},
 	}

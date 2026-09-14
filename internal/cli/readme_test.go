@@ -26,6 +26,7 @@ import (
 // search below to match.
 var readmeVerbatimCliLines = []string{
 	"restored agent links",
+	"takes effect in new agent sessions",
 	"record them with `fu commit`",
 	"the store worktree was left alone; these changes are not committed:",
 	"these are untracked or ignored, so no restore touches them:",

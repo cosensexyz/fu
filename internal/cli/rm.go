@@ -30,7 +30,7 @@ func newRmCmd(app rmApplication) *cobra.Command {
 			// line later.
 			printDurableOutcome(cmd, "remove", outcome.Operation)
 			printResult(cmd, outcome.Operation.Reconcile)
-			fmt.Fprintf(cmd.OutOrStdout(), "removed %s\n", name)
+			fmt.Fprintf(cmd.OutOrStdout(), "removed %s%s\n", name, hintSuffix(outcome.Operation.Reconcile))
 			return err
 		},
 	}

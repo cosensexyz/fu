@@ -34,7 +34,7 @@ func newNewCmd(app newApplication) *cobra.Command {
 			printDurableOutcome(cmd, "create", outcome)
 			printResult(cmd, outcome.Reconcile)
 			if !outcome.RecoveryPending {
-				fmt.Fprintf(cmd.OutOrStdout(), "created %s\n", args[0])
+				fmt.Fprintf(cmd.OutOrStdout(), "created %s%s\n", args[0], hintSuffix(outcome.Reconcile))
 			}
 			return err
 		},

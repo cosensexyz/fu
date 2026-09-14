@@ -30,6 +30,7 @@ func newCloneCmd(app cloneApplication) *cobra.Command {
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "cloned store to %s from %s (%d skill(s))\n",
 				filepath.Join(outcome.Home, "store"), outcome.URL, outcome.Skills)
+			printDeliveryHint(cmd.OutOrStdout(), outcome.Result)
 			return nil
 		},
 	}

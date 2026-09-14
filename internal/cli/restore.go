@@ -39,6 +39,7 @@ func newRestoreCmd(app restoreApplication) *cobra.Command {
 				return err
 			}
 			fmt.Fprintln(out, "restored agent links")
+			printDeliveryHint(out, outcome.Result)
 			printRefusedPaths(errOut, outcome.Refused)
 			printKeptPaths(errOut, outcome.Left)
 			return nil

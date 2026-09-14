@@ -87,16 +87,27 @@ func newToggleCmd(app toggleApplication, use string, on bool) *cobra.Command {
 			// never see the stderr diagnostics that say so. Softening the
 			// wording keeps the confirmation honest on its own, whether or
 			// not the diagnostics above are visible to whoever reads it.
+			//
+			// A switch that changed no link gets neither sentence. Enabling
+			// a skill that is already on and already linked is the common
+			// case here, and "takes effect in new agent sessions" told the
+			// user to restart an agent that would look exactly the same
+			// afterwards. The counts, not the command, decide (see
+			// deliveryHint); DeliveryBlocked still overrides them, because a
+			// blocked target is worth saying even when the pass moved
+			// nothing for it.
 			out := cmd.OutOrStdout()
+			scope := "globally"
+			if cmd.Flags().Changed("agent") {
+				scope = "for " + agentName
+			}
 			switch {
-			case cmd.Flags().Changed("agent") && outcome.DeliveryBlocked:
-				fmt.Fprintf(out, "%s %s for %s; may not take effect -- see diagnostics\n", verb, args[0], agentName)
-			case cmd.Flags().Changed("agent"):
-				fmt.Fprintf(out, "%s %s for %s; takes effect in new agent sessions\n", verb, args[0], agentName)
+			case outcome.DeliveryBlocked && cmd.Flags().Changed("agent"):
+				fmt.Fprintf(out, "%s %s %s; may not take effect -- see diagnostics\n", verb, args[0], scope)
 			case outcome.DeliveryBlocked:
-				fmt.Fprintf(out, "%s %s globally; may not take effect for every agent -- see diagnostics\n", verb, args[0])
+				fmt.Fprintf(out, "%s %s %s; may not take effect for every agent -- see diagnostics\n", verb, args[0], scope)
 			default:
-				fmt.Fprintf(out, "%s %s globally; takes effect in new agent sessions\n", verb, args[0])
+				fmt.Fprintf(out, "%s %s %s%s\n", verb, args[0], scope, hintSuffix(outcome.Operation.Reconcile))
 			}
 			return err
 		},

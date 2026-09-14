@@ -70,8 +70,19 @@ func newAddCmd(app addApplication) *cobra.Command {
 			// drop it -- and they are the exits where the user aborted, which
 			// is exactly when a recovery-boundary finding matters most (round
 			// 18 finding M18, same defect class in adopt).
-			if err := plan.NoCandidates(); err != nil {
+			//
+			// They carry its effect out too. The prologue is a full write
+			// command prologue: it projects the links an agent detected since
+			// the last write command was owed, and it has already done so by
+			// the time the user aborts. `nothing selected; nothing installed`
+			// is true about the source and false about the agent directories,
+			// and the run exits 0, so nothing else would ever mention it.
+			reportPrologue := func() {
 				printResult(cmd, plan.Prologue())
+				printDeliveryHint(cmd.OutOrStdout(), plan.Prologue())
+			}
+			if err := plan.NoCandidates(); err != nil {
+				reportPrologue()
 				return err
 			}
 			selected, err := selectCandidates(cmd, cands, all)
@@ -80,11 +91,11 @@ func newAddCmd(app addApplication) *cobra.Command {
 				// around it: the user's selection was refused, nothing was
 				// installed, and the prologue's recovery-boundary findings
 				// would otherwise be lost.
-				printResult(cmd, plan.Prologue())
+				reportPrologue()
 				return err
 			}
 			if len(selected) == 0 {
-				printResult(cmd, plan.Prologue())
+				reportPrologue()
 				fmt.Fprintln(cmd.ErrOrStderr(), "nothing selected; nothing installed")
 				return plan.NoSelection()
 			}
@@ -105,6 +116,7 @@ func newAddCmd(app addApplication) *cobra.Command {
 				printDurableOutcome(cmd, "add", operation)
 			}
 			printResult(cmd, outcome.Reconcile)
+			printDeliveryHint(cmd.OutOrStdout(), outcome.Reconcile)
 			return err
 		},
 	}

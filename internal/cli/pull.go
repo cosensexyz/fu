@@ -38,6 +38,7 @@ func newPullCmd(app pullApplication) *cobra.Command {
 			default:
 				fmt.Fprintf(out, "fast-forwarded %s %s..%s, %d path(s) changed\n", outcome.Branch, outcome.From, outcome.To, len(outcome.Changed))
 			}
+			printDeliveryHint(out, outcome.Result)
 			return err
 		},
 	}

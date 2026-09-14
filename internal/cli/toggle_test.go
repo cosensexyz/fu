@@ -446,6 +446,10 @@ func TestToggleAgentEmptyStringRejectedNotGlobal(t *testing.T) {
 // pre-fix: `fu enable writer` and `fu disable writer` both produced
 // empty output on success -- no confirmation the write happened, no
 // indication of when it takes effect.
+//
+// Both toggles below change a link, which is what the timing sentence is
+// about. A switch that changes nothing gets the confirmation without it --
+// see TestToggleDoesNotClaimEffectWhenNoLinkChanged.
 func TestToggleCommandsConfirmChangeAndTiming(t *testing.T) {
 	fuHome, home := t.TempDir(), t.TempDir()
 	t.Setenv("FU_HOME", fuHome)
@@ -453,6 +457,7 @@ func TestToggleCommandsConfirmChangeAndTiming(t *testing.T) {
 	mustMkdirAll(t, filepath.Join(home, ".claude"))
 	runCmd(t, "init")
 	runCmd(t, "new", "alpha")
+	runCmd(t, "disable", "alpha")
 
 	out, err := runCmd(t, "enable", "alpha")
 	if err != nil {

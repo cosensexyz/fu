@@ -47,6 +47,7 @@ func newRevertCmd(app revertApplication) *cobra.Command {
 				return err
 			}
 			fmt.Fprintf(out, "reverted %d operation(s)\n", n)
+			printDeliveryHint(out, outcome.Result)
 			return nil
 		},
 	}
