@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/cosensexyz/fu/internal/agent"
@@ -27,6 +28,12 @@ type StatusReport struct {
 // same four buckets recovery does, though not the same four: staging holds no
 // authority SPEC §9 promises, so there is no Retained bucket, and Unmatched
 // takes its place -- a bucket recovery has no counterpart for.
+//
+// Since leases exist, three of these buckets take their verdict from evidence
+// rather than from a name: a leased object is classified by store.ScanLeases,
+// the same function `fu gc` uses, so a count here is one gc will honour.
+// What follows describes the older, name-based half, which still decides every
+// entry no lease accounts for.
 //
 // Collectable was not always one of these, and the other three still cover
 // far more ground: until update learned to leave the tree it replaced
@@ -67,12 +74,22 @@ type StagingInventory struct {
 	// pending transaction's live tree exactly. It is Blocked, because a
 	// recovery pass is what settles it.
 	Collectable int
+	// Notes explains the Uncollectable entries a lease could speak for. It is
+	// not a parallel array: only refusals a lease witnessed carry a reason, so
+	// there are usually fewer notes than the count.
+	Notes []StagingNote
 	// Blocked counts entries a recovery pass settles: a pending transaction's
 	// published staged root and its private reservation, and a pending config
 	// exchange's candidate and active swap name. RecoverPending and
 	// RecoverConfigExchanges run from every write command and from
 	// `fu restore`, never from `fu gc`.
 	Blocked int
+	// InUse counts entries a live process is still working in, proved by a
+	// held lease. It is deliberately not folded into Blocked: those two states
+	// have opposite remedies. A blocked entry waits on a recovery pass the
+	// user can run; an in-use one waits on another process to finish, and
+	// telling that user to run `fu restore` sends them to do nothing.
+	InUse int
 	// Uncollectable counts what nothing collects today. This is the gap
 	// DESIGN §6 records as still open for source scratch: reporting it is the
 	// half that can be delivered without ownership evidence, and offering to
@@ -90,6 +107,37 @@ type StagingInventory struct {
 	// been refused and runs `fu status` to find out what is in the way used to
 	// see nothing at all.
 	Unmatched int
+}
+
+// Empty reports whether the inventory has anything to say. A plain == against
+// a zero value stopped compiling when Notes arrived; naming the question is
+// better than reaching for reflect to keep the old spelling.
+func (s StagingInventory) Empty() bool {
+	return s.Collectable == 0 && s.Blocked == 0 && s.InUse == 0 &&
+		s.Uncollectable == 0 && s.Unmatched == 0 && len(s.Notes) == 0
+}
+
+// noteRefusal records why one entry was refused, when the classifier had a
+// reason to give. Silent otherwise: a bucket line with no explanation is the
+// old behaviour, not a regression, and inventing one would be worse.
+func (s *StagingInventory) noteRefusal(name, reason string) {
+	if reason == "" {
+		return
+	}
+	s.Notes = append(s.Notes, StagingNote{Name: name, Reason: reason})
+}
+
+// StagingNote explains one staging entry fu refused to account for.
+//
+// The Uncollectable bucket is the only one with no remedy, which makes the
+// explanation the whole of what fu can offer about it. The classifier computes
+// one for every refusal -- "another object now stands at the leased name",
+// "lease file name does not derive from its own token" -- and until now threw
+// them all away, while `fu gc` told the user `fu status` would name them and
+// `fu status` printed a bare count.
+type StagingNote struct {
+	Name   string
+	Reason string
 }
 
 // AgentStatus carries one agent's reality as scanned, plus the drift between
@@ -321,6 +369,21 @@ var (
 	// Close's quarantine (source/scratch.go) -- because the distinction between
 	// them matters to the process that made them and not to a reader who can
 	// act on none of them.
+	//
+	// These prefixes now describe a smaller set than they once did, but not an
+	// emptying one. A source scratch, a clone scratch or a private staged root
+	// made since leases exist is accounted for by one, and the switch diverts
+	// it to the collector's own verdict before reaching here; those three
+	// shrink to what predates the mechanism, which nothing recorded and for
+	// which nothing may invent an owner.
+	//
+	// The rest are still being produced. ".fu-config-candidate-" and
+	// ".fu-config-swap" come from the config exchange (store/config_exchange.go,
+	// store/config.go), which takes no lease, and ".fu-retired-staging-" from
+	// the reservation rollback's double-fault path, whose name is derived from
+	// a digest rather than a token and so is unresolvable either way (DESIGN
+	// §6). Saying the whole set drains would be a promise about three prefixes
+	// no code yet keeps.
 	//
 	// ".fu-new-" and ".fu-config-candidate-" appear here as well as in the
 	// claimed set below, and the order of the switch is what separates the two
@@ -1305,11 +1368,70 @@ func Status(st *store.Store, cfg *store.Config, agents []agent.Agent) (StatusRep
 	for _, name := range store.PendingConfigExchangeStagingNames(pendingExchangeNames) {
 		stagingClaims[name] = true
 	}
+	// Leases are read before the walk, and the walk defers to them, because a
+	// leased object's bucket is the collector's answer rather than this
+	// function's: `fu gc` reaches the same verdict through the same classifier
+	// (store.ScanLeases), so a count promised here is one gc will honour.
+	//
+	// Only names a lease actually accounts for are diverted. Residue that
+	// predates the mechanism still falls through to the prefix arms below,
+	// where it is reported as what it is -- something nothing collects, and
+	// nothing may invent an owner for.
+	// The claims go in, because a lease verdict alone is not what gc does: gc
+	// refuses a name a pending journal governs, whatever the lease says, and a
+	// report that called such a name collectable would send the user to run
+	// `fu gc` and watch the count not move. That is the exact failure the
+	// bucketing exists to prevent.
+	leased, leaseFiles, claimedLeases, leaseReasons, leaseErr := leasedStagingStates(st, stagingClaims)
+	if leaseErr != nil {
+		problems = append(problems, fmt.Errorf("read the staging leases: %w", leaseErr))
+	}
 	for _, name := range stagingNames {
 		switch {
-		// Claimed first: a name a pending record governs is settled by the next
-		// recovery pass, whatever shape it has. Testing residue first would
-		// report a transaction's own work in progress as permanent litter.
+		// A lease file is not residue: it is the record that explains one, and
+		// it shares its object's fate. Left to the arms below it would be
+		// counted a second time, under a bucket that describes the evidence
+		// rather than the thing.
+		case leaseFiles[name] == store.LeaseInUse:
+			report.Staging.InUse++
+		case leaseFiles[name] == store.LeaseCollectable:
+			report.Staging.Collectable++
+		case leaseFiles[name] == store.LeaseUnaccountable:
+			report.Staging.Uncollectable++
+			report.Staging.noteRefusal(name, leaseReasons[name])
+		// A lease whose verdict was suppressed because the journal claims its
+		// object. It waits on the same recovery pass the object does.
+		case claimedLeases[name]:
+			report.Staging.Blocked++
+		// Any remaining lease file. Reaching here means the directory walk saw
+		// it and the lease scan did not produce a verdict for it, which is what
+		// another fu process releasing its lease between the two looks like:
+		// the file is gone. Counted nowhere, because the arms below would
+		// describe fu's own evidence as an entry fu has no pending record for
+		// -- alarming, and about a file that no longer exists.
+		//
+		// Not covered by a test: the state lives between two listings inside
+		// one Status call, and there is no seam to stand in it from this
+		// package. The store-side equivalent is pinned
+		// (TestReclaimRemovesNothingWhenALeaseVanishesAfterItsRecordIsRead);
+		// adding an exported seam to store for this one transient count would
+		// cost more than the misreport does.
+		case strings.HasPrefix(name, store.LeasePrefix):
+		// A lease's verdict next: it is evidence, and every arm below is an
+		// inference from a name. Evidence outranks inference. A name no lease
+		// covers yields LeaseStateUnset and matches none of these, which is
+		// the whole reason that value exists.
+		case leased[name] == store.LeaseInUse:
+			report.Staging.InUse++
+		case leased[name] == store.LeaseCollectable:
+			report.Staging.Collectable++
+		case leased[name] == store.LeaseUnaccountable:
+			report.Staging.Uncollectable++
+			report.Staging.noteRefusal(name, leaseReasons[name])
+		// Claimed first among the inferences: a name a pending record governs
+		// is settled by the next recovery pass, whatever shape it has. Testing
+		// residue first would report a transaction's own work in progress as
+		// permanent litter.
 		case stagingClaims[name]:
 			report.Staging.Blocked++
 		// The tree a completed, unpruned update family replaced -- present
@@ -1447,4 +1569,66 @@ func remoteStatus(st *store.Store) *RemoteStatus {
 	}
 	status.Relation = relationFromStore(comparison.Relation)
 	return status
+}
+
+// leasedStagingStates maps each leased object under staging to the state its
+// lease puts it in.
+//
+// A lease covers a name only while its evidence accounts for it: a lease whose
+// object is gone covers nothing, and contributes no entry here. The map is
+// keyed by the spelling the object currently wears, which is what the caller's
+// directory walk found.
+//
+// It also counts the leases whose objects are already gone, since those are
+// collectable in their own right -- `fu gc` removes the record -- and a status
+// that omitted them would promise fewer reclaimable things than gc performs.
+func leasedStagingStates(st *store.Store, claimed map[string]bool) (objects, leases map[string]store.LeaseState, claimedLeases map[string]bool, reasons map[string]string, err error) {
+	// Partial findings are kept even on error, for the same reason the scan
+	// keeps going: losing every verdict it had already reached because of one
+	// bad lease file leaves the report worse than it was before leases
+	// existed. The error still reaches the caller and becomes a reported
+	// problem.
+	findings, err := store.ScanLeases(st.StagingDir())
+	objects = make(map[string]store.LeaseState, len(findings))
+	leases = make(map[string]store.LeaseState, len(findings))
+	claimedLeases = make(map[string]bool)
+	reasons = make(map[string]string)
+	for _, finding := range findings {
+		if finding.State == store.LeaseCollectable && claimed[finding.Name] {
+			// gc will refuse this one: the journal governs the name and a
+			// recovery pass settles it. Reporting it as collectable would
+			// promise something gc declines to do -- and the lease file has to
+			// follow the object, or the count splits across two buckets for
+			// one thing.
+			objects[finding.Name] = store.LeaseStateUnset
+			leases[filepath.Base(finding.LeasePath)] = store.LeaseStateUnset
+			// Suppressing the verdict is not the same as having no record.
+			// Left at that, the lease file matched no arm of the caller's
+			// switch and fell to the one for names fu has no pending record
+			// for -- said about fu's own evidence, for a record that exists and
+			// is the very reason the verdict was suppressed. It shares the
+			// object's fate, and the object's fate here is the journal's.
+			claimedLeases[filepath.Base(finding.LeasePath)] = true
+			continue
+		}
+		leases[filepath.Base(finding.LeasePath)] = finding.State
+		if finding.Reason != "" {
+			// Keyed under both spellings the caller may meet it by: a refusal
+			// whose object resolved is reported against the object, and one
+			// that never got that far against the lease file itself.
+			reasons[filepath.Base(finding.LeasePath)] = finding.Reason
+			if finding.Name != "" {
+				reasons[finding.Name] = finding.Reason
+			}
+		}
+		if finding.Name == "" {
+			// The lease outlived its object -- nothing under staging carries
+			// its token -- so the directory walk finds nothing to attribute
+			// this verdict to. The lease file itself carries it, and removing
+			// that file is what settles the run.
+			continue
+		}
+		objects[finding.Name] = finding.State
+	}
+	return objects, leases, claimedLeases, reasons, err
 }

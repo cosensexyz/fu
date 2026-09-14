@@ -119,12 +119,97 @@ func (a *Application) Initialize() (InitOutcome, error) {
 	return InitOutcome{Home: home}, nil
 }
 
+// PruneRecovery reclaims what fu can prove it may: the journal families a
+// completed transaction no longer needs, and the temporary objects whose
+// leases show their holders are gone.
+//
+// It is the one command that proceeds without a store. Every other refuses,
+// because without a store there is nothing for it to act on -- but gc's whole
+// job is reclamation, and the residue an interrupted `fu clone` leaves exists
+// exactly when no store does. Refusing to collect it because the home is
+// half-built would leave the one leftover no other command can reach. So a
+// missing store costs the journal half and is reported, rather than costing
+// the command.
 func (a *Application) PruneRecovery() (PruneOutcome, error) {
-	st, err := a.openStore()
+	home, err := a.home()
 	if err != nil {
 		return PruneOutcome{}, err
 	}
-	return PruneCompletedTransactions(st)
+	// The store is opened first so the sweep can be told which names a pending
+	// transaction still governs. A leased object is journalled before its lease
+	// is dropped, and reclaiming one inside that window leaves the journal
+	// naming a root that is gone -- a state no recovery pass repairs and every
+	// later command trips over.
+	//
+	// A store that is absent is not an error here: the sweep runs with no
+	// claims, which is exactly right, since there is no journal to contradict.
+	// A store that is present but unreadable is, because then claims exist and
+	// cannot be read, and sweeping blind is the thing this guards against.
+	st, openErr := a.openStore()
+	switch {
+	case errors.Is(openErr, store.ErrStoreNotFound):
+		outcome, sweepErr := reclaimStagingLeases(home, nil)
+		outcome.StoreSkipped = true
+		return outcome, sweepErr
+	case openErr != nil:
+		return PruneOutcome{}, openErr
+	}
+	// Both under fu.lock, and both inside the same one. Reading the claims and
+	// then sweeping is only atomic with respect to a live writer if no writer
+	// can journal a reservation in between -- and a writer holds this very
+	// lock across its journal write. Outside it, a reservation journalled
+	// after the read is unprotected by a claim set that predates it, which is
+	// the state the claim check exists to prevent. Every other sweep in `fu
+	// gc` computes its claims inside this lock for the same reason; this one
+	// was the exception twice over.
+	outcome, sweepErr := a.sweepStagingUnderLock(st, home)
+	pruned, pruneErr := PruneCompletedTransactions(st)
+	outcome.Transactions = pruned.Transactions
+	outcome.Files = pruned.Files
+	return outcome, errors.Join(sweepErr, pruneErr)
+}
+
+// sweepStagingUnderLock reads the pending claims and reclaims the staging
+// leases without releasing fu.lock between the two.
+func (a *Application) sweepStagingUnderLock(st *store.Store, home string) (outcome PruneOutcome, retErr error) {
+	session, err := st.BeginWrite()
+	if err != nil {
+		return PruneOutcome{}, fmt.Errorf("open checked staging-sweep session: %w", err)
+	}
+	defer func() { retErr = errors.Join(retErr, session.Close()) }()
+	homeRoot, err := session.Store.Root()
+	if err != nil {
+		return PruneOutcome{}, err
+	}
+	lockErr := withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
+		pending, err := PendingTxns(session.Store)
+		if err != nil {
+			return fmt.Errorf("read the pending transactions before sweeping staging: %w", err)
+		}
+		var sweepErr error
+		outcome, sweepErr = reclaimStagingLeases(home, pendingStagingClaims(pending))
+		return sweepErr
+	})
+	return outcome, lockErr
+}
+
+// reclaimStagingLeases runs the lease sweep against a home's staging area,
+// whether or not a store was ever built there.
+func reclaimStagingLeases(home string, claimed map[string]bool) (PruneOutcome, error) {
+	staging := filepath.Join(home, "staging")
+	reclaimed, err := store.ReclaimLeases(staging, claimed)
+	notes := make([]StagingNote, 0, len(reclaimed.Refusals))
+	for _, refusal := range reclaimed.Refusals {
+		notes = append(notes, StagingNote{Name: refusal.Name, Reason: refusal.Reason})
+	}
+	return PruneOutcome{
+		PayloadNotes:          notes,
+		Payloads:              reclaimed.Objects,
+		Leases:                reclaimed.Leases,
+		PayloadsInUse:         reclaimed.InUse,
+		PayloadsUnaccountable: reclaimed.Unaccountable,
+		PayloadsClaimed:       reclaimed.Claimed,
+	}, err
 }
 
 // readDiagnostics collects the config-level findings every read command

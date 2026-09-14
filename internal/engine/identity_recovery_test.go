@@ -15,10 +15,14 @@ func TestPublishedReservationRecoveryJournalsTheLiveManifest(t *testing.T) {
 	}
 	defer session.Close()
 	st := session.Store
-	reservation, err := st.ReserveStagedRootOwned(0o755)
+	reservation, reservationLease, err := st.ReserveStagedRootOwned(0o755)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Production releases the lease once the journal names the root; these
+	// tests do not journal, so they stand in for that here.
+	defer reservationLease.Release(st.StagingDir())
 	live, err := st.PublishStagedRootOwned(reservation, "alpha")
 	if err != nil {
 		t.Fatal(err)

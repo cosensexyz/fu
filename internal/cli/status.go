@@ -258,10 +258,25 @@ func plural(n int, one, many string) string {
 }
 
 // printStagingSection reads like the recovery section with one line's worth of
-// difference, which is the whole point of keeping them apart. `fu gc` reaches
-// staging for exactly one residue class -- the tree a completed update family
-// left behind (StagingInventory.Collectable) -- so that one line is worded
+// difference, which is the whole point of keeping them apart. Everything `fu
+// gc` reaches under staging arrives in StagingInventory.Collectable -- once
+// only the tree a completed update family left behind, now also every abandoned
+// temporary payload a lease accounts for -- so that one line is worded
 // identically to recovery's own collectable line.
+//
+// These counts are staging entries, not payloads: a reclaimable payload is two
+// of them, its record and its object, which is why `fu gc` reports one payload
+// where this reports two. When everything collectable is leased, the arithmetic
+// holds exactly -- gc's reclaimed payloads plus its settled records equal what
+// this counted, which is the design's own acceptance criterion.
+//
+// It stops being exact when the bucket also holds the tree a completed update
+// family left behind. That is collectable too and `fu gc` does reclaim it, but
+// PruneOutcome carries no count for it: it is a directory removed whole against
+// its manifest by a primitive whose signature is not worth widening for one
+// line of output (see gc.go). So a home holding both reports three collectable
+// and hears about two. Stated rather than silently promised, because the
+// promise is what makes a user re-run a command to watch a number.
 //
 // The waiting line stops at `fu restore` rather than repeating recovery's "then
 // `fu gc`", and that is a choice about what to promise rather than a statement
@@ -273,7 +288,7 @@ func plural(n int, one, many string) string {
 // that turns out to do nothing is the "run a command and watch a count not
 // move" failure this whole section exists to avoid.
 func printStagingSection(out io.Writer, inventory engine.StagingInventory) bool {
-	if inventory == (engine.StagingInventory{}) {
+	if inventory.Empty() {
 		return false
 	}
 	fmt.Fprintln(out, "staging")
@@ -283,11 +298,30 @@ func printStagingSection(out io.Writer, inventory engine.StagingInventory) bool 
 	if inventory.Blocked != 0 {
 		fmt.Fprintf(out, "  %d waiting on an unfinished write (run `fu restore`)\n", inventory.Blocked)
 	}
+	if inventory.InUse != 0 {
+		// Its own line, because the remedy is the opposite of the one above:
+		// nothing to run, and nothing to fix. Another fu process is working
+		// here and will clear up after itself.
+		fmt.Fprintf(out, "  %d in use by another fu process (nothing to do; it clears up when that finishes)\n", inventory.InUse)
+	}
 	// Same deliberately inactionable wording as the recovery section's: this
 	// residue has no remedy today, so the line says what is accumulating and
 	// stops, rather than implying the reader may go delete it.
 	if inventory.Uncollectable != 0 {
 		fmt.Fprintf(out, "  %d that no command collects yet\n", inventory.Uncollectable)
+		// Named, with the reason, wherever fu has one. This is the bucket with
+		// no remedy, so the explanation is the whole of what can be offered
+		// about it. This printed a bare count while `fu gc` pointed here for
+		// the names, which is how a user asking "why can fu not account for
+		// this?" got a number back. gc names its own refusals now -- it has
+		// to, since it runs in homes where this command exits 1 -- so the two
+		// say the same thing from wherever the user happens to be standing.
+		//
+		// Only entries a lease witnessed carry a reason, so this lists fewer
+		// than the count above whenever older lease-less residue is present.
+		for _, note := range inventory.Notes {
+			fmt.Fprintf(out, "    %s: %s\n", note.Name, note.Reason)
+		}
 	}
 	// This one does have a remedy, and it is not fu's to perform: the content
 	// belongs to whoever put it there. The line exists so a user whom `fu new`,

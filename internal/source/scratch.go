@@ -30,6 +30,12 @@ type ownedScratch struct {
 	parentIDAt func(int) (store.FileIdentity, unix.Stat_t, error)
 	quarantine string
 	closed     bool
+	// lease is the durable evidence that this directory is fu's, written
+	// before the directory exists and held for its whole life. Every cleanup
+	// path in this file is an in-process defer, so a process exit is exactly
+	// what leaves residue behind -- and without the lease nothing later can
+	// prove that residue was ever fu's to remove (DESIGN §6).
+	lease *store.Lease
 }
 
 type scratchCleanupHooks struct {
@@ -96,10 +102,26 @@ func newOwnedScratchWithIdentityHooks(stagingDir string, expected store.FileIden
 	}
 	parentID := parentIdentity
 
-	name, err := newScratchName(".fu-src-")
+	name, err := newScratchName(store.SourceScratchPrefix)
 	if err != nil {
 		return nil, err
 	}
+	// Before the directory, deliberately: a crash in between then leaves a
+	// record of what fu was about to do, which is what makes the leftover
+	// collectable instead of a directory nobody can account for.
+	lease, err := store.AcquireLease(parentPath, store.LeaseSourceScratch, name)
+	if err != nil {
+		return nil, fmt.Errorf("reserve source scratch: %w", err)
+	}
+	defer func() {
+		if retErr != nil {
+			// Only if the cleanup above actually removed the directory. A
+			// failed cleanup leaves it on disk, and dropping the record there
+			// would manufacture the unaccounted residue this lease exists to
+			// prevent.
+			_ = lease.ReleaseIfObjectGone(parentPath)
+		}
+	}()
 	if err := unix.Mkdirat(parentFD, name, 0o700); err != nil {
 		return nil, fmt.Errorf("create source scratch directory: %w", err)
 	}
@@ -125,6 +147,10 @@ func newOwnedScratchWithIdentityHooks(stagingDir string, expected store.FileIden
 	createdIdentity, _, inspectErr := inspectCreated(parentFD, name)
 	if inspectErr != nil {
 		return nil, fmt.Errorf("inspect created source scratch directory: %w", inspectErr)
+	}
+	// The lease can now prove what it made, not merely what it intended.
+	if err := lease.AttachIdentity(parentPath, createdIdentity); err != nil {
+		return nil, err
 	}
 	if hooks.afterMkdir != nil {
 		if err := hooks.afterMkdir(parentFD, name); err != nil {
@@ -180,7 +206,7 @@ func newOwnedScratchWithIdentityHooks(stagingDir string, expected store.FileIden
 	return &ownedScratch{
 		parent: parent, rootDir: rootDir, root: root,
 		parentPath: parentPath, name: name, path: path, parentID: parentID, identity: identity,
-		parentIDAt: captureParentIdentity,
+		parentIDAt: captureParentIdentity, lease: lease,
 	}, nil
 }
 
@@ -202,8 +228,12 @@ func cleanupUnidentifiedEmptyScratch(parent *os.File, parentPath, name string) e
 // never the object removed by cleanup.
 func cleanupCreatedScratch(parent *os.File, parentPath, name string, expected store.FileIdentity, beforeRemove func(string) error) error {
 	defer keepScratchDescriptorOwnersAlive(parent)
-	retired, err := store.RetireNameAt(parent, name, ".fu-src-orphan-")
-	if err != nil {
+	// Same token as the live name, for the reason the quarantine rename in
+	// Close uses one: a lease matches on the token, so this rename needs no
+	// record rewrite and opens no window. RetireNameAt's random name would
+	// have severed the object from its evidence.
+	retired := store.SourceScratchOrphanPrefix + store.LeaseTokenOf(name)
+	if err := store.RenameNoReplaceAt(parent, name, parent, retired); err != nil {
 		return fmt.Errorf("retire failed source scratch %s: %w", filepath.Join(parentPath, name), err)
 	}
 	moved, movedStat, err := store.EntryIdentityAt(int(parent.Fd()), retired)
@@ -271,10 +301,11 @@ func (s *ownedScratch) closeWithHooks(h scratchCleanupHooks) (retErr error) {
 		if err := s.validateNamed(s.name); err != nil {
 			return s.closeDescriptors(err)
 		}
-		quarantine, err := newScratchName(".fu-src-clean-")
-		if err != nil {
-			return s.closeDescriptors(err)
-		}
+		// The quarantine name carries the same token as the live name, so the
+		// lease still matches it without being rewritten. Rewriting would only
+		// move the window rather than close it: a crash between the rename and
+		// the rewrite leaves a record naming an object that has moved.
+		quarantine := store.SourceScratchCleanPrefix + s.lease.Token()
 		if h.beforeRootRetire != nil {
 			if err := h.beforeRootRetire(); err != nil {
 				return s.closeDescriptors(err)
@@ -308,6 +339,12 @@ func (s *ownedScratch) closeWithHooks(h scratchCleanupHooks) (retErr error) {
 	}
 	if err := unix.Unlinkat(int(s.parent.Fd()), s.quarantine, unix.AT_REMOVEDIR); err != nil {
 		return fmt.Errorf("remove quarantined source scratch directory: %w", err)
+	}
+	// Last, once there is nothing left for it to account for. A crash between
+	// the two leaves a lease naming an absent object, which the next
+	// reclamation settles by removing the lease alone.
+	if err := s.lease.Release(s.parentPath); err != nil {
+		return s.closeDescriptors(err)
 	}
 	return s.closeDescriptors(nil)
 }

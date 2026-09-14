@@ -194,10 +194,16 @@ func describeTransportError(err error) error {
 }
 
 // cloneScratchPrefix names the staging entry Clone fills before the rename
-// into place. engine/status.go lists it among the residue a process exit can
-// leave behind; nothing collects it, because no record could prove it is
-// fu's (the same reason .fu-src-* is left alone).
+// into place. A crash while it is being filled leaves it behind, and a lease
+// beside it is what lets a later run prove it was fu's and remove it -- the
+// evidence DESIGN §6 records as having been missing. It is also the one
+// residue fu can produce while no store exists at all, which is why `fu gc`
+// reaches staging without one.
 const cloneScratchPrefix = ".fu-clone-"
+
+// newCloneScratchName is the clone scratch's name, ending in the token its
+// lease matches on.
+func newCloneScratchName() (string, error) { return randomLeaseName(cloneScratchPrefix) }
 
 // cloneHooks is a test-only seam, like the hooks every other write path has.
 type cloneHooks struct {
@@ -230,12 +236,39 @@ func cloneWithHooks(ctx context.Context, home, url string, hooks cloneHooks) (*S
 			return nil, fmt.Errorf("create directory %s: %w", d, err)
 		}
 	}
-	scratch, err := os.MkdirTemp(s.StagingDir(), cloneScratchPrefix+"*")
+	// The name is generated here rather than by MkdirTemp so that it ends in a
+	// token the lease below can match on. MkdirTemp's suffix is its own, and a
+	// leased object has to carry its lease's token in its name.
+	scratchName, err := newCloneScratchName()
 	if err != nil {
-		return nil, fmt.Errorf("create clone scratch under %s: %w", s.StagingDir(), err)
+		return nil, err
+	}
+	// Before the directory, so that a crash in between leaves a record of what
+	// fu was about to do. This is the only residue fu can leave while no store
+	// exists at all, and until the lease there was nothing any later run could
+	// use to prove the leftover was fu's (DESIGN §6).
+	lease, err := AcquireLease(s.StagingDir(), LeaseCloneScratch, scratchName)
+	if err != nil {
+		return nil, fmt.Errorf("reserve clone scratch: %w", err)
+	}
+	scratch := filepath.Join(s.StagingDir(), scratchName)
+	if err := os.Mkdir(scratch, 0o700); err != nil {
+		return nil, errors.Join(fmt.Errorf("create clone scratch under %s: %w", s.StagingDir(), err), lease.ReleaseIfObjectGone(s.StagingDir()))
+	}
+	identity, _, err := EntryIdentityAt(atFDCWD, scratch)
+	if err != nil {
+		return nil, errors.Join(err, lease.ReleaseIfObjectGone(s.StagingDir()))
+	}
+	if err := lease.AttachIdentity(s.StagingDir(), identity); err != nil {
+		return nil, errors.Join(err, lease.ReleaseIfObjectGone(s.StagingDir()))
 	}
 	discard := func(err error) (*Store, error) {
-		return nil, errors.Join(err, os.RemoveAll(scratch))
+		// The lease goes after the directory, so a crash between them leaves a
+		// lease naming nothing, which the next reclamation settles by removing
+		// the lease alone.
+		// ReleaseIfObjectGone, not Release: when the removal above fails the
+		// scratch is still there, and the record has to stay with it.
+		return nil, errors.Join(err, os.RemoveAll(scratch), lease.ReleaseIfObjectGone(s.StagingDir()))
 	}
 	// MkdirTemp creates 0700; the directory becomes store/ and Init makes
 	// that 0755.
@@ -295,6 +328,15 @@ func cloneWithHooks(ctx context.Context, home, url string, hooks cloneHooks) (*S
 	}
 	if err := renameCloneIntoPlace(s.StagingDir(), filepath.Base(scratch), home); err != nil {
 		return discard(err)
+	}
+	// The scratch is now $FU_HOME/store and nothing under staging carries the
+	// token any more, so the lease covers nothing. Releasing it here is
+	// tidiness rather than correctness: a crash before this leaves a lease
+	// naming an object that is not there, which reclamation settles by
+	// removing the lease -- and must, since the store it became is not
+	// staging's to touch.
+	if err := lease.Release(s.StagingDir()); err != nil {
+		return nil, err
 	}
 	return Open(home)
 }

@@ -545,7 +545,7 @@ func TestStatusInventoriesStagingByWhatTheUserCanDo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (StagingInventory{Blocked: 4, Uncollectable: 5}); report.Staging != want {
+	if want := (StagingInventory{Blocked: 4, Uncollectable: 5}); !sameStagingInventory(report.Staging, want) {
 		t.Fatalf("staging inventory = %+v, want %+v", report.Staging, want)
 	}
 }
@@ -1103,7 +1103,7 @@ func TestStatusCountsUnmatchedStagingNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (StagingInventory{Uncollectable: 1, Unmatched: 1}); report.Staging != want {
+	if want := (StagingInventory{Uncollectable: 1, Unmatched: 1}); !sameStagingInventory(report.Staging, want) {
 		t.Fatalf("staging inventory = %+v, want %+v", report.Staging, want)
 	}
 }
@@ -1155,7 +1155,7 @@ func TestStatusCountsAnOrphanUpdateStagingPayloadAsCollectable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (StagingInventory{Collectable: 1}); report.Staging != want {
+	if want := (StagingInventory{Collectable: 1}); !sameStagingInventory(report.Staging, want) {
 		t.Fatalf("an orphaned update staging tree a completed family describes must be reported collectable: got %+v, want %+v", report.Staging, want)
 	}
 	// Read-only means read-only: status must not have touched the tree it is
@@ -1213,7 +1213,7 @@ func TestStatusDoesNotCountAnOrdinaryCompletedUpdateAsCollectable(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Staging != (StagingInventory{}) {
+	if !sameStagingInventory(report.Staging, StagingInventory{}) {
 		t.Fatalf("an already-reclaimed update family has nothing left to collect: got %+v, want zero value", report.Staging)
 	}
 }
@@ -1283,7 +1283,7 @@ func TestStatusCountsAnUpdateStagingRetiredRootAsCollectable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (StagingInventory{Collectable: 1}); report.Staging != want {
+	if want := (StagingInventory{Collectable: 1}); !sameStagingInventory(report.Staging, want) {
 		t.Fatalf("a retired root the manifest still describes is resumable, so Collectable: got %+v, want %+v", report.Staging, want)
 	}
 }
@@ -1823,7 +1823,7 @@ func TestStatusDoesNotCallAForeignStagingEntryCollectable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (StagingInventory{Unmatched: 1}); report.Staging != want {
+	if want := (StagingInventory{Unmatched: 1}); !sameStagingInventory(report.Staging, want) {
 		t.Fatalf("an entry fu cannot show is its own must not advertise `fu gc`: got %+v, want %+v", report.Staging, want)
 	}
 }
@@ -1883,7 +1883,85 @@ func TestStatusCallsAClaimedStagingNameBlockedNotCollectable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (StagingInventory{Blocked: 1}); report.Staging != want {
+	if want := (StagingInventory{Blocked: 1}); !sameStagingInventory(report.Staging, want) {
 		t.Fatalf("a staging name a pending transaction claims waits on recovery, not on gc: got %+v, want %+v", report.Staging, want)
+	}
+}
+
+// sameStagingInventory compares two inventories by their counts and by the
+// refusals they explain. A plain == stopped compiling when Notes arrived, and
+// spelling the comparison out keeps a test that means "these counts" from
+// silently also meaning "and no explanations", which is a different claim.
+func sameStagingInventory(got, want StagingInventory) bool {
+	if got.Collectable != want.Collectable || got.Blocked != want.Blocked ||
+		got.InUse != want.InUse || got.Uncollectable != want.Uncollectable ||
+		got.Unmatched != want.Unmatched {
+		return false
+	}
+	if len(got.Notes) != len(want.Notes) {
+		return false
+	}
+	for i := range got.Notes {
+		if got.Notes[i] != want.Notes[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestStagingInventoryEmptyCoversEveryReportedField is the same property as
+// TestResultEmptyCoversEveryReportedField, one type over, and for the same
+// reason: StagingInventory.Empty decides whether `fu status` prints a staging
+// section at all, and it was written only because adding Notes made the old
+// `inventory == (engine.StagingInventory{})` stop compiling.
+//
+// Notes is the field that needs this most. It is the one condition no other
+// test can reach on its own -- noteRefusal is only ever called beside
+// Uncollectable++, so a scene that produces a note produces a count too, and
+// dropping `len(s.Notes) == 0` is invisible everywhere else.
+func TestStagingInventoryEmptyCoversEveryReportedField(t *testing.T) {
+	cases := map[string]StagingInventory{
+		"collectable":   {Collectable: 1},
+		"blocked":       {Blocked: 1},
+		"in use":        {InUse: 1},
+		"uncollectable": {Uncollectable: 1},
+		"unmatched":     {Unmatched: 1},
+		"notes":         {Notes: []StagingNote{{Name: ".fu-src-x", Reason: "because"}}},
+	}
+	if !(StagingInventory{}).Empty() {
+		t.Fatal("a zero StagingInventory must be empty")
+	}
+	for name, inventory := range cases {
+		if inventory.Empty() {
+			t.Fatalf("an inventory carrying %s is not empty", name)
+		}
+	}
+}
+
+// And the comparison the converted tests rely on. A helper written to replace
+// `==` must be at least as strict as the `==` it replaced, or every test that
+// meant "exactly this inventory" quietly starts meaning less.
+func TestSameStagingInventoryComparesEveryReportedField(t *testing.T) {
+	base := StagingInventory{
+		Collectable: 1, Blocked: 2, InUse: 3, Uncollectable: 4, Unmatched: 5,
+		Notes: []StagingNote{{Name: ".fu-src-x", Reason: "because"}},
+	}
+	if !sameStagingInventory(base, base) {
+		t.Fatal("an inventory must equal itself")
+	}
+	differing := map[string]StagingInventory{
+		"collectable":   {Collectable: 9, Blocked: 2, InUse: 3, Uncollectable: 4, Unmatched: 5, Notes: base.Notes},
+		"blocked":       {Collectable: 1, Blocked: 9, InUse: 3, Uncollectable: 4, Unmatched: 5, Notes: base.Notes},
+		"in use":        {Collectable: 1, Blocked: 2, InUse: 9, Uncollectable: 4, Unmatched: 5, Notes: base.Notes},
+		"uncollectable": {Collectable: 1, Blocked: 2, InUse: 3, Uncollectable: 9, Unmatched: 5, Notes: base.Notes},
+		"unmatched":     {Collectable: 1, Blocked: 2, InUse: 3, Uncollectable: 4, Unmatched: 9, Notes: base.Notes},
+		"note count":    {Collectable: 1, Blocked: 2, InUse: 3, Uncollectable: 4, Unmatched: 5},
+		"note name":     {Collectable: 1, Blocked: 2, InUse: 3, Uncollectable: 4, Unmatched: 5, Notes: []StagingNote{{Name: ".fu-src-y", Reason: "because"}}},
+		"note reason":   {Collectable: 1, Blocked: 2, InUse: 3, Uncollectable: 4, Unmatched: 5, Notes: []StagingNote{{Name: ".fu-src-x", Reason: "other"}}},
+	}
+	for name, other := range differing {
+		if sameStagingInventory(base, other) {
+			t.Fatalf("inventories differing in %s must not compare equal", name)
+		}
 	}
 }

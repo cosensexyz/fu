@@ -397,7 +397,7 @@ func TestCloneScratchIsCountedAsUncollectableByStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (StagingInventory{Uncollectable: 1}); report.Staging != want {
+	if want := (StagingInventory{Uncollectable: 1}); !sameStagingInventory(report.Staging, want) {
 		t.Fatalf("a clone scratch must land in the bucket nothing collects, got %+v want %+v", report.Staging, want)
 	}
 }

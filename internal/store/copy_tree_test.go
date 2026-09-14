@@ -26,7 +26,7 @@ func TestReserveStagedRootOwnedCleansPrivateRootAfterSnapshotFailure(t *testing.
 	t.Cleanup(func() { _ = session.Close() })
 
 	want := errors.New("injected after mkdir")
-	_, err = session.Store.reserveStagedRootOwnedWithHooks(0o755, stagedRootReservationHooks{
+	_, _, err = session.Store.reserveStagedRootOwnedWithHooks(0o755, stagedRootReservationHooks{
 		afterMkdir: func(string) error { return want },
 	})
 	if !errors.Is(err, want) {
@@ -104,10 +104,14 @@ func TestPublishStagedReservationRejectsPrivateRootReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
-	reservation, err := session.Store.ReserveStagedRootOwned(0o755)
+	reservation, reservationLease, err := session.Store.ReserveStagedRootOwned(0o755)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Production releases the lease once the journal names the root; these
+	// tests do not journal, so they stand in for that here.
+	defer reservationLease.Release(session.Store.StagingDir())
 	private := filepath.Join(s.StagingDir(), reservation.Name)
 	if err := os.Rename(private, private+".owned"); err != nil {
 		t.Fatal(err)

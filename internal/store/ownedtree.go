@@ -561,17 +561,37 @@ func (s *Store) CreateStagedRootOwned(name string, perm os.FileMode) (OwnedTree,
 	if !validPublicLogicalEntry(name) {
 		return OwnedTree{}, fmt.Errorf("create staged root requires a public single-component name outside the .fu- namespace: %q", name)
 	}
-	reservation, err := s.ReserveStagedRootOwned(perm)
+	reservation, lease, err := s.ReserveStagedRootOwned(perm)
 	if err != nil {
 		return OwnedTree{}, err
 	}
-	return s.PublishStagedRootOwned(reservation, name)
+	// Published within this call, so the lease's window closes here rather
+	// than at a journal write: nothing outside sees the private name, and the
+	// public one is the caller's to account for.
+	tree, err := s.PublishStagedRootOwned(reservation, name)
+	// ReleaseIfObjectGone, not Release: a failed publish leaves the private
+	// root exactly where it is -- the rename either never happened or was
+	// undone -- and dropping the lease beside a surviving object turns it into
+	// the unbacked `.fu-new-*` this whole mechanism exists to abolish. Every
+	// other unwinding path in the package already asks this question; this one
+	// answered it unconditionally.
+	return tree, errors.Join(err, lease.ReleaseIfObjectGone(s.StagingDir()))
 }
 
 // ReserveStagedRootOwned exclusively creates a private staging directory and
 // returns its identity manifest without publishing a final name. Callers must
 // persist this reservation before PublishStagedRootOwned.
-func (s *Store) ReserveStagedRootOwned(perm os.FileMode) (StagedRootReservation, error) {
+// ReserveStagedRootOwned creates a private staging root and returns it with
+// the lease that accounts for it until the journal does.
+//
+// The lease exists because the WAL cannot cover its own beginning: a
+// transaction record cannot name a root before the root exists, so the window
+// between creating one and journalling it is the one place a crash leaves a
+// private root no record mentions -- the unbacked `.fu-new-*` DESIGN §6 lists
+// among the residue nothing collects. The caller releases the lease once the
+// journal write succeeds, because from that moment recovery owns the name and
+// two owners would be one too many.
+func (s *Store) ReserveStagedRootOwned(perm os.FileMode) (StagedRootReservation, *Lease, error) {
 	return s.reserveStagedRootOwnedWithHooks(perm, stagedRootReservationHooks{})
 }
 
@@ -579,19 +599,33 @@ type stagedRootReservationHooks struct {
 	afterMkdir func(string) error
 }
 
-func (s *Store) reserveStagedRootOwnedWithHooks(perm os.FileMode, hooks stagedRootReservationHooks) (_ StagedRootReservation, retErr error) {
+func (s *Store) reserveStagedRootOwnedWithHooks(perm os.FileMode, hooks stagedRootReservationHooks) (_ StagedRootReservation, _ *Lease, retErr error) {
 	defer keepDescriptorOwnersAlive(s)
 	if s.writeRoots == nil || s.writeRoots.staging == nil || s.writeRoots.staging.dir == nil {
-		return StagedRootReservation{}, errors.New("store is not attached to a checked staging root")
+		return StagedRootReservation{}, nil, errors.New("store is not attached to a checked staging root")
 	}
 	staging := s.writeRoots.staging
 	parentFD := int(staging.dir.Fd())
 	private, err := privateStagedRootName()
 	if err != nil {
-		return StagedRootReservation{}, err
+		return StagedRootReservation{}, nil, err
 	}
+	// Before the mkdir, so the window this lease exists for has evidence in
+	// it from its first instant.
+	lease, err := AcquireLease(s.StagingDir(), LeaseStagedRoot, private)
+	if err != nil {
+		return StagedRootReservation{}, nil, fmt.Errorf("reserve private staging root: %w", err)
+	}
+	defer func() {
+		if retErr != nil {
+			// The rollback below retires the private root rather than deleting
+			// it, and may fail outright; either way the record stays unless
+			// nothing carries its token any more.
+			retErr = errors.Join(retErr, lease.ReleaseIfObjectGone(s.StagingDir()))
+		}
+	}()
 	if err := unix.Mkdirat(parentFD, private, uint32(perm.Perm())); err != nil {
-		return StagedRootReservation{}, fmt.Errorf("create private staging root %s/%s exclusively: %w", staging.display, private, err)
+		return StagedRootReservation{}, nil, fmt.Errorf("create private staging root %s/%s exclusively: %w", staging.display, private, err)
 	}
 	expectedIdentity, observed, err := entryIdentityAt(parentFD, private)
 	if err != nil {
@@ -599,12 +633,12 @@ func (s *Store) reserveStagedRootOwnedWithHooks(perm os.FileMode, hooks stagedRo
 		// was never published, so this best-effort removal cannot target a
 		// caller-provided entry even when identity capture itself failed.
 		cleanupErr := unix.Unlinkat(parentFD, private, unix.AT_REMOVEDIR)
-		return StagedRootReservation{}, errors.Join(err, cleanupErr)
+		return StagedRootReservation{}, nil, errors.Join(err, cleanupErr)
 	}
 	mode, kind, err := modeAndKind(&observed)
 	if err != nil || kind != ownedDirectory {
 		cleanupErr := unix.Unlinkat(parentFD, private, unix.AT_REMOVEDIR)
-		return StagedRootReservation{}, errors.Join(err, cleanupErr)
+		return StagedRootReservation{}, nil, errors.Join(err, cleanupErr)
 	}
 	expectedMode := uint32(mode)
 	succeeded := false
@@ -612,27 +646,47 @@ func (s *Store) reserveStagedRootOwnedWithHooks(perm os.FileMode, hooks stagedRo
 		if succeeded {
 			return
 		}
+		// Its own prefix, not the leased-payload one. Switching the prefix was
+		// tried and does nothing: retireOwnedDirectoryAt derives its target
+		// through ownedCleanupRetiredName, which is a digest of the path and
+		// identity rather than the lease's token, so the retired object is
+		// unresolvable either way -- and sharing a prefix between two naming
+		// schemes would break the one thing ".fu-retired-payload-<token>"
+		// means.
+		//
+		// The residue that leaves is real and narrow, and DESIGN §6 records
+		// it: on the double fault where the rename succeeds, the rmdir fails
+		// and the restore fails too, the object sits under a name its lease
+		// cannot find, so the record is collected and the object becomes
+		// residue nothing accounts for. It is reported -- .fu-retired-staging-
+		// is in stagingResiduePrefixes -- which is the same standing this case
+		// had before leases existed.
 		retErr = errors.Join(retErr, retireOwnedDirectoryAt(staging.dir, private, ".fu-retired-staging-", expectedIdentity, expectedMode))
 	}()
 	if hooks.afterMkdir != nil {
 		if err := hooks.afterMkdir(private); err != nil {
-			return StagedRootReservation{}, err
+			return StagedRootReservation{}, nil, err
 		}
 	}
 	tree, err := snapshotOwnedTree(staging, private)
 	if err != nil {
-		return StagedRootReservation{}, err
+		return StagedRootReservation{}, nil, err
 	}
 	if len(tree.Entries) != 0 {
-		return StagedRootReservation{}, fmt.Errorf("%w: private staging root %s/%s was created empty but already holds %d entries",
+		return StagedRootReservation{}, nil, fmt.Errorf("%w: private staging root %s/%s was created empty but already holds %d entries",
 			ErrOwnedTreeChanged, staging.display, private, len(tree.Entries))
 	}
 	reservation := StagedRootReservation{Name: private, Manifest: tree}
 	if err := reservation.Validate(); err != nil {
-		return StagedRootReservation{}, err
+		return StagedRootReservation{}, nil, err
+	}
+	// The identity goes in now that there is one, so the lease can prove what
+	// it made rather than only what it intended.
+	if err := lease.AttachIdentity(s.StagingDir(), expectedIdentity); err != nil {
+		return StagedRootReservation{}, nil, err
 	}
 	succeeded = true
-	return reservation, nil
+	return reservation, lease, nil
 }
 
 // PublishStagedRootOwned moves a persisted private reservation to its final

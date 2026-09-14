@@ -35,6 +35,31 @@ import (
 type PruneOutcome struct {
 	Transactions int
 	Files        int
+	// Payloads counts the abandoned temporary objects reclaimed against their
+	// leases, and Leases the records settled -- which differ whenever a lease
+	// outlived its object, as every convergent crash boundary leaves it.
+	Payloads int
+	Leases   int
+	// PayloadsInUse and PayloadsUnaccountable are what the run deliberately
+	// left alone: one because a live process still holds it, the other because
+	// the evidence does not account for what is there and deleting it would be
+	// a guess.
+	PayloadsInUse         int
+	PayloadsUnaccountable int
+	// PayloadNotes explains those refusals. `fu gc` names them itself rather
+	// than pointing at `fu status`, because the one home the storeless sweep
+	// exists for -- no store yet, an interrupted `fu clone` behind it -- is a
+	// home where `fu status` exits 1.
+	PayloadNotes []StagingNote
+	// PayloadsClaimed counts objects a pending transaction's journal governs.
+	// A leased object is journalled before its lease is dropped, so this is the
+	// window between the two -- recovery settles them, and gc must not.
+	PayloadsClaimed int
+	// StoreSkipped is set when there was no store to prune, so the run did the
+	// staging sweep alone. `fu clone`'s residue exists precisely when no store
+	// does, and refusing to reclaim it because the home is half-built would
+	// leave the one leftover no other command can reach.
+	StoreSkipped bool
 }
 
 type txnPrune struct {
