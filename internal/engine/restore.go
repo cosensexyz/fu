@@ -4,6 +4,9 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/cosensexyz/fu/internal/agent"
 	"github.com/cosensexyz/fu/internal/store"
@@ -306,6 +309,101 @@ func carryWarningsForward(first, second []string) []string {
 type RevertOutcome struct {
 	Result  Result
 	Changed []string
+	// DisplacedByRevertedAdopt names the adopts this revert undid whose skill
+	// the store no longer holds -- the ones whose agent entry the reconcile
+	// below therefore leaves empty, with what was there before reachable only
+	// under recovery/.
+	//
+	// A name is dropped whenever the skill survives, however that came about:
+	// a refusal that reached nothing, an apply that stopped before this one,
+	// or a revert that restored an earlier copy of the same skill and relinked
+	// it. In all three the entry is live and copying an archive over it is the
+	// mistake this field exists to prevent.
+	//
+	// Reverting an adopt is the one case where undoing an operation does not
+	// return things to how they were. Every other operation either created
+	// what it is now removing (new, add) or removed what it is now restoring
+	// from history (rm); adopt alone moved something of the user's aside,
+	// archiving it under recovery/ and leaving a link. The revert drops the
+	// store copy and reconcile removes the link, so the agent directory ends
+	// up empty rather than back at its pre-adopt state.
+	//
+	// The names travel out so the command can say so at the moment the user
+	// needs it. No command restores the archive today, which SPEC rule 10
+	// states -- but a user who has just run the command SPEC scenario 5 points
+	// at for undoing a mistake should not have to go looking for that sentence.
+	DisplacedByRevertedAdopt []string
+}
+
+// adoptsBeingReverted names the skills whose adopt is among the n operations
+// `fu revert n` is about to undo.
+//
+// Selection is by ordinal, not by commit count. Store.Log(n) returns n
+// *commits*, while Revert(n) counts *operations* -- and fu writes commits on
+// its own account (a sweep, an `init: store`, a recovery compensation) that
+// carry Ordinal 0 and are stepped over by the revert. Reading n commits put
+// the boundary somewhere else, and the first thing to fall outside it was the
+// adopt this exists to report: no warning, and the user's content sitting in
+// recovery/ unmentioned. WalkOperations is the single place that decides what
+// an operation is, and resolveOperationsBack resolves the revert's target from
+// the same walk, so asking it is asking the question the revert will answer.
+//
+// The subject is fu's own ("adopt: <name>", adopt.go). A commit a user wrote by
+// hand can still reach here -- IsOperationMessage whitelists by verb, so
+// `git commit -m "adopt: ..."` inside the store is an operation as far as fu is
+// concerned, countable by revert and numbered by log. Naming it is then
+// correct about what was reverted, though the pointer to recovery/ will find
+// nothing; that is the same latitude every other verb has and is not worth a
+// second source of truth to narrow.
+// adoptsLeftWithoutTheirSkill keeps the adopts whose skill the store no longer
+// holds, which is the condition that makes the warning true.
+//
+// The warning says the agent entry is empty and the only copy of what was
+// there before is in recovery/. That follows from one fact and not from any
+// other: the store no longer has the skill, so the reconcile below has no
+// content to link and the name is left bare. Asking that directly replaced two
+// separate rules that each approximated it and each got a case wrong.
+//
+// A whole-call test on the changed paths kept an adopt an interrupted apply had
+// never touched -- its link and store copy both live -- and telling that user
+// to copy an archive over it is the harm this whole warning exists to prevent.
+// Narrowing to "this revert moved something under the skill's own prefix"
+// fixed that and introduced the mirror: `adopt v1; rm; adopt v2; revert 2`
+// restores v1 and relinks it, so the paths did move, the entry is *not* empty,
+// and the advice would land on a live link again.
+//
+// Absence from the store answers all of them, on the failure path as well:
+// content this revert destroyed is gone from the store whether or not the run
+// finished, and content it never reached is still there.
+func adoptsLeftWithoutTheirSkill(st *store.Store, names []string) []string {
+	var kept []string
+	for _, name := range names {
+		if _, err := os.Lstat(filepath.Join(st.SkillsDir(), name)); os.IsNotExist(err) {
+			kept = append(kept, name)
+		}
+	}
+	return kept
+}
+
+func adoptsBeingReverted(st *store.Store, n int) ([]string, error) {
+	var names []string
+	err := st.WalkOperations(func(entry store.OperationEntry) (bool, error) {
+		switch {
+		case entry.Ordinal == 0:
+			// Not an operation; the revert steps over it and so does this.
+			return true, nil
+		case entry.Ordinal > n:
+			return false, nil
+		}
+		subject, _, _ := strings.Cut(entry.Message, "\n")
+		if name, ok := strings.CutPrefix(strings.TrimSpace(subject), "adopt: "); ok {
+			if name = strings.TrimSpace(name); name != "" {
+				names = append(names, name)
+			}
+		}
+		return true, nil
+	})
+	return names, err
 }
 
 // RevertOperations rolls the store back n operations. Unlike Restore it is a
@@ -424,6 +522,19 @@ func RevertOperations(st *store.Store, agents []agent.Agent, n int) (outcome Rev
 		if err := checked.Sweep(); err != nil {
 			return err
 		}
+		// Read after the sweep, so the walk resolves from the same HEAD the
+		// revert will. The names are filtered again after the revert runs,
+		// since what this window says was undone and what the store still
+		// holds are separate questions. Not because the sweep shifts the window -- it cannot:
+		// both of Sweep's commits carry ExternalCommitMessage and therefore
+		// Ordinal 0, so no ordinal moves across it. That was the reason under
+		// the earlier commit-counting version, and it did not survive the
+		// change to ordinals.
+		displaced, err := adoptsBeingReverted(checked, n)
+		if err != nil {
+			return fmt.Errorf("read the operations about to be reverted: %w", err)
+		}
+		outcome.DisplacedByRevertedAdopt = displaced
 
 		// n is passed through untouched, and both arguments are the same
 		// value now. There used to be a skip adjustment here: Log(1) before
@@ -448,8 +559,12 @@ func RevertOperations(st *store.Store, agents []agent.Agent, n int) (outcome Rev
 		changed, err := checked.Revert(n)
 		outcome.Changed = changed
 		if err != nil {
+			outcome.DisplacedByRevertedAdopt = adoptsLeftWithoutTheirSkill(
+				checked, outcome.DisplacedByRevertedAdopt)
 			return err
 		}
+		outcome.DisplacedByRevertedAdopt = adoptsLeftWithoutTheirSkill(
+			checked, outcome.DisplacedByRevertedAdopt)
 
 		// Reloaded, because the revert just rewrote fu.yaml on disk and cfg
 		// above is the copy from before it ran. reconcileChecked does not
