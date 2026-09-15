@@ -12,10 +12,10 @@ import (
 )
 
 // Walks the SPEC scenarios this file covers: create and record (7), toggle
-// (2), and mistake recovery (5) through revert and log. Scenarios 1 and 6 are
-// exercised functionally by add_test.go, adopt_test.go and
-// adopt_whole_test.go rather than here; folding them into this walkthrough is
-// tracked in DESIGN §8.
+// (2), and mistake recovery (5) through revert and log. Scenario 4 is
+// TestScenarioMachineMigration below; 1, 3 and 6 are in
+// scenario_closeout_test.go, which says at its head what each asserts that the
+// unit tests over the same code do not.
 func TestScenarioWalkthrough(t *testing.T) {
 	s, _ := setupStore(t)
 	claudeDir, codexDir := t.TempDir(), t.TempDir()
