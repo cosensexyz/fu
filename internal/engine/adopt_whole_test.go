@@ -17,7 +17,13 @@ import (
 	"github.com/cosensexyz/fu/internal/testenv"
 )
 
-func TestMarshalAdoptLinkArchiveIgnoresIdentityHandle(t *testing.T) {
+// Version 1 ignores the handle; version 2 does not. This test pinned the first
+// half when that was the only half there was -- it is what kept an archive
+// reproducible by binaries predating handles. Batch 10 made the handle part of
+// what a current archive records, so both halves are stated here: the legacy
+// encoding must still drop it, or an old archive stops reproducing, and the
+// current encoding must keep it, or the batch achieved nothing.
+func TestMarshalAdoptLinkArchiveIgnoresIdentityHandleOnlyAtVersionOne(t *testing.T) {
 	withHandle := newAdoptLinkArchiveRecord(
 		adoptLinkArchiveEntry,
 		"claude",
@@ -30,16 +36,28 @@ func TestMarshalAdoptLinkArchiveIgnoresIdentityHandle(t *testing.T) {
 	withoutHandle := withHandle
 	withoutHandle.Identity.Handle = ""
 
-	withRaw, withName, err := marshalAdoptLinkArchive(withHandle)
+	withRaw, withName, err := marshalAdoptLinkArchiveAt(withHandle, adoptLinkArchiveVersionLegacy)
 	if err != nil {
 		t.Fatal(err)
 	}
-	withoutRaw, withoutName, err := marshalAdoptLinkArchive(withoutHandle)
+	withoutRaw, withoutName, err := marshalAdoptLinkArchiveAt(withoutHandle, adoptLinkArchiveVersionLegacy)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(withRaw, withoutRaw) || withName != withoutName {
-		t.Fatalf("handle changed archive encoding: %s/%s vs %s/%s", withName, withRaw, withoutName, withoutRaw)
+		t.Fatalf("at version 1 the handle must not change the encoding: %s/%s vs %s/%s",
+			withName, withRaw, withoutName, withoutRaw)
+	}
+
+	currentRaw, currentName, err := marshalAdoptLinkArchive(withHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(currentRaw, withRaw) || currentName == withName {
+		t.Fatal("at the current version the handle must reach the record; otherwise nothing records the strongest identity")
+	}
+	if !bytes.Contains(currentRaw, []byte("1:aabb")) {
+		t.Fatalf("the current encoding must carry the handle: %s", currentRaw)
 	}
 }
 
@@ -746,6 +764,7 @@ func TestAdoptWholeDirSymlink(t *testing.T) {
 		records[0].OriginalPath != filepath.Join(homeDir, ".claude", "skills") || records[0].RawTarget != target {
 		t.Fatalf("removed whole-directory link was not durably archived: %+v", records)
 	}
+	assertArchiveRecordsTheStrongestIdentity(t, records)
 	if _, err := PruneCompletedTransactions(s); err != nil {
 		t.Fatal(err)
 	}

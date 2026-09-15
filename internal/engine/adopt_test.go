@@ -12,6 +12,7 @@ import (
 
 	"github.com/cosensexyz/fu/internal/agent"
 	"github.com/cosensexyz/fu/internal/store"
+	"github.com/cosensexyz/fu/internal/testenv"
 	"golang.org/x/sys/unix"
 )
 
@@ -166,11 +167,38 @@ func TestAdoptWarnsOnDisagreeingSymlinkTargets(t *testing.T) {
 	if len(wantTargets) != 0 {
 		t.Fatalf("missing archived symlink targets: %v", wantTargets)
 	}
+	assertArchiveRecordsTheStrongestIdentity(t, records)
 	if _, err := PruneCompletedTransactions(s); err != nil {
 		t.Fatal(err)
 	}
 	if after := readAdoptLinkArchives(t, s); len(after) != 2 {
 		t.Fatalf("gc removed durable symlink archives: %+v", after)
+	}
+}
+
+// assertArchiveRecordsTheStrongestIdentity checks what every end-to-end adopt
+// assertion was missing: that the archive a real adopt writes carries this
+// build's version and the handle the platform actually supplied.
+//
+// Every other handle assertion in this batch uses a synthetic identity, so a
+// change that fed a handle-stripped identity into the record builders -- or a
+// regression to version 1 -- would leave all of them green while voiding the
+// batch's entire premise. The handle half runs only where handles exist; Linux
+// CI sets FU_REQUIRE_FILE_HANDLES=1, so it is not silently skipped there.
+func assertArchiveRecordsTheStrongestIdentity(t *testing.T, records []adoptLinkArchiveRecord) {
+	t.Helper()
+	for _, record := range records {
+		if record.Version != adoptLinkArchiveVersion {
+			t.Fatalf("archive written at version %d, want %d: a real adopt must write what this build writes",
+				record.Version, adoptLinkArchiveVersion)
+		}
+		if testenv.FileHandlesRequired() && record.Identity.Handle == "" {
+			t.Fatalf("archive %+v carries no handle on a filesystem that exports them; "+
+				"the record is back to device and inode, which a replacement can reuse", record.Identity)
+		}
+		if got := record.evidence(); testenv.FileHandlesRequired() && got != adoptLinkEvidenceHandle {
+			t.Fatalf("archive evidence = %v, want the strong case", got)
+		}
 	}
 }
 
@@ -1672,6 +1700,7 @@ func TestAdoptSymlinkArchivesLinkWithoutCopyingTarget(t *testing.T) {
 	if len(records) != 1 || records[0].RawTarget != target || records[0].OriginalPath != filepath.Join(agentDir, "alpha") {
 		t.Fatalf("removed symlink was not durably archived: %+v", records)
 	}
+	assertArchiveRecordsTheStrongestIdentity(t, records)
 }
 
 func TestAdoptSymlinkRecoveryRequiresDurableArchiveBeforeUnlink(t *testing.T) {
@@ -1701,7 +1730,12 @@ func TestAdoptSymlinkRecoveryRequiresDurableArchiveBeforeUnlink(t *testing.T) {
 		t.Fatalf("retired symlink = %q, %v; want %q", got, err, target)
 	}
 	archivePath := filepath.Join(s.RecoveryDir(), archive.LinkArchive)
-	if err := os.WriteFile(archivePath, []byte("{}"), 0o644); err != nil {
+	// A version this build understands, so the content comparison is what
+	// refuses it. `{}` would be rejected a step earlier, for having no version
+	// at all, and would leave the byte check -- the thing this test is named
+	// for -- unexercised.
+	edited := fmt.Sprintf(`{"version":%d}`, adoptLinkArchiveVersion)
+	if err := os.WriteFile(archivePath, []byte(edited), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1709,6 +1743,15 @@ func TestAdoptSymlinkRecoveryRequiresDurableArchiveBeforeUnlink(t *testing.T) {
 		!strings.Contains(err.Error(), archive.LinkArchive) ||
 		!strings.Contains(err.Error(), "no longer matches") {
 		t.Fatalf("changed durable link archive must stop recovery, got %v", err)
+	}
+	// And an archive with no recognisable version is refused too, one step
+	// earlier and saying so.
+	if err := os.WriteFile(archivePath, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSkill(s, nil, "beta"); !errors.Is(err, ErrTxnConflict) ||
+		!strings.Contains(err.Error(), "unsupported version") {
+		t.Fatalf("an archive with no version must stop recovery and say why, got %v", err)
 	}
 	if got, err := os.Readlink(retiredPath); err != nil || got != target {
 		t.Fatalf("recovery removed the symlink without a valid durable archive: %q, %v", got, err)
@@ -2314,6 +2357,30 @@ func TestAdoptRetainsLiveRetirementIdentityUntilRemoval(t *testing.T) {
 				record.Archive.OriginalIdentity.Handle = ""
 				for i := range record.AdoptTargets {
 					record.AdoptTargets[i].EntryIdentity.Handle = ""
+				}
+				// A legacy WAL came from a build that also wrote a legacy
+				// archive, so the pair has to be aged together. Stripping only
+				// the WAL leaves a combination fu cannot produce -- a version 2
+				// archive recording a handle beside a record that has none --
+				// and validation refuses it before this test's subject is ever
+				// reached. Ageing both is also the real upgrade path, so the
+				// resume below exercises it.
+				if record.Archive.LinkArchive != "" {
+					legacyRaw, legacyName, err := marshalAdoptLinkArchiveAt(
+						perEntryAdoptLinkArchive(
+							AdoptTarget{SkillsDir: agentDir},
+							"alpha", record.Archive,
+						), adoptLinkArchiveVersionLegacy)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Remove(filepath.Join(s.RecoveryDir(), record.Archive.LinkArchive)); err != nil {
+						t.Fatal(err)
+					}
+					if err := writeTxnFileNoReplace(s, legacyName, legacyRaw); err != nil {
+						t.Fatal(err)
+					}
+					record.Archive.LinkArchive = legacyName
 				}
 				if strings.HasPrefix(boundary, "already-retired-") {
 					if err := os.Rename(filepath.Join(agentDir, "alpha"), filepath.Join(agentDir, record.Archive.Retired)); err != nil {

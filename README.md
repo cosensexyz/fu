@@ -371,6 +371,19 @@ to collect. Do not delete these records by hand. They contain enough
 authority to automatically restore an archived directory or symlink, but
 this release does not ship a command that does so.
 
+These records carry a format version. Version 2 — what fu writes now — records
+the strongest identity the filesystem offered, including the kernel file handle
+on Linux, which survives the inode reuse a device-and-inode pair does not.
+Version 1 predates that and never recorded a handle, so the absence of one in a
+version 1 record says nothing about what was available at the time; fu tracks
+that distinction rather than reading an old record as stronger evidence than it
+is. Existing records are never rewritten — each is read by the rules of the
+version it declares — so upgrading fu leaves `recovery/` byte for byte as it
+was. An older fu meeting a version 2 record refuses it and reports a safety
+conflict rather than guessing, so if you move between fu versions, let the
+version that started an interrupted `adopt` (or a newer one) be the version
+that finishes it.
+
 Agent-link retirement has one smaller crash residue outside `recovery/`.
 Reconcile first renames an approved fu-owned link to an unpredictable
 `.fu-retired-*` sibling, validates that moved inode and raw target, and then

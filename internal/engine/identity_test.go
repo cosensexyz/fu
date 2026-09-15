@@ -36,8 +36,15 @@ func TestStatInodeIsReadOnlyByTheStoreIdentityPrimitive(t *testing.T) {
 	}
 	dir := filepath.Dir(currentFile)
 	inodeAllowlist := map[string]map[string]bool{}
+	// The one place in the engine that may drop a captured handle, and it may
+	// do so on one branch only: encoding an archive at version 1, the format
+	// that never recorded handles, so that a file written by an older build
+	// still reproduces byte for byte. Version 2 keeps the handle -- the
+	// allowlist names the function, so if the strip ever escapes that branch
+	// this guard will not notice, which is why the branch carries its own
+	// explanation at the call site.
 	downgradeAllowlist := map[string]map[string]bool{
-		"adopt_link_archive.go": {"marshalAdoptLinkArchive": true},
+		"adopt_link_archive.go": {"marshalAdoptLinkArchiveAt": true},
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
