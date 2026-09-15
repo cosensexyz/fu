@@ -144,42 +144,32 @@ func Run(st *store.Store, agents []agent.Agent, op Op) (Result, error) {
 // constructing an Op the same mandatory recovery boundary as Run. It is
 // intentionally complete even when discovery later yields zero operations.
 func writeCommandPrologue(st *store.Store, agents []agent.Agent) (res Result, retErr error) {
-	session, err := st.BeginWrite()
+	ws, err := beginWrite(st, "the write prologue")
 	if err != nil {
-		return res, fmt.Errorf("open checked write prologue: %w", err)
+		return res, err
 	}
 	defer func() {
-		retErr = errors.Join(retErr, session.Close())
+		retErr = errors.Join(retErr, ws.close())
 	}()
-	checked := session.Store
-	homeRoot, err := checked.Root()
-	if err != nil {
-		return res, fmt.Errorf("use checked write root: %w", err)
-	}
-	storeRoot, err := checked.StoreRoot()
-	if err != nil {
-		return res, fmt.Errorf("use checked store root: %w", err)
-	}
-	retErr = withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
-		recoveryResult, err := RecoverPendingReporting(checked)
-		mergeResult(&res, recoveryResult)
-		if err != nil {
-			return fmt.Errorf("recover pending transactions: %w", err)
-		}
-		cfg, err := store.LoadConfigRoot(storeRoot, "fu.yaml", st.ConfigPath())
-		if err != nil {
-			return fmt.Errorf("load config %s: %w", st.ConfigPath(), err)
-		}
-		if err := cfg.CheckWritable(); err != nil {
-			return fmt.Errorf("check config writable: %w", err)
-		}
-		if err := checked.Sweep(); err != nil {
-			return fmt.Errorf("sweep external edits: %w", err)
-		}
-		if err := session.CheckCanonicalPath(); err != nil {
+	retErr = ws.underLock(func() error {
+		if err := ws.recoverPending(&res); err != nil {
 			return err
 		}
-		reconcileResult, err := reconcileChecked(checked, cfg, agents, nil)
+		cfg, err := ws.loadConfig()
+		if err != nil {
+			return err
+		}
+		if err := ws.checked.Sweep(); err != nil {
+			return fmt.Errorf("sweep external edits: %w", err)
+		}
+		// After the sweep here, before it in revert and pull. The order is
+		// left as each command had it: moving this is a semantic change with
+		// its own evidence to gather, not something a refactor decides. The
+		// inconsistency is recorded in DESIGN's known gaps.
+		if err := ws.session.CheckCanonicalPath(); err != nil {
+			return err
+		}
+		reconcileResult, err := reconcileChecked(ws.checked, cfg, agents, nil)
 		mergeResult(&res, reconcileResult)
 		if err != nil {
 			if errors.Is(err, ErrOperationFailed) {
@@ -261,33 +251,27 @@ func (h hooks) commitStore(st *store.Store, message string, prepared store.Prepa
 }
 
 func run(st *store.Store, agents []agent.Agent, op Op, h hooks) (res Result, err error) {
-	session, err := st.BeginWrite()
+	// Wrapped here rather than inside beginWrite: the shell reports what it
+	// could not open, and this command alone classifies a setup failure so its
+	// outcome can tell "never started" apart from "failed partway".
+	ws, err := beginWrite(st, "the write session")
 	if err != nil {
-		return res, asOperationSetupError(fmt.Errorf("open checked write session: %w", err))
+		return res, asOperationSetupError(err)
 	}
 	// Joined rather than discarded, matching reconcileChecked: a close error
 	// here means the pinned descriptors did not release cleanly, which is not
 	// something a successful command should hide.
 	defer func() {
-		if closeErr := session.Close(); closeErr != nil {
+		if closeErr := ws.close(); closeErr != nil {
 			err = errors.Join(err, closeErr)
 		}
 	}()
-	checked := session.Store
-	homeRoot, err := checked.Root()
-	if err != nil {
-		return res, asOperationSetupError(fmt.Errorf("use checked write root: %w", err))
-	}
-	storeRoot, err := checked.StoreRoot()
-	if err != nil {
-		return res, asOperationSetupError(fmt.Errorf("use checked store root: %w", err))
-	}
+	checked := ws.checked
+	storeRoot := ws.storeRoot
 	setupComplete := false
-	err = withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
-		recoveryResult, err := RecoverPendingReporting(checked)
-		mergeResult(&res, recoveryResult)
-		if err != nil {
-			return fmt.Errorf("recover pending transactions: %w", err)
+	err = ws.underLock(func() error {
+		if err := ws.recoverPending(&res); err != nil {
+			return err
 		}
 		// The bytes come back with the parsed config so the two cannot
 		// disagree. Reading the file a second time later to establish a
@@ -295,24 +279,21 @@ func run(st *store.Store, agents []agent.Agent, op Op, h hooks) (res Result, err
 		// external edit, leaving cfg modelling one version while the baseline
 		// named another, and the conditional install below then matched the
 		// baseline and destroyed the edit.
-		cfg, configLoaded, err := store.LoadConfigRootBytes(storeRoot, "fu.yaml", st.ConfigPath())
+		cfg, configLoaded, err := ws.loadConfigBytes()
 		if err != nil {
-			return fmt.Errorf("load config %s: %w", st.ConfigPath(), err)
+			return err
 		}
-		// Writability is a precondition, checked before Sweep or Mutate run
+		// The writability refusal happens inside loadConfigBytes, and it
+		// happens before Sweep for a reason worth keeping written down
 		// (finding I1, hardened by round 2 finding 4): a config newer than
 		// this build supports must be refused before anything is written --
 		// including the sweep commit below, which is itself a commit and
-		// would otherwise absorb the very content this guard exists to
-		// refuse, under the unrelated message "external: manual
-		// modifications". LoadConfig reads straight from disk regardless of
-		// git state, so checking here (before Sweep ever runs) sees exactly
-		// the same version a check after Sweep would have -- nothing is lost
-		// by moving it earlier, and a refused write now leaves the store
-		// exactly as the user left it, not partially committed.
-		if err := cfg.CheckWritable(); err != nil {
-			return fmt.Errorf("check config writable: %w", err)
-		}
+		// would otherwise absorb the very content the guard exists to refuse,
+		// under the unrelated message "external: manual modifications".
+		// LoadConfig reads straight from disk regardless of git state, so
+		// checking before Sweep ever runs sees exactly the same version a
+		// check after it would have; nothing is lost by the earlier position,
+		// and a refused write leaves the store exactly as the user left it.
 		if err := checked.Sweep(); err != nil {
 			return fmt.Errorf("sweep external edits: %w", err)
 		}
@@ -468,7 +449,11 @@ func run(st *store.Store, agents []agent.Agent, op Op, h hooks) (res Result, err
 			op.outcome.WALComplete = true
 			op.outcome.RecoveryPending = false
 		}
-		if err := session.CheckCanonicalPath(); err != nil {
+		// Checked here, far below this command's own sweep. The other order --
+		// check before sweeping -- is what revert and pull do; the difference
+		// is recorded in DESIGN's known gaps and left as found, since moving it
+		// is a semantic change rather than a refactor.
+		if err := ws.session.CheckCanonicalPath(); err != nil {
 			return err
 		}
 		if op.outcome != nil {

@@ -425,40 +425,31 @@ func mergeResult(dst *Result, src Result) {
 // stdout, so a script redirecting only stdout saw a clean run while an
 // agent silently got nothing.
 func Reconcile(st *store.Store, agents []agent.Agent) (res Result, retErr error) {
-	session, err := st.BeginWrite()
+	ws, err := beginWrite(st, "reconcile")
 	if err != nil {
-		return res, fmt.Errorf("open checked reconcile session: %w", err)
+		return res, err
 	}
 	defer func() {
-		retErr = errors.Join(retErr, session.Close())
+		retErr = errors.Join(retErr, ws.close())
 	}()
-	checked := session.Store
-	homeRoot, err := checked.Root()
-	if err != nil {
-		return res, fmt.Errorf("use checked reconcile root: %w", err)
-	}
-	storeRoot, err := checked.StoreRoot()
-	if err != nil {
-		return res, fmt.Errorf("use checked store root for reconcile: %w", err)
-	}
-	retErr = withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
-		recoveryResult, err := RecoverPendingReporting(checked)
-		mergeResult(&res, recoveryResult)
-		if err != nil {
-			return fmt.Errorf("recover pending transactions before reconcile: %w", err)
-		}
-		cfg, err := store.LoadConfigRoot(storeRoot, "fu.yaml", st.ConfigPath())
-		if err != nil {
-			return fmt.Errorf("load config %s for reconcile: %w", st.ConfigPath(), err)
-		}
-		if err := cfg.CheckWritable(); err != nil {
-			return fmt.Errorf("check config writable before reconcile: %w", err)
-		}
-		if err := session.CheckCanonicalPath(); err != nil {
+	retErr = ws.underLock(func() error {
+		if err := ws.recoverPending(&res); err != nil {
 			return err
 		}
-		reconcileResult, err := reconcileChecked(checked, cfg, agents, nil)
+		cfg, err := ws.loadConfig()
+		if err != nil {
+			return err
+		}
+		// No sweep: Reconcile must not fold hand edits into history, which is
+		// the property SPEC §5.3 rests restore on.
+		if err := ws.session.CheckCanonicalPath(); err != nil {
+			return err
+		}
+		reconcileResult, err := reconcileChecked(ws.checked, cfg, agents, nil)
 		mergeResult(&res, reconcileResult)
+		// Returned rather than swallowed, unlike writeCommandPrologue: a
+		// caller of Reconcile asked for exactly this work, so a per-agent
+		// failure is the answer, not a finding carried alongside one.
 		return err
 	})
 	return res, retErr

@@ -138,26 +138,16 @@ func Restore(st *store.Store, agents []agent.Agent, hard bool) (outcome RestoreO
 	// meant that when BeginWrite, Root or StoreRoot then failed for their own
 	// reasons, the per-agent failures the first layer had already found
 	// vanished from the error the user saw.
-	session, err := st.BeginWrite()
+	ws, err := beginWrite(st, "restore")
 	if err != nil {
 		return outcome, errors.Join(reconcileErr, err)
 	}
-	// Every other BeginWrite call site in this package folds session.Close's
-	// error into the returned error with errors.Join rather than discarding
-	// it (Reconcile, writeCommandPrologue, pruneCompletedTransactions); a
-	// named return is what makes that actually reach the caller here, since a
-	// bare `return outcome, resetErr` would let the deferred assignment land
-	// on a value nothing downstream reads.
-	defer func() { retErr = errors.Join(retErr, session.Close()) }()
-	checked := session.Store
-	homeRoot, err := checked.Root()
-	if err != nil {
-		return outcome, errors.Join(reconcileErr, fmt.Errorf("use checked restore root: %w", err))
-	}
-	storeRoot, err := checked.StoreRoot()
-	if err != nil {
-		return outcome, errors.Join(reconcileErr, fmt.Errorf("use checked store root for restore: %w", err))
-	}
+	// beginWrite reports the close error on its own failure paths; this is the
+	// success path's half. A named return is what makes it actually reach the
+	// caller here, since a bare `return outcome, resetErr` would let the
+	// deferred assignment land on a value nothing downstream reads.
+	defer func() { retErr = errors.Join(retErr, ws.close()) }()
+	checked := ws.checked
 	// Pinned descriptors are not a lock: they guarantee this call keeps
 	// writing to the store it opened, not that no other fu process is writing
 	// to it at the same time. The prior round's Restore could leave that gap
@@ -165,7 +155,7 @@ func Restore(st *store.Store, agents []agent.Agent, hard bool) (outcome RestoreO
 	// other command in this package that changes state -- run (pipeline.go),
 	// RevertOperations below, Reconcile itself -- holds fu.lock for the whole
 	// of its change. So does this one now.
-	retErr = withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
+	retErr = ws.underLock(func() error {
 		dirty, err := checked.ChangedPathsIncludingIgnored()
 		if err != nil {
 			return err
@@ -204,12 +194,12 @@ func Restore(st *store.Store, agents []agent.Agent, hard bool) (outcome RestoreO
 		// above): it must not be held hostage to the store worktree. This is a
 		// second pass, not a reordering -- the shape RevertOperations already
 		// has below.
-		cfg, err := store.LoadConfigRoot(storeRoot, "fu.yaml", st.ConfigPath())
+		// Reloaded because the reset above may have replaced fu.yaml, and
+		// reloaded inside the lock this body already holds -- fu.lock is not
+		// reentrant.
+		cfg, err := ws.loadConfig()
 		if err != nil {
-			return fmt.Errorf("reload config %s after reset: %w", st.ConfigPath(), err)
-		}
-		if err := cfg.CheckWritable(); err != nil {
-			return fmt.Errorf("check restored config writable: %w", err)
+			return err
 		}
 		// Every other production route into reconcileChecked performs this
 		// check first -- Reconcile, RevertOperations, reconcileWithHooks -- and
@@ -219,7 +209,7 @@ func Restore(st *store.Store, agents []agent.Agent, hard bool) (outcome RestoreO
 		// session's identities before any agent-side reconcile writes a
 		// canonical store path as a link target, which is exactly what runs
 		// next.
-		if err := session.CheckCanonicalPath(); err != nil {
+		if err := ws.session.CheckCanonicalPath(); err != nil {
 			return err
 		}
 		reconcileResult, err := reconcileChecked(checked, cfg, agents, nil)
@@ -395,20 +385,12 @@ func RevertOperations(st *store.Store, agents []agent.Agent, n int) (outcome Rev
 	if n < 1 {
 		return RevertOutcome{}, fmt.Errorf("revert count must be >= 1, got %d", n)
 	}
-	session, err := st.BeginWrite()
+	ws, err := beginWrite(st, "revert")
 	if err != nil {
 		return outcome, err
 	}
-	defer func() { retErr = errors.Join(retErr, session.Close()) }()
-	checked := session.Store
-	homeRoot, err := checked.Root()
-	if err != nil {
-		return outcome, fmt.Errorf("use checked revert root: %w", err)
-	}
-	storeRoot, err := checked.StoreRoot()
-	if err != nil {
-		return outcome, fmt.Errorf("use checked store root for revert: %w", err)
-	}
+	defer func() { retErr = errors.Join(retErr, ws.close()) }()
+	checked := ws.checked
 	// Mirrors Reconcile's own shape (reconcile.go): recovery, the config
 	// load/writable/canonical-path checks, this command's own mutation, and
 	// the closing internal reconcile pass all run inside the single lock
@@ -425,20 +407,17 @@ func RevertOperations(st *store.Store, agents []agent.Agent, n int) (outcome Rev
 	// into an "external: manual modifications" commit instead of being
 	// recovered the way every other write command recovers it before doing
 	// its own work.
-	retErr = withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
-		recoveryResult, err := RecoverPendingReporting(checked)
-		mergeResult(&res, recoveryResult)
+	retErr = ws.underLock(func() error {
+		if err := ws.recoverPending(&res); err != nil {
+			return err
+		}
+		cfg, err := ws.loadConfig()
 		if err != nil {
-			return fmt.Errorf("recover pending transactions before revert: %w", err)
+			return err
 		}
-		cfg, err := store.LoadConfigRoot(storeRoot, "fu.yaml", st.ConfigPath())
-		if err != nil {
-			return fmt.Errorf("load config %s for revert: %w", st.ConfigPath(), err)
-		}
-		if err := cfg.CheckWritable(); err != nil {
-			return fmt.Errorf("check config writable before revert: %w", err)
-		}
-		if err := session.CheckCanonicalPath(); err != nil {
+		// Before the sweep here, after it in writeCommandPrologue and run.
+		// Left as found: see the note at that call site.
+		if err := ws.session.CheckCanonicalPath(); err != nil {
 			return err
 		}
 
@@ -484,17 +463,15 @@ func RevertOperations(st *store.Store, agents []agent.Agent, n int) (outcome Rev
 		// Reconcile itself already reloads at this point in its own sequence
 		// (reconcile.go); this is that same read, at the one place revert can
 		// perform it -- after its own mutation, inside the same lock.
-		cfg, err = store.LoadConfigRoot(storeRoot, "fu.yaml", st.ConfigPath())
+		//
+		// The writability re-check comes with it, for the same reason the
+		// reload does: the reverted-to config is a different file, and nothing
+		// else has established that this version is one this build can write.
+		// A revert landing on a fu.yaml from a future schema would otherwise
+		// be discovered only by the next command.
+		cfg, err = ws.loadConfig()
 		if err != nil {
-			return fmt.Errorf("reload config %s after revert: %w", st.ConfigPath(), err)
-		}
-		// Re-checked for the same reason it is loaded again: the reverted-to
-		// config is a different file, and nothing else has established that
-		// this version is one this build can write. A revert landing on a
-		// fu.yaml from a future schema would otherwise be discovered only by
-		// the next command.
-		if err := cfg.CheckWritable(); err != nil {
-			return fmt.Errorf("check reverted config writable: %w", err)
+			return err
 		}
 
 		// The internal reconcile entry, not the public Reconcile: that one

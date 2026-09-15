@@ -145,36 +145,26 @@ func CommitOperations(st *store.Store, agents []agent.Agent, scope CommitScope) 
 func commitOperationsWithHooks(st *store.Store, agents []agent.Agent, scope CommitScope, h hooks) (outcome CommitOutcome, retErr error) {
 	var res Result
 	defer func() { outcome.Result = res }()
-	session, err := st.BeginWrite()
+	ws, err := beginWrite(st, "commit")
 	if err != nil {
 		return outcome, err
 	}
-	defer func() { retErr = errors.Join(retErr, session.Close()) }()
-	checked := session.Store
-	homeRoot, err := checked.Root()
-	if err != nil {
-		return outcome, fmt.Errorf("use checked commit root: %w", err)
-	}
-	storeRoot, err := checked.StoreRoot()
-	if err != nil {
-		return outcome, fmt.Errorf("use checked store root for commit: %w", err)
-	}
-	retErr = withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
-		recoveryResult, err := RecoverPendingReporting(checked)
-		mergeResult(&res, recoveryResult)
-		if err != nil {
-			return fmt.Errorf("recover pending transactions before commit: %w", err)
+	defer func() { retErr = errors.Join(retErr, ws.close()) }()
+	checked := ws.checked
+	retErr = ws.underLock(func() error {
+		if err := ws.recoverPending(&res); err != nil {
+			return err
 		}
 		// The bytes cfg was parsed from are the baseline the pre-publish
 		// check below compares against, exactly as run does after its sweep.
-		cfg, configLoaded, err := store.LoadConfigRootBytes(storeRoot, "fu.yaml", st.ConfigPath())
+		cfg, configLoaded, err := ws.loadConfigBytes()
 		if err != nil {
-			return fmt.Errorf("load config %s for commit: %w", st.ConfigPath(), err)
+			return err
 		}
-		if err := cfg.CheckWritable(); err != nil {
-			return fmt.Errorf("check config writable before commit: %w", err)
-		}
-		if err := session.CheckCanonicalPath(); err != nil {
+		// No store-wide sweep here, and that is batch 2's semantics rather
+		// than an omission: a named commit takes only its own prefix, and
+		// sweeping would fold everything else in with it.
+		if err := ws.session.CheckCanonicalPath(); err != nil {
 			return err
 		}
 
@@ -219,7 +209,7 @@ func commitOperationsWithHooks(st *store.Store, agents []agent.Agent, scope Comm
 		// from a model that no longer describes the file. The store-wide
 		// candidate additionally carries fu.yaml itself, which must be those
 		// same bytes.
-		currentConfig, err := store.ReadConfigFileRoot(storeRoot, "fu.yaml")
+		currentConfig, err := store.ReadConfigFileRoot(ws.storeRoot, "fu.yaml")
 		if err != nil {
 			return fmt.Errorf("read config %s before publishing: %w", st.ConfigPath(), err)
 		}

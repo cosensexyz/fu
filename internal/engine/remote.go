@@ -214,34 +214,23 @@ func PullOperations(st *store.Store, agents []agent.Agent) (outcome PullOutcome,
 		}
 		return outcome, fmt.Errorf("fetch from %s: %w", url, err)
 	}
-	session, err := st.BeginWrite()
+	ws, err := beginWrite(st, "pull")
 	if err != nil {
 		return outcome, err
 	}
-	defer func() { retErr = errors.Join(retErr, session.Close()) }()
-	checked := session.Store
-	homeRoot, err := checked.Root()
-	if err != nil {
-		return outcome, fmt.Errorf("use checked pull root: %w", err)
-	}
-	storeRoot, err := checked.StoreRoot()
-	if err != nil {
-		return outcome, fmt.Errorf("use checked store root for pull: %w", err)
-	}
-	retErr = withLock(homeRoot, "fu.lock", st.LockPath(), func() error {
-		recoveryResult, err := RecoverPendingReporting(checked)
-		mergeResult(&outcome.Result, recoveryResult)
+	defer func() { retErr = errors.Join(retErr, ws.close()) }()
+	checked := ws.checked
+	retErr = ws.underLock(func() error {
+		if err := ws.recoverPending(&outcome.Result); err != nil {
+			return err
+		}
+		cfg, err := ws.loadConfig()
 		if err != nil {
-			return fmt.Errorf("recover pending transactions before pull: %w", err)
+			return err
 		}
-		cfg, err := store.LoadConfigRoot(storeRoot, "fu.yaml", st.ConfigPath())
-		if err != nil {
-			return fmt.Errorf("load config %s for pull: %w", st.ConfigPath(), err)
-		}
-		if err := cfg.CheckWritable(); err != nil {
-			return fmt.Errorf("check config writable before pull: %w", err)
-		}
-		if err := session.CheckCanonicalPath(); err != nil {
+		// Before the sweep, as revert does; see the note in
+		// writeCommandPrologue about the two orders in this package.
+		if err := ws.session.CheckCanonicalPath(); err != nil {
 			return err
 		}
 		if err := checked.Sweep(); err != nil {
@@ -261,12 +250,13 @@ func PullOperations(st *store.Store, agents []agent.Agent) (outcome PullOutcome,
 		}
 		outcome.UpToDate = ff.UpToDate
 		outcome.Completed = true
-		cfg, err = store.LoadConfigRoot(storeRoot, "fu.yaml", st.ConfigPath())
+		// Reloaded because the fast-forward above may have replaced fu.yaml,
+		// and reloaded *here*, inside the lock this body already holds --
+		// fu.lock is not reentrant, so reaching for a public entry point to
+		// re-read it would deadlock rather than refuse.
+		cfg, err = ws.loadConfig()
 		if err != nil {
-			return fmt.Errorf("reload config %s after pull: %w", st.ConfigPath(), err)
-		}
-		if err := cfg.CheckWritable(); err != nil {
-			return fmt.Errorf("check pulled config writable: %w", err)
+			return err
 		}
 		reconcileResult, err := reconcileChecked(checked, cfg, agents, nil)
 		mergeResult(&outcome.Result, reconcileResult)
